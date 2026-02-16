@@ -1,0 +1,17 @@
+[package]
+name = "rudolf-v"
+version = "0.1.0"
+edition = "2021"
+description = "RUst Device-Optimized Library for Frontend Vision — CPU reference implementation of the vilib visual frontend"
+
+[dependencies]
+# Image I/O only — NOT for algorithms
+image = "0.25"
+
+[dev-dependencies]
+criterion = "0.5"
+approx = "0.5"
+
+[[bench]]
+name = "benchmarks"
+harness = false
