@@ -18,7 +18,7 @@
 
 use rudolf_v::fast::Feature;
 use rudolf_v::frontend::{Frontend, FrontendConfig};
-use rudolf_v::klt::{LkMethod};
+use rudolf_v::histeq::HistEqMethod;
 use rudolf_v::image::Image;
 
 use minifb::{Key, Window, WindowOptions};
@@ -102,7 +102,7 @@ fn main() {
         pyramid_levels: 4,
         klt_window: 11,
         klt_max_iter: 30,
-        klt_method: LkMethod::InverseCompositional,
+        histeq: HistEqMethod::Global,
         ..Default::default()
     };
     let mut frontend = Frontend::new(config, img_w, img_h);
@@ -123,7 +123,7 @@ fn main() {
     let mut frame_delay_ms: u64 = 30; // ms between frames
     let mut last_frame_time = Instant::now();
 
-    println!("\nControls: Space=pause, S=step, Q/Esc=quit, +/-=speed, T=trails, F=flow\n");
+    println!("\nControls: Space=pause, S=step, Q/Esc=quit, +/-=speed, T=trails, F=flow, H=histeq\n");
 
     while window.is_open() && !window.is_key_down(Key::Escape) && !window.is_key_down(Key::Q) {
         // Handle input.
@@ -141,6 +141,20 @@ fn main() {
         if window.is_key_pressed(Key::F, minifb::KeyRepeat::No) {
             show_flow = !show_flow;
             println!("Flow: {}", if show_flow { "on" } else { "off" });
+        }
+        if window.is_key_pressed(Key::H, minifb::KeyRepeat::No) {
+            let next = match frontend.histeq() {
+                HistEqMethod::None => HistEqMethod::Global,
+                HistEqMethod::Global => HistEqMethod::Clahe { tile_size: 32, clip_limit: 2.0 },
+                HistEqMethod::Clahe { .. } => HistEqMethod::None,
+            };
+            frontend.set_histeq(next);
+            let label = match next {
+                HistEqMethod::None => "off",
+                HistEqMethod::Global => "global",
+                HistEqMethod::Clahe { .. } => "CLAHE",
+            };
+            println!("HistEq: {}", label);
         }
         if window.is_key_pressed(Key::Equal, minifb::KeyRepeat::No)
             || window.is_key_pressed(Key::NumPadPlus, minifb::KeyRepeat::No)

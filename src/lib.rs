@@ -10,6 +10,7 @@ pub mod convolution;
 pub mod fast;
 pub mod gradient;
 pub mod harris;
+pub mod histeq;
 pub mod klt;
 pub mod nms;
 pub mod occupancy;

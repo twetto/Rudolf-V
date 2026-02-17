@@ -23,6 +23,7 @@
 
 use crate::fast::{FastDetector, Feature};
 use crate::harris::HarrisDetector;
+use crate::histeq::{self, HistEqMethod};
 use crate::image::Image;
 use crate::klt::{KltTracker, LkMethod, TrackStatus};
 use crate::nms::OccupancyNms;
@@ -103,6 +104,9 @@ pub struct FrontendConfig {
     pub klt_epsilon: f32,
     /// KLT algorithm variant.
     pub klt_method: LkMethod,
+    /// Histogram equalization preprocessing.
+    /// Stabilizes brightness across frames when auto-exposure is active.
+    pub histeq: HistEqMethod,
 }
 
 impl Default for FrontendConfig {
@@ -123,6 +127,7 @@ impl Default for FrontendConfig {
             klt_max_iter: 30,
             klt_epsilon: 0.01,
             klt_method: LkMethod::ForwardAdditive,
+            histeq: HistEqMethod::None,
         }
     }
 }
@@ -189,8 +194,19 @@ impl Frontend {
         assert_eq!(image.width(), self.img_w);
         assert_eq!(image.height(), self.img_h);
 
+        // Step 0: Histogram equalization (brightness normalization).
+        // Applied before pyramid construction so that all levels benefit
+        // from consistent intensity statistics.
+        let equalized;
+        let input = if self.config.histeq != HistEqMethod::None {
+            equalized = histeq::apply_histeq(image, self.config.histeq);
+            &equalized
+        } else {
+            image
+        };
+
         // Step 1: Build pyramid.
-        let curr_pyramid = Pyramid::build(image, self.config.pyramid_levels, self.config.pyramid_sigma);
+        let curr_pyramid = Pyramid::build(input, self.config.pyramid_levels, self.config.pyramid_sigma);
 
         let mut stats = FrameStats {
             tracked: 0,
@@ -312,6 +328,16 @@ impl Frontend {
         self.features.clear();
         self.grid.clear();
         // Don't reset next_id — IDs should be globally unique.
+    }
+
+    /// Get the current histogram equalization method.
+    pub fn histeq(&self) -> HistEqMethod {
+        self.config.histeq
+    }
+
+    /// Change the histogram equalization method at runtime.
+    pub fn set_histeq(&mut self, method: HistEqMethod) {
+        self.config.histeq = method;
     }
 }
 
@@ -566,5 +592,48 @@ mod tests {
         frontend.process(&img1);
         let (_, stats) = frontend.process(&img2);
         assert!(stats.tracked > 0, "IC method should track features");
+    }
+
+    #[test]
+    fn test_global_histeq_tracking() {
+        // With global histEq: same scene at different brightness levels
+        // should still track successfully.
+        let img1 = make_scene(160, 120, 0, 0);
+        // Simulate brightness jump: multiply all pixels.
+        let mut img2_bright = make_scene(160, 120, 2, 1);
+        for y in 0..120 {
+            for x in 0..160 {
+                let v = img2_bright.get(x, y);
+                img2_bright.set(x, y, (v as u16 * 3 / 2).min(255) as u8);
+            }
+        }
+
+        let config = FrontendConfig {
+            histeq: HistEqMethod::Global,
+            max_features: 30,
+            ..Default::default()
+        };
+        let mut frontend = Frontend::new(config, 160, 120);
+
+        frontend.process(&img1);
+        let (_, stats) = frontend.process(&img2_bright);
+        assert!(stats.tracked > 0, "histEq should help track across brightness change");
+    }
+
+    #[test]
+    fn test_clahe_tracking() {
+        let img1 = make_scene(160, 120, 0, 0);
+        let img2 = make_scene(160, 120, 2, 1);
+
+        let config = FrontendConfig {
+            histeq: HistEqMethod::Clahe { tile_size: 32, clip_limit: 2.0 },
+            max_features: 30,
+            ..Default::default()
+        };
+        let mut frontend = Frontend::new(config, 160, 120);
+
+        frontend.process(&img1);
+        let (_, stats) = frontend.process(&img2);
+        assert!(stats.tracked > 0, "CLAHE frontend should track features");
     }
 }

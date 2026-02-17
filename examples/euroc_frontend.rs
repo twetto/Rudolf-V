@@ -17,6 +17,7 @@
 //   stdout                             — per-frame summary
 
 use rudolf_v::frontend::{Frontend, FrontendConfig};
+use rudolf_v::histeq::HistEqMethod;
 use rudolf_v::image::Image;
 
 use std::env;
@@ -79,9 +80,10 @@ fn main() {
         pyramid_levels: 4,
         klt_window: 11,
         klt_max_iter: 30,
+        histeq: HistEqMethod::Global,
         ..Default::default()
     };
-    println!("Config: max_features={}, cell={}px, pyramid={}L, klt_window={}",
+    println!("Config: max_features={}, cell={}px, pyramid={}L, klt_window={}, histeq=global",
         config.max_features, config.cell_size, config.pyramid_levels, config.klt_window);
 
     let mut frontend = Frontend::new(config, img_w, img_h);
