@@ -402,6 +402,32 @@ impl<T: Pixel + fmt::Debug> fmt::Debug for Image<T> {
 }
 
 // ---------------------------------------------------------------------------
+// Index / IndexMut — img[(x, y)] syntax
+// ---------------------------------------------------------------------------
+// Implementing std::ops::Index lets you use bracket syntax for pixel access.
+// For Copy types (u8, f32), Rust auto-derefs &T → T transparently, so
+// `img[(x, y)] + img[(x+1, y)]` works without manual dereferencing.
+
+impl<T: Pixel> std::ops::Index<(usize, usize)> for Image<T> {
+    type Output = T;
+
+    #[inline]
+    fn index(&self, (x, y): (usize, usize)) -> &T {
+        self.bounds_check(x, y);
+        &self.data[y * self.stride + x]
+    }
+}
+
+impl<T: Pixel> std::ops::IndexMut<(usize, usize)> for Image<T> {
+    #[inline]
+    fn index_mut(&mut self, (x, y): (usize, usize)) -> &mut T {
+        self.bounds_check(x, y);
+        let idx = y * self.stride + x;
+        &mut self.data[idx]
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ImageView<'a, T> — Borrowed sub-region of an Image
 // ---------------------------------------------------------------------------
 //
@@ -505,6 +531,21 @@ impl<'a, T: Pixel + fmt::Debug> fmt::Debug for ImageView<'a, T> {
             writeln!(f, "]")?;
         }
         Ok(())
+    }
+}
+
+impl<'a, T: Pixel> std::ops::Index<(usize, usize)> for ImageView<'a, T> {
+    type Output = T;
+
+    #[inline]
+    fn index(&self, (x, y): (usize, usize)) -> &T {
+        assert!(
+            x < self.width && y < self.height,
+            "ImageView pixel ({x},{y}) out of bounds for view {}×{}",
+            self.width,
+            self.height,
+        );
+        &self.data[y * self.parent_stride + self.x_offset + x]
     }
 }
 
@@ -672,5 +713,48 @@ mod tests {
     #[should_panic(expected = "stride")]
     fn test_stride_less_than_width() {
         let _img: Image<u8> = Image::new_with_stride(10, 5, 8); // stride < width
+    }
+
+    #[test]
+    fn test_index_read() {
+        let data: Vec<u8> = (0..12).collect();
+        let img = Image::from_vec(4, 3, data);
+        assert_eq!(img[(0, 0)], 0);
+        assert_eq!(img[(3, 0)], 3);
+        assert_eq!(img[(0, 1)], 4);
+        assert_eq!(img[(3, 2)], 11);
+    }
+
+    #[test]
+    fn test_index_mut_write() {
+        let mut img: Image<u8> = Image::new(4, 3);
+        img[(1, 2)] = 42;
+        assert_eq!(img[(1, 2)], 42);
+        assert_eq!(img.get(1, 2), 42); // consistent with get()
+    }
+
+    #[test]
+    fn test_index_arithmetic() {
+        // Verify auto-deref works seamlessly in expressions.
+        let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let img = Image::from_vec(2, 2, data);
+        let sum = img[(0, 0)] + img[(1, 0)] + img[(0, 1)] + img[(1, 1)];
+        assert!((sum - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn test_index_out_of_bounds() {
+        let img: Image<u8> = Image::new(4, 4);
+        let _ = img[(4, 0)];
+    }
+
+    #[test]
+    fn test_imageview_index() {
+        let data: Vec<u8> = (0..16).collect();
+        let img = Image::from_vec(4, 4, data);
+        let view = img.sub_image(1, 1, 2, 2);
+        assert_eq!(view[(0, 0)], 5);
+        assert_eq!(view[(1, 1)], 10);
     }
 }

@@ -263,3 +263,59 @@ fn single_pixel_image() {
     let view = img.sub_image(0, 0, 1, 1);
     assert_eq!(view.get(0, 0), 123);
 }
+
+// ===== Index / IndexMut =====
+
+#[test]
+fn index_consistent_with_get_set() {
+    let mut img: Image<u8> = Image::new(8, 8);
+
+    // Write via set, read via index.
+    img.set(3, 5, 100);
+    assert_eq!(img[(3, 5)], 100);
+
+    // Write via index, read via get.
+    img[(7, 7)] = 200;
+    assert_eq!(img.get(7, 7), 200);
+}
+
+#[test]
+fn index_checkerboard() {
+    let mut img: Image<u8> = Image::new(10, 10);
+    for y in 0..10 {
+        for x in 0..10 {
+            img[(x, y)] = if (x + y) % 2 == 0 { 255 } else { 0 };
+        }
+    }
+    for y in 0..10 {
+        for x in 0..10 {
+            let expected = if (x + y) % 2 == 0 { 255u8 } else { 0u8 };
+            assert_eq!(img[(x, y)], expected, "mismatch at ({x}, {y})");
+        }
+    }
+}
+
+#[test]
+fn index_with_stride() {
+    let mut img: Image<u8> = Image::new_with_stride(3, 3, 8);
+    img[(0, 0)] = 1;
+    img[(2, 2)] = 99;
+    assert_eq!(img[(0, 0)], 1);
+    assert_eq!(img[(2, 2)], 99);
+    assert_eq!(img[(1, 1)], 0); // untouched
+}
+
+#[test]
+fn index_sub_image_view() {
+    let mut img: Image<u8> = Image::new(6, 6);
+    for y in 0..6 {
+        for x in 0..6 {
+            img[(x, y)] = (y * 6 + x) as u8;
+        }
+    }
+    let view = img.sub_image(2, 2, 3, 3);
+    // view[(0,0)] = img[(2,2)] = 2*6+2 = 14
+    assert_eq!(view[(0, 0)], 14);
+    // view[(2,2)] = img[(4,4)] = 4*6+4 = 28
+    assert_eq!(view[(2, 2)], 28);
+}
