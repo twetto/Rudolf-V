@@ -7,11 +7,11 @@
 pub mod image;
 pub mod convert;
 pub mod convolution;
+pub mod fast;
+pub mod nms;
 pub mod pyramid;
 
 // Future steps (uncomment as implemented):
-// pub mod fast;          // Step 3: FAST corner detector
-// pub mod nms;           // Step 3b: non-maximum suppression
 // pub mod gradient;      // Step 4 dep: Sobel gradients
 // pub mod harris;        // Step 4: Harris corner detector
 // pub mod klt;           // Step 5: KLT / Lucas-Kanade tracker

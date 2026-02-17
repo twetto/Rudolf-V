@@ -30,7 +30,7 @@ We are adopting a verification-first development strategy. The project is divide
 
 * [x] `Image<T>` Dynamic Container
 * [x] Gaussian Pyramid Generation
-* [ ] FAST Corner Detection
+* [x] FAST Corner Detection
 * [ ] Harris Corner Response
 * [ ] KLT (Lucas-Kanade) Feature Tracker
 
