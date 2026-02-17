@@ -2,21 +2,51 @@
 
 **Ru**st **D**evice **O**ptimized **L**ibrary for **F**rontend **V**ision
 
-> **Status: Project Initialization**
+> **Status: Phase 1 -- CPU Reference Implementation (In Progress)**
 >
-> This repository is currently a **White Paper / Skeleton**. No functional code has been implemented yet.
-> We are currently laying the groundwork for **Phase 1 (CPU Reference)**.
+> Core image infrastructure, Gaussian pyramids, and FAST corner detection are implemented and tested.
+> Harris corner response and KLT tracking are next.
 
 ## About
 
 **Rudolf-V** is an experimental Rust port of the [UZH RPG vilib](https://github.com/uzh-rpg/vilib) (CUDA Visual Library).
 
-While the original `vilib` is a state-of-the-art, CUDA-only library designed strictly for NVIDIA platforms, **Rudolf-V** aims to democratize high-speed visual tracking. By leveraging **Rust** and **wgpu**, this library targets cross-platform compatibility, bringing GPU-accelerated visual frontends to "generous" hardware that CUDA leaves behind:
+While the original `vilib` is a state-of-the-art, CUDA-only library designed strictly for NVIDIA platforms, **Rudolf-V** aims to democratize high-speed visual tracking. By leveraging **Rust** and **wgpu**, this library targets cross-platform compatibility, bringing GPU-accelerated visual frontends to hardware that CUDA leaves behind:
 
 * **Raspberry Pi 4 & 5** (via Vulkan)
 * AMD & Intel integrated graphics
 * Apple Silicon
 * NVIDIA GPUs
+
+## Quick Start
+
+```bash
+# Run all tests
+cargo test
+
+# Visualize FAST corner detection and NMS
+cargo run --example visualize_fast
+# -> outputs SVG files in vis_output/:
+#     {scene}_fast_raw.svg     -- raw FAST detections
+#     {scene}_fast_nms.svg     -- after grid-based NMS
+#     {scene}_compare.svg      -- side-by-side comparison
+#     pyramid.svg              -- Gaussian pyramid levels
+#     multilevel_fast.svg      -- FAST at each pyramid level
+
+# Run benchmarks
+cargo bench
+```
+
+## Module Overview
+
+| Module | Description | vilib Equivalent |
+|---|---|---|
+| `image` | `Image<T>`, `ImageView<'a, T>`, `Pixel` trait, bilinear interpolation | -- |
+| `convert` | Pixel type conversions (u8 <-> f32, RGB -> grayscale) | -- |
+| `convolution` | Separable 1D convolution (horizontal + vertical) | `conv_filter_row.cu`, `conv_filter_col.cu` |
+| `pyramid` | Gaussian image pyramid (blur + 2x downsample) | `pyramid_gpu.cu` |
+| `fast` | FAST-N corner detector (N=9,10,11,12) with Rosten's high-speed test | `fast_gpu_cuda_tools.cu` |
+| `nms` | Grid-based non-maximum suppression | `detector_base_gpu_cuda_tools.cu` |
 
 ## Engineering Roadmap
 
