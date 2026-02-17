@@ -218,7 +218,7 @@ fn bilinear_linear_gradient() {
             img.set(x, y, x as f32 * 3.0 + y as f32 * 7.0);
         }
     }
-    // Test several sub-pixel points.
+    // Test several sub-pixel points (within interpolatable range).
     let test_points = [(0.5, 0.5), (2.3, 4.7), (7.9, 1.1), (0.0, 8.0)];
     for (px, py) in test_points {
         let expected = px * 3.0 + py * 7.0;
@@ -228,6 +228,29 @@ fn bilinear_linear_gradient() {
             "bilinear({px}, {py}): expected {expected}, got {actual}"
         );
     }
+}
+
+#[test]
+fn bilinear_boundary_no_panic() {
+    // Querying at and beyond the boundary should clamp, not panic.
+    let mut img: Image<f32> = Image::new(4, 4);
+    for y in 0..4 {
+        for x in 0..4 {
+            img.set(x, y, (x + y * 4) as f32);
+        }
+    }
+
+    // Exact boundary
+    let v = interpolate_bilinear(&img, 3.0, 3.0);
+    assert!((v - 15.0).abs() < 1e-6); // pixel (3,3) = 3 + 3*4 = 15
+
+    // Beyond boundary — should clamp to edge
+    let v = interpolate_bilinear(&img, 10.0, 10.0);
+    assert!((v - 15.0).abs() < 1e-6);
+
+    // Negative — should clamp to origin
+    let v = interpolate_bilinear(&img, -5.0, -5.0);
+    assert!((v - 0.0).abs() < 1e-6);
 }
 
 // ===== Clone =====

@@ -558,21 +558,37 @@ impl<'a, T: Pixel> std::ops::Index<(usize, usize)> for ImageView<'a, T> {
 /// Given floating-point coordinates (x, y), computes a weighted average
 /// of the four surrounding integer-coordinate pixels.
 ///
+/// **Boundary handling:** Clamps coordinates to the image boundary
+/// (replicates edge pixels). This means querying at x = width-1 or
+/// y = height-1 is safe — the out-of-bounds neighbor is replaced by
+/// the edge pixel. This matches vilib's border strategy and is benign
+/// for LK tracking, where clamped boundary contributions in the error
+/// and gradient images cancel each other out.
+///
 /// # Panics
-/// Panics if (x, y) would access out-of-bounds pixels (i.e., if
-/// x >= width-1 or y >= height-1 after flooring).
+/// Panics if the image is empty (width or height is 0).
 pub fn interpolate_bilinear(img: &Image<f32>, x: f32, y: f32) -> f32 {
+    assert!(img.width() > 0 && img.height() > 0, "cannot interpolate on an empty image");
+
+    // Clamp to valid coordinate range.
+    let max_x = (img.width() - 1) as f32;
+    let max_y = (img.height() - 1) as f32;
+    let x = x.clamp(0.0, max_x);
+    let y = y.clamp(0.0, max_y);
+
     let x0 = x.floor() as usize;
     let y0 = y.floor() as usize;
     let fx = x - x0 as f32;
     let fy = y - y0 as f32;
 
-    debug_assert!(x0 + 1 < img.width() && y0 + 1 < img.height());
+    // Clamp x1/y1 so we don't exceed bounds at the right/bottom edge.
+    let x1 = (x0 + 1).min(img.width() - 1);
+    let y1 = (y0 + 1).min(img.height() - 1);
 
-    (1.0 - fx) * (1.0 - fy) * img.get(x0, y0).to_f32()
-        + fx * (1.0 - fy) * img.get(x0 + 1, y0).to_f32()
-        + (1.0 - fx) * fy * img.get(x0, y0 + 1).to_f32()
-        + fx * fy * img.get(x0 + 1, y0 + 1).to_f32()
+    (1.0 - fx) * (1.0 - fy) * img.get(x0, y0)
+        + fx * (1.0 - fy) * img.get(x1, y0)
+        + (1.0 - fx) * fy * img.get(x0, y1)
+        + fx * fy * img.get(x1, y1)
 }
 
 #[cfg(test)]
@@ -699,6 +715,36 @@ mod tests {
         let img = Image::from_vec(2, 2, data);
         let v = interpolate_bilinear(&img, 0.5, 0.5);
         // (0 + 10 + 20 + 30) / 4 = 15
+        assert!((v - 15.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_bilinear_boundary_clamp() {
+        // At the right/bottom edge, should clamp and return the edge pixel.
+        let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let img = Image::from_vec(2, 2, data);
+
+        // Exactly at (1.0, 1.0) — bottom-right pixel. x1/y1 clamp to 1.
+        let v = interpolate_bilinear(&img, 1.0, 1.0);
+        assert!((v - 4.0).abs() < 1e-6);
+
+        // Beyond bounds — clamped back to edge.
+        let v = interpolate_bilinear(&img, 5.0, 5.0);
+        assert!((v - 4.0).abs() < 1e-6);
+
+        // Negative — clamped to (0, 0).
+        let v = interpolate_bilinear(&img, -1.0, -1.0);
+        assert!((v - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_bilinear_edge_interpolation() {
+        // At x = width-1, fy blending should still work along the edge.
+        let data: Vec<f32> = vec![0.0, 10.0, 0.0, 20.0];
+        let img = Image::from_vec(2, 2, data);
+        // x=1.0 (right edge), y=0.5 (midway vertically)
+        // Top-right = 10.0, bottom-right = 20.0 → blends to 15.0
+        let v = interpolate_bilinear(&img, 1.0, 0.5);
         assert!((v - 15.0).abs() < 1e-6);
     }
 
