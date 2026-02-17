@@ -12,7 +12,6 @@ pub mod gradient;
 pub mod harris;
 pub mod klt;
 pub mod nms;
-pub mod pyramid;
 pub mod occupancy;
 pub mod frontend;
-
+pub mod pyramid;

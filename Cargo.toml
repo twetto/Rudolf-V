@@ -7,6 +7,8 @@ description = "RUst Device-Optimized Library for Frontend Vision — CPU referen
 [dependencies]
 # Image I/O only — NOT for algorithms
 image = "0.25"
+# Live visualization window (minimal framebuffer)
+minifb = "0.27"
 
 [dev-dependencies]
 criterion = "0.5"

@@ -42,6 +42,18 @@ cargo run --example visualize_fast
 #     klt_multiframe.svg       — 3-frame tracking trails
 #     klt_subpixel.svg         — sub-pixel blob tracking demo
 
+# Run on EuRoC MAV dataset
+cargo run --example euroc_frontend --release -- /path/to/MH_01_easy
+# Optional: limit to N frames
+cargo run --example euroc_frontend --release -- /path/to/MH_01_easy 100
+# → outputs:
+#     vis_output/euroc_tracks.svg   — feature tracks overlaid on last frame
+#     vis_output/euroc_stats.csv    — per-frame statistics
+
+# Live visualization window (requires minifb)
+cargo run --example euroc_live --release -- /path/to/MH_01_easy
+# Controls: Space=pause, S=step, Q/Esc=quit, +/-=speed, T=trails, F=flow
+
 # Run benchmarks
 cargo bench
 ```
