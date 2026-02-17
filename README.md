@@ -4,8 +4,8 @@
 
 > **Status: Phase 1 — CPU Reference Implementation (In Progress)**
 >
-> Core image infrastructure, Gaussian pyramids, FAST and Harris corner detection are implemented and tested.
-> KLT tracking is next.
+> All core algorithms are implemented: image containers, Gaussian pyramids, FAST and Harris corner detection, and pyramidal KLT tracking.
+> Occupancy grid and the frontend pipeline (Step 6) remain.
 
 ## About
 
@@ -35,6 +35,10 @@ cargo run --example visualize_fast
 #     harris_chessboard.svg    — Harris raw vs NMS on chessboard
 #     harris_response.svg      — Harris response heatmap
 #     fast_vs_harris.svg       — FAST vs Harris on same image
+#     klt_flow_1to2.svg        — KLT flow arrows (frame 1→2)
+#     klt_flow_2to3.svg        — KLT flow arrows (frame 2→3)
+#     klt_multiframe.svg       — 3-frame tracking trails
+#     klt_subpixel.svg         — sub-pixel blob tracking demo
 
 # Run benchmarks
 cargo bench
@@ -52,6 +56,7 @@ cargo bench
 | `nms` | Grid-based non-maximum suppression | `detector_base_gpu_cuda_tools.cu` |
 | `gradient` | Sobel gradient computation (separable) | `harris_gpu_cuda_tools.cu` |
 | `harris` | Harris corner detector (structure tensor) | `harris_gpu_cuda_tools.cu` |
+| `klt` | Pyramidal Lucas-Kanade optical flow tracker | `feature_tracker_cuda_tools.cu` |
 
 ## Engineering Roadmap
 
@@ -67,7 +72,7 @@ We are adopting a verification-first development strategy. The project is divide
 * [x] Gaussian Pyramid Generation
 * [x] FAST Corner Detection
 * [x] Harris Corner Response
-* [ ] KLT (Lucas-Kanade) Feature Tracker
+* [x] KLT (Lucas-Kanade) Feature Tracker
 
 ### Phase 2: `wgpu` Acceleration
 
@@ -103,4 +108,3 @@ If you use concepts from this library in an academic context, please cite the or
   doi = {10.1109/IROS45743.2020.9340851}
 }
 ```
-

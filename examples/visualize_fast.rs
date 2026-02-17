@@ -7,6 +7,7 @@
 use rudolf_v::fast::FastDetector;
 use rudolf_v::harris::HarrisDetector;
 use rudolf_v::image::Image;
+use rudolf_v::klt::{KltTracker, LkMethod, TrackStatus};
 use rudolf_v::nms::OccupancyNms;
 use rudolf_v::pyramid::Pyramid;
 
@@ -83,6 +84,119 @@ fn main() {
     let svg_vs = render_fast_vs_harris(&chessboard, &fast_chess, &harris_nms);
     fs::write("vis_output/fast_vs_harris.svg", &svg_vs).unwrap();
 
+    // ===== KLT Tracking =====
+    println!("\n=== KLT Tracking ===");
+
+    // Scene: multiple squares shifted by known amounts.
+    let klt_img1 = make_klt_scene(0, 0);
+    let klt_img2 = make_klt_scene(4, 2);
+    let klt_img3 = make_klt_scene(8, 4); // cumulative shift for 3-frame sequence
+
+    let klt_pyr1 = Pyramid::build(&klt_img1, 3, 1.0);
+    let klt_pyr2 = Pyramid::build(&klt_img2, 3, 1.0);
+    let klt_pyr3 = Pyramid::build(&klt_img3, 3, 1.0);
+
+    // Detect in frame 1.
+    let klt_det = FastDetector::new(20, 9);
+    let mut u8_l0 = Image::new(klt_pyr1.levels[0].width(), klt_pyr1.levels[0].height());
+    for (x, y, v) in klt_pyr1.levels[0].pixels() {
+        u8_l0.set(x, y, v.clamp(0.0, 255.0).round() as u8);
+    }
+    let detected = klt_det.detect(&u8_l0);
+    let nms_klt = OccupancyNms::new(12);
+    let features = nms_klt.suppress(&detected, klt_img1.width(), klt_img1.height());
+    println!("  Detected features (frame 1): {}", features.len());
+
+    // Track frame 1 → 2.
+    let tracker = KltTracker::new(7, 30, 0.01, 3);
+    let results_12 = tracker.track(&klt_pyr1, &klt_pyr2, &features);
+    let tracked_12 = results_12.iter().filter(|r| r.status == TrackStatus::Tracked).count();
+    println!("  Tracked frame 1→2: {}", tracked_12);
+
+    // Single-step flow arrows.
+    let svg_klt1 = render_klt_flow(&klt_img1, &klt_img2, &features, &results_12,
+        "KLT: frame 1 -> 2 (shift +4, +2)");
+    fs::write("vis_output/klt_flow_1to2.svg", &svg_klt1).unwrap();
+
+    // Track frame 2 → 3 using tracked positions from step 1.
+    let features_f2: Vec<_> = results_12.iter()
+        .filter(|r| r.status == TrackStatus::Tracked)
+        .map(|r| r.feature.clone())
+        .collect();
+    let results_23 = tracker.track(&klt_pyr2, &klt_pyr3, &features_f2);
+
+    let svg_klt2 = render_klt_flow(&klt_img2, &klt_img3, &features_f2, &results_23,
+        "KLT: frame 2 -> 3 (shift +4, +2)");
+    fs::write("vis_output/klt_flow_2to3.svg", &svg_klt2).unwrap();
+
+    // 3-frame track visualization: frame1 positions → frame2 → frame3 overlaid.
+    let svg_multi = render_klt_multiframe(
+        &klt_img3, &features, &results_12, &results_23,
+        "KLT: 3-frame tracking (cumulative +8, +4)");
+    fs::write("vis_output/klt_multiframe.svg", &svg_multi).unwrap();
+
+    // Gaussian blob sub-pixel tracking demo.
+    let (blob1, blob2) = make_blob_pair(1.7, 0.8);
+    let blob_pyr1 = Pyramid::build(&blob1, 3, 1.0);
+    let blob_pyr2 = Pyramid::build(&blob2, 3, 1.0);
+
+    let blob_features = vec![rudolf_v::fast::Feature {
+        x: 50.0, y: 50.0, score: 100.0, level: 0, id: 1,
+    }];
+    let blob_results = tracker.track(&blob_pyr1, &blob_pyr2, &blob_features);
+    if let Some(r) = blob_results.first() {
+        let dx = r.feature.x - 50.0;
+        let dy = r.feature.y - 50.0;
+        println!("  Blob sub-pixel: tracked ({dx:.3}, {dy:.3}), expected (1.700, 0.800)");
+    }
+
+    let svg_blob = render_klt_flow(&blob1, &blob2, &blob_features, &blob_results,
+        &format!("KLT sub-pixel (FA): shift (1.7, 0.8), recovered ({:.2}, {:.2})",
+            blob_results[0].feature.x - 50.0, blob_results[0].feature.y - 50.0));
+    fs::write("vis_output/klt_subpixel.svg", &svg_blob).unwrap();
+
+    // ===== FA vs IC comparison =====
+    println!("\n=== FA vs IC Comparison ===");
+    let cmp_img1 = make_klt_scene(0, 0);
+    let cmp_img2 = make_klt_scene(4, 2);
+    let cmp_pyr1 = Pyramid::build(&cmp_img1, 3, 1.0);
+    let cmp_pyr2 = Pyramid::build(&cmp_img2, 3, 1.0);
+
+    // Detect features.
+    let mut cmp_u8 = Image::new(cmp_pyr1.levels[0].width(), cmp_pyr1.levels[0].height());
+    for (x, y, v) in cmp_pyr1.levels[0].pixels() {
+        cmp_u8.set(x, y, v.clamp(0.0, 255.0).round() as u8);
+    }
+    let cmp_features_raw = klt_det.detect(&cmp_u8);
+    let cmp_features = nms_klt.suppress(&cmp_features_raw, cmp_img1.width(), cmp_img1.height());
+
+    let fa_tracker = KltTracker::with_method(7, 30, 0.01, 3, LkMethod::ForwardAdditive);
+    let ic_tracker = KltTracker::with_method(7, 30, 0.01, 3, LkMethod::InverseCompositional);
+
+    let fa_results = fa_tracker.track(&cmp_pyr1, &cmp_pyr2, &cmp_features);
+    let ic_results = ic_tracker.track(&cmp_pyr1, &cmp_pyr2, &cmp_features);
+
+    let fa_tracked = fa_results.iter().filter(|r| r.status == TrackStatus::Tracked).count();
+    let ic_tracked = ic_results.iter().filter(|r| r.status == TrackStatus::Tracked).count();
+    println!("  FA tracked: {}/{}", fa_tracked, cmp_features.len());
+    println!("  IC tracked: {}/{}", ic_tracked, cmp_features.len());
+
+    let svg_fa_vs_ic = render_fa_vs_ic(&cmp_img2, &cmp_features, &fa_results, &ic_results);
+    fs::write("vis_output/klt_fa_vs_ic.svg", &svg_fa_vs_ic).unwrap();
+
+    // Sub-pixel comparison.
+    let ic_blob_tracker = KltTracker::with_method(7, 30, 0.01, 3, LkMethod::InverseCompositional);
+    let ic_blob_results = ic_blob_tracker.track(&blob_pyr1, &blob_pyr2, &blob_features);
+    if let Some(r) = ic_blob_results.first() {
+        let dx = r.feature.x - 50.0;
+        let dy = r.feature.y - 50.0;
+        println!("  IC blob sub-pixel: ({dx:.3}, {dy:.3}), expected (1.700, 0.800)");
+    }
+    let svg_ic_blob = render_klt_flow(&blob1, &blob2, &blob_features, &ic_blob_results,
+        &format!("KLT sub-pixel (IC): shift (1.7, 0.8), recovered ({:.2}, {:.2})",
+            ic_blob_results[0].feature.x - 50.0, ic_blob_results[0].feature.y - 50.0));
+    fs::write("vis_output/klt_subpixel_ic.svg", &svg_ic_blob).unwrap();
+
     println!("\nDone! Open vis_output/*.svg in your browser.");
 }
 
@@ -155,6 +269,59 @@ fn make_chessboard(img_size: usize, cell_size: usize, lo: u8, hi: u8) -> Image<u
         }
     }
     img
+}
+
+/// Scene for KLT demos: multiple bright rectangles on dark background,
+/// shifted by (shift_x, shift_y) to simulate inter-frame motion.
+fn make_klt_scene(shift_x: usize, shift_y: usize) -> Image<u8> {
+    let w = 160;
+    let h = 120;
+    let mut img = Image::from_vec(w, h, vec![25u8; w * h]);
+
+    let rects: [(usize, usize, usize, usize, u8); 6] = [
+        (30, 25, 20, 20, 200),
+        (70, 20, 25, 15, 180),
+        (110, 30, 18, 22, 210),
+        (25, 65, 22, 25, 190),
+        (75, 60, 30, 20, 170),
+        (115, 70, 20, 18, 205),
+    ];
+
+    for &(rx, ry, rw, rh, val) in &rects {
+        let rx = rx + shift_x;
+        let ry = ry + shift_y;
+        for y in ry..(ry + rh).min(h) {
+            for x in rx..(rx + rw).min(w) {
+                img.set(x, y, val);
+            }
+        }
+    }
+    img
+}
+
+/// A pair of Gaussian blob images for sub-pixel tracking demo.
+fn make_blob_pair(dx: f32, dy: f32) -> (Image<u8>, Image<u8>) {
+    let w = 100;
+    let h = 100;
+    let cx = 50.0f32;
+    let cy = 50.0f32;
+    let sigma2 = 80.0;
+
+    let mut img1 = Image::from_vec(w, h, vec![30u8; w * h]);
+    let mut img2 = Image::from_vec(w, h, vec![30u8; w * h]);
+
+    for y in 0..h {
+        for x in 0..w {
+            let d1 = (x as f32 - cx).powi(2) + (y as f32 - cy).powi(2);
+            let v1 = 30.0 + 200.0 * (-d1 / sigma2).exp();
+            img1.set(x, y, v1.min(255.0) as u8);
+
+            let d2 = (x as f32 - cx - dx).powi(2) + (y as f32 - cy - dy).powi(2);
+            let v2 = 30.0 + 200.0 * (-d2 / sigma2).exp();
+            img2.set(x, y, v2.min(255.0) as u8);
+        }
+    }
+    (img1, img2)
 }
 
 // ---------------------------------------------------------------------------
@@ -304,8 +471,283 @@ fn render_multilevel_fast(pyr: &Pyramid) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// KLT rendering
+// ---------------------------------------------------------------------------
+
+/// Render KLT optical flow: left = frame1 with features, right = frame2 with
+/// arrows from original to tracked positions.
+fn render_klt_flow(
+    img1: &Image<u8>,
+    img2: &Image<u8>,
+    features: &[rudolf_v::fast::Feature],
+    results: &[rudolf_v::klt::TrackedFeature],
+    title: &str,
+) -> String {
+    let sw = img1.width() * SCALE;
+    let sh = img1.height() * SCALE;
+    let gap = 30;
+    let total_w = sw * 2 + gap;
+    let total_h = sh + 60;
+
+    let mut svg = String::new();
+    writeln!(svg, "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {} {}\" width=\"{}\" height=\"{}\">",
+        total_w, total_h, total_w, total_h).unwrap();
+    writeln!(svg, "<style>text {{ font-family: monospace; font-size: 12px; fill: #333; }}</style>").unwrap();
+    writeln!(svg, "<defs><marker id=\"ah\" markerWidth=\"8\" markerHeight=\"6\" refX=\"8\" refY=\"3\" orient=\"auto\">\
+        <path d=\"M0,0 L8,3 L0,6\" fill=\"#22dd44\"/></marker></defs>").unwrap();
+    writeln!(svg, "<text x=\"10\" y=\"18\" font-weight=\"bold\" font-size=\"14\">{}</text>", title).unwrap();
+
+    // Left: frame 1 with detected features.
+    writeln!(svg, "<g transform=\"translate(0, 40)\">").unwrap();
+    writeln!(svg, "<text x=\"10\" y=\"-5\">Frame 1: {} features</text>", features.len()).unwrap();
+    write_image_rects(&mut svg, img1);
+    write_feature_circles(&mut svg, features, "4488ff");
+    writeln!(svg, "</g>").unwrap();
+
+    // Right: frame 2 with flow arrows.
+    let offset = sw + gap;
+    let tracked_count = results.iter().filter(|r| r.status == TrackStatus::Tracked).count();
+    let lost_count = results.len() - tracked_count;
+    writeln!(svg, "<g transform=\"translate({}, 40)\">", offset).unwrap();
+    writeln!(svg, "<text x=\"10\" y=\"-5\">Frame 2: {} tracked, {} lost</text>",
+        tracked_count, lost_count).unwrap();
+    write_image_rects(&mut svg, img2);
+
+    for (feat, result) in features.iter().zip(results.iter()) {
+        let x0 = feat.x as usize * SCALE + SCALE / 2;
+        let y0 = feat.y as usize * SCALE + SCALE / 2;
+
+        match result.status {
+            TrackStatus::Tracked => {
+                let x1 = (result.feature.x * SCALE as f32) as usize + SCALE / 2;
+                let y1 = (result.feature.y * SCALE as f32) as usize + SCALE / 2;
+
+                // Origin dot (blue).
+                writeln!(svg, "  <circle cx=\"{}\" cy=\"{}\" r=\"2\" fill=\"#4488ff\" opacity=\"0.6\"/>",
+                    x0, y0).unwrap();
+                // Arrow from origin to tracked position.
+                let arrow_dx = x1 as f32 - x0 as f32;
+                let arrow_dy = y1 as f32 - y0 as f32;
+                let arrow_len = (arrow_dx * arrow_dx + arrow_dy * arrow_dy).sqrt();
+                if arrow_len > 1.0 {
+                    writeln!(svg, "  <line x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\" \
+                        stroke=\"#22dd44\" stroke-width=\"1.5\" marker-end=\"url(#ah)\"/>",
+                        x0, y0, x1, y1).unwrap();
+                }
+                // Tracked position dot (green).
+                writeln!(svg, "  <circle cx=\"{}\" cy=\"{}\" r=\"3\" fill=\"#22dd44\"/>",
+                    x1, y1).unwrap();
+            }
+            _ => {
+                // Lost/OOB: red X.
+                let s = 3;
+                writeln!(svg, "  <line x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\" stroke=\"#ff3333\" stroke-width=\"1.5\"/>",
+                    x0 - s, y0 - s, x0 + s, y0 + s).unwrap();
+                writeln!(svg, "  <line x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\" stroke=\"#ff3333\" stroke-width=\"1.5\"/>",
+                    x0 + s, y0 - s, x0 - s, y0 + s).unwrap();
+            }
+        }
+    }
+
+    writeln!(svg, "</g>").unwrap();
+    writeln!(svg, "</svg>").unwrap();
+    svg
+}
+
+/// Render a 3-frame tracking sequence: trails from frame1 → frame2 → frame3
+/// overlaid on the final frame image.
+fn render_klt_multiframe(
+    img3: &Image<u8>,
+    features_f1: &[rudolf_v::fast::Feature],
+    results_12: &[rudolf_v::klt::TrackedFeature],
+    results_23: &[rudolf_v::klt::TrackedFeature],
+    title: &str,
+) -> String {
+    let sw = img3.width() * SCALE;
+    let sh = img3.height() * SCALE;
+    let total_h = sh + 60;
+
+    let mut svg = String::new();
+    writeln!(svg, "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {} {}\" width=\"{}\" height=\"{}\">",
+        sw, total_h, sw, total_h).unwrap();
+    writeln!(svg, "<style>text {{ font-family: monospace; font-size: 12px; fill: #333; }}</style>").unwrap();
+    writeln!(svg, "<defs><marker id=\"ah2\" markerWidth=\"6\" markerHeight=\"4\" refX=\"6\" refY=\"2\" orient=\"auto\">\
+        <path d=\"M0,0 L6,2 L0,4\" fill=\"#22dd44\"/></marker></defs>").unwrap();
+    writeln!(svg, "<text x=\"10\" y=\"18\" font-weight=\"bold\" font-size=\"14\">{}</text>", title).unwrap();
+
+    writeln!(svg, "<g transform=\"translate(0, 40)\">").unwrap();
+    write_image_rects(&mut svg, img3);
+
+    // Build a map from frame2 features to frame3 results.
+    // results_12[i] → features_f2[j] where j indexes only tracked ones.
+    let mut f2_idx = 0;
+    for (i, r12) in results_12.iter().enumerate() {
+        if r12.status != TrackStatus::Tracked {
+            continue;
+        }
+
+        let p1x = features_f1[i].x;
+        let p1y = features_f1[i].y;
+        let p2x = r12.feature.x;
+        let p2y = r12.feature.y;
+
+        // Check if this feature survived to frame 3.
+        let (p3x, p3y, survived) = if f2_idx < results_23.len()
+            && results_23[f2_idx].status == TrackStatus::Tracked
+        {
+            (results_23[f2_idx].feature.x, results_23[f2_idx].feature.y, true)
+        } else {
+            (p2x, p2y, false)
+        };
+        f2_idx += 1;
+
+        // Scale to SVG coordinates.
+        let sx = |v: f32| (v * SCALE as f32) as usize + SCALE / 2;
+
+        // Frame 1 position (blue dot).
+        writeln!(svg, "  <circle cx=\"{}\" cy=\"{}\" r=\"2.5\" fill=\"#4488ff\" opacity=\"0.5\"/>",
+            sx(p1x), sx(p1y)).unwrap();
+
+        // Trail: frame1 → frame2 (faded).
+        writeln!(svg, "  <line x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\" \
+            stroke=\"#88aaff\" stroke-width=\"1\" opacity=\"0.5\"/>",
+            sx(p1x), sx(p1y), sx(p2x), sx(p2y)).unwrap();
+
+        if survived {
+            // Trail: frame2 → frame3 (bright green arrow).
+            writeln!(svg, "  <circle cx=\"{}\" cy=\"{}\" r=\"2\" fill=\"#88aaff\" opacity=\"0.5\"/>",
+                sx(p2x), sx(p2y)).unwrap();
+            writeln!(svg, "  <line x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\" \
+                stroke=\"#22dd44\" stroke-width=\"1.5\" marker-end=\"url(#ah2)\"/>",
+                sx(p2x), sx(p2y), sx(p3x), sx(p3y)).unwrap();
+            // Final position (solid green).
+            writeln!(svg, "  <circle cx=\"{}\" cy=\"{}\" r=\"3.5\" fill=\"none\" stroke=\"#22dd44\" stroke-width=\"1.5\"/>",
+                sx(p3x), sx(p3y)).unwrap();
+        } else {
+            // Lost at frame 3: red X at frame 2 position.
+            let cx = sx(p2x);
+            let cy = sx(p2y);
+            writeln!(svg, "  <line x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\" stroke=\"#ff3333\" stroke-width=\"1.5\"/>",
+                cx - 3, cy - 3, cx + 3, cy + 3).unwrap();
+            writeln!(svg, "  <line x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\" stroke=\"#ff3333\" stroke-width=\"1.5\"/>",
+                cx + 3, cy - 3, cx - 3, cy + 3).unwrap();
+        }
+    }
+
+    // Legend.
+    let ly = sh + 5;
+    writeln!(svg, "  <circle cx=\"10\" cy=\"{}\" r=\"3\" fill=\"#4488ff\"/>", ly).unwrap();
+    writeln!(svg, "  <text x=\"18\" y=\"{}\">Frame 1</text>", ly + 4).unwrap();
+    writeln!(svg, "  <circle cx=\"80\" cy=\"{}\" r=\"3\" fill=\"#88aaff\"/>", ly).unwrap();
+    writeln!(svg, "  <text x=\"88\" y=\"{}\">Frame 2</text>", ly + 4).unwrap();
+    writeln!(svg, "  <circle cx=\"150\" cy=\"{}\" r=\"3\" fill=\"#22dd44\"/>", ly).unwrap();
+    writeln!(svg, "  <text x=\"158\" y=\"{}\">Frame 3</text>", ly + 4).unwrap();
+
+    writeln!(svg, "</g>").unwrap();
+    writeln!(svg, "</svg>").unwrap();
+    svg
+}
+
+// ---------------------------------------------------------------------------
 // SVG helpers
 // ---------------------------------------------------------------------------
+
+/// Forward Additive vs Inverse Compositional side-by-side.
+/// Left = FA arrows, Right = IC arrows, both on the same target frame.
+fn render_fa_vs_ic(
+    img: &Image<u8>,
+    features: &[rudolf_v::fast::Feature],
+    fa_results: &[rudolf_v::klt::TrackedFeature],
+    ic_results: &[rudolf_v::klt::TrackedFeature],
+) -> String {
+    let sw = img.width() * SCALE;
+    let sh = img.height() * SCALE;
+    let gap = 30;
+    let total_w = sw * 2 + gap;
+    let total_h = sh + 80;
+
+    let mut svg = String::new();
+    writeln!(svg, "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {} {}\" width=\"{}\" height=\"{}\">",
+        total_w, total_h, total_w, total_h).unwrap();
+    writeln!(svg, "<style>text {{ font-family: monospace; font-size: 12px; fill: #333; }}</style>").unwrap();
+    writeln!(svg, "<defs>\
+        <marker id=\"ahfa\" markerWidth=\"8\" markerHeight=\"6\" refX=\"8\" refY=\"3\" orient=\"auto\">\
+        <path d=\"M0,0 L8,3 L0,6\" fill=\"#22dd44\"/></marker>\
+        <marker id=\"ahic\" markerWidth=\"8\" markerHeight=\"6\" refX=\"8\" refY=\"3\" orient=\"auto\">\
+        <path d=\"M0,0 L8,3 L0,6\" fill=\"#dd8822\"/></marker>\
+        </defs>").unwrap();
+    writeln!(svg, "<text x=\"10\" y=\"18\" font-weight=\"bold\" font-size=\"14\">Forward Additive vs Inverse Compositional</text>").unwrap();
+
+    // Render a side (FA or IC).
+    let render_side = |svg: &mut String, x_off: usize, label: &str, results: &[rudolf_v::klt::TrackedFeature], color: &str, marker: &str| {
+        let tracked = results.iter().filter(|r| r.status == TrackStatus::Tracked).count();
+        writeln!(svg, "<g transform=\"translate({}, 40)\">", x_off).unwrap();
+        writeln!(svg, "<text x=\"10\" y=\"-5\">{}: {} tracked</text>", label, tracked).unwrap();
+        write_image_rects(svg, img);
+
+        for (feat, result) in features.iter().zip(results.iter()) {
+            let x0 = feat.x as usize * SCALE + SCALE / 2;
+            let y0 = feat.y as usize * SCALE + SCALE / 2;
+
+            match result.status {
+                TrackStatus::Tracked => {
+                    let x1 = (result.feature.x * SCALE as f32) as usize + SCALE / 2;
+                    let y1 = (result.feature.y * SCALE as f32) as usize + SCALE / 2;
+                    writeln!(svg, "  <circle cx=\"{}\" cy=\"{}\" r=\"2\" fill=\"#4488ff\" opacity=\"0.5\"/>",
+                        x0, y0).unwrap();
+                    let arrow_len = ((x1 as f32 - x0 as f32).powi(2) + (y1 as f32 - y0 as f32).powi(2)).sqrt();
+                    if arrow_len > 1.0 {
+                        writeln!(svg, "  <line x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\" \
+                            stroke=\"#{}\" stroke-width=\"1.5\" marker-end=\"url(#{})\"/>",
+                            x0, y0, x1, y1, color, marker).unwrap();
+                    }
+                    writeln!(svg, "  <circle cx=\"{}\" cy=\"{}\" r=\"3\" fill=\"#{}\"/>",
+                        x1, y1, color).unwrap();
+                }
+                _ => {
+                    let s = 3;
+                    writeln!(svg, "  <line x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\" stroke=\"#ff3333\" stroke-width=\"1.5\"/>",
+                        x0 - s, y0 - s, x0 + s, y0 + s).unwrap();
+                    writeln!(svg, "  <line x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\" stroke=\"#ff3333\" stroke-width=\"1.5\"/>",
+                        x0 + s, y0 - s, x0 - s, y0 + s).unwrap();
+                }
+            }
+        }
+        writeln!(svg, "</g>").unwrap();
+    };
+
+    render_side(&mut svg, 0, "Forward Additive", fa_results, "22dd44", "ahfa");
+    render_side(&mut svg, sw + gap, "Inverse Compositional", ic_results, "dd8822", "ahic");
+
+    // Displacement stats at bottom.
+    let mut fa_dx_sum = 0.0f32;
+    let mut fa_dy_sum = 0.0f32;
+    let mut ic_dx_sum = 0.0f32;
+    let mut ic_dy_sum = 0.0f32;
+    let mut fa_n = 0;
+    let mut ic_n = 0;
+    for (feat, (fa, ic)) in features.iter().zip(fa_results.iter().zip(ic_results.iter())) {
+        if fa.status == TrackStatus::Tracked {
+            fa_dx_sum += fa.feature.x - feat.x;
+            fa_dy_sum += fa.feature.y - feat.y;
+            fa_n += 1;
+        }
+        if ic.status == TrackStatus::Tracked {
+            ic_dx_sum += ic.feature.x - feat.x;
+            ic_dy_sum += ic.feature.y - feat.y;
+            ic_n += 1;
+        }
+    }
+    let ly = sh + 50;
+    if fa_n > 0 && ic_n > 0 {
+        writeln!(svg, "<text x=\"10\" y=\"{}\">FA mean displacement: ({:.2}, {:.2})  |  IC mean displacement: ({:.2}, {:.2})  |  Expected: (4.0, 2.0)</text>",
+            ly, fa_dx_sum / fa_n as f32, fa_dy_sum / fa_n as f32,
+            ic_dx_sum / ic_n as f32, ic_dy_sum / ic_n as f32).unwrap();
+    }
+
+    writeln!(svg, "</svg>").unwrap();
+    svg
+}
 
 fn write_image_rects(svg: &mut String, img: &Image<u8>) {
     for y in 0..img.height() {
