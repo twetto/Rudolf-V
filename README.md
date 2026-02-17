@@ -29,7 +29,7 @@ We are adopting a verification-first development strategy. The project is divide
 **Purpose:** Since debugging GPU shaders is difficult, this CPU implementation will serve as the **Test Oracle** (Ground Truth). We will not write a single line of shader code until the math is verified here.
 
 * [x] `Image<T>` Dynamic Container
-* [ ] Gaussian Pyramid Generation
+* [x] Gaussian Pyramid Generation
 * [ ] FAST Corner Detection
 * [ ] Harris Corner Response
 * [ ] KLT (Lucas-Kanade) Feature Tracker

@@ -6,10 +6,10 @@
 
 pub mod image;
 pub mod convert;
+pub mod convolution;
+pub mod pyramid;
 
 // Future steps (uncomment as implemented):
-// pub mod convolution;   // Step 2 dep: separable filters
-// pub mod pyramid;       // Step 2: Gaussian pyramid
 // pub mod fast;          // Step 3: FAST corner detector
 // pub mod nms;           // Step 3b: non-maximum suppression
 // pub mod gradient;      // Step 4 dep: Sobel gradients
