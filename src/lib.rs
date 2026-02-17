@@ -13,7 +13,6 @@ pub mod harris;
 pub mod klt;
 pub mod nms;
 pub mod pyramid;
+pub mod occupancy;
+pub mod frontend;
 
-// Future steps (uncomment as implemented):
-// pub mod occupancy;     // Step 6: occupancy grid
-// pub mod frontend;      // Step 6b: top-level pipeline

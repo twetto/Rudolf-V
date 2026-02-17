@@ -2,10 +2,12 @@
 
 **Ru**st **D**evice **O**ptimized **L**ibrary for **F**rontend **V**ision
 
-> **Status: Phase 1 — CPU Reference Implementation (In Progress)**
+> **Status: Phase 1 — CPU Reference Implementation (Complete)**
 >
-> All core algorithms are implemented: image containers, Gaussian pyramids, FAST and Harris corner detection, and pyramidal KLT tracking.
-> Occupancy grid and the frontend pipeline (Step 6) remain.
+> All core algorithms are implemented: image containers, Gaussian pyramids, FAST and Harris
+> corner detection, pyramidal KLT tracking (forward additive + inverse compositional),
+> occupancy grid, and the complete frontend pipeline.
+> Ready for Phase 2: GPU acceleration via wgpu.
 
 ## About
 
@@ -57,6 +59,8 @@ cargo bench
 | `gradient` | Sobel gradient computation (separable) | `harris_gpu_cuda_tools.cu` |
 | `harris` | Harris corner detector (structure tensor) | `harris_gpu_cuda_tools.cu` |
 | `klt` | Pyramidal Lucas-Kanade optical flow tracker | `feature_tracker_cuda_tools.cu` |
+| `occupancy` | Occupancy grid for spatial feature distribution | `detector_base_gpu_cuda_tools.cu` |
+| `frontend` | Complete detect-track-replenish pipeline | `vilib_ros.cpp` |
 
 ## Engineering Roadmap
 
@@ -73,6 +77,7 @@ We are adopting a verification-first development strategy. The project is divide
 * [x] FAST Corner Detection
 * [x] Harris Corner Response
 * [x] KLT (Lucas-Kanade) Feature Tracker
+* [x] Occupancy Grid + Frontend Pipeline
 
 ### Phase 2: `wgpu` Acceleration
 
