@@ -8,12 +8,12 @@ pub mod image;
 pub mod convert;
 pub mod convolution;
 pub mod fast;
+pub mod gradient;
+pub mod harris;
 pub mod nms;
 pub mod pyramid;
 
 // Future steps (uncomment as implemented):
-// pub mod gradient;      // Step 4 dep: Sobel gradients
-// pub mod harris;        // Step 4: Harris corner detector
 // pub mod klt;           // Step 5: KLT / Lucas-Kanade tracker
 // pub mod occupancy;     // Step 6: occupancy grid
 // pub mod frontend;      // Step 6b: top-level pipeline

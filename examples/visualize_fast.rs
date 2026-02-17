@@ -5,6 +5,7 @@
 // Output: vis_output/*.svg — open in any browser.
 
 use rudolf_v::fast::FastDetector;
+use rudolf_v::harris::HarrisDetector;
 use rudolf_v::image::Image;
 use rudolf_v::nms::OccupancyNms;
 use rudolf_v::pyramid::Pyramid;
@@ -54,6 +55,33 @@ fn main() {
     // Multi-level FAST
     let svg_ml = render_multilevel_fast(&pyr);
     fs::write("vis_output/multilevel_fast.svg", &svg_ml).unwrap();
+
+    // Harris on chessboard — the test FAST can't pass
+    println!("\n=== Harris ===");
+    let chessboard = make_chessboard(80, 10, 20, 230);
+    let harris = HarrisDetector::new(0.04, 1e6, 2);
+    let harris_raw = harris.detect(&chessboard);
+    println!("  Chessboard Harris raw: {}", harris_raw.len());
+
+    let nms = OccupancyNms::new(12);
+    let harris_nms = nms.suppress(&harris_raw, chessboard.width(), chessboard.height());
+    println!("  After NMS (cell=12): {}", harris_nms.len());
+
+    let svg = render_comparison(&chessboard, &harris_raw, &harris_nms, 12, "chessboard Harris");
+    fs::write("vis_output/harris_chessboard.svg", &svg).unwrap();
+
+    // Harris response heatmap
+    let response = harris.corner_response(&chessboard);
+    let svg_resp = render_response_heatmap(&response, "Harris response (chessboard)");
+    fs::write("vis_output/harris_response.svg", &svg_resp).unwrap();
+
+    // FAST vs Harris side-by-side on the same image
+    let fast_det = FastDetector::new(20, 9);
+    let fast_chess = fast_det.detect(&chessboard);
+    println!("  FAST on chessboard: {} (expect ~0)", fast_chess.len());
+
+    let svg_vs = render_fast_vs_harris(&chessboard, &fast_chess, &harris_nms);
+    fs::write("vis_output/fast_vs_harris.svg", &svg_vs).unwrap();
 
     println!("\nDone! Open vis_output/*.svg in your browser.");
 }
@@ -111,6 +139,19 @@ fn make_gradient_step() -> Image<u8> {
             let base: u8 = if x < 50 { 30 } else { 200 };
             let grad = (y as f32 * 0.3) as u8;
             img.set(x, y, base.saturating_add(grad));
+        }
+    }
+    img
+}
+
+fn make_chessboard(img_size: usize, cell_size: usize, lo: u8, hi: u8) -> Image<u8> {
+    let mut img = Image::new(img_size, img_size);
+    for y in 0..img_size {
+        for x in 0..img_size {
+            let cx = x / cell_size;
+            let cy = y / cell_size;
+            let val = if (cx + cy) % 2 == 0 { lo } else { hi };
+            img.set(x, y, val);
         }
     }
     img
@@ -323,4 +364,87 @@ fn write_grid_overlay(svg: &mut String, img_w: usize, img_h: usize, cell_size: u
             y, sw, y).unwrap();
         y += cell_scaled;
     }
+}
+
+/// Render Harris response as a heatmap: blue (negative/edge) → black (zero) → red (positive/corner).
+fn render_response_heatmap(response: &Image<f32>, title: &str) -> String {
+    let sw = response.width() * SCALE;
+    let sh = response.height() * SCALE;
+    let total_h = sh + 40;
+
+    // Find min/max for normalization.
+    let mut min_r = f32::MAX;
+    let mut max_r = f32::MIN;
+    for (_, _, v) in response.pixels() {
+        if v < min_r { min_r = v; }
+        if v > max_r { max_r = v; }
+    }
+
+    let mut svg = String::new();
+    writeln!(svg, "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {} {}\" width=\"{}\" height=\"{}\">",
+        sw, total_h, sw, total_h).unwrap();
+    writeln!(svg, "<style>text {{ font-family: monospace; font-size: 12px; fill: #333; }}</style>").unwrap();
+    writeln!(svg, "<text x=\"10\" y=\"20\" font-weight=\"bold\">{}</text>", title).unwrap();
+
+    writeln!(svg, "<g transform=\"translate(0, 30)\">").unwrap();
+    for y in 0..response.height() {
+        for x in 0..response.width() {
+            let v = response.get(x, y);
+            let (r, g, b) = if v > 0.0 {
+                // Positive → red (corner)
+                let t = (v / max_r).sqrt().min(1.0); // sqrt for better visibility
+                ((t * 255.0) as u8, 0u8, 0u8)
+            } else if v < 0.0 {
+                // Negative → blue (edge)
+                let t = (v / min_r).sqrt().min(1.0);
+                (0u8, 0u8, (t * 255.0) as u8)
+            } else {
+                (0, 0, 0)
+            };
+            let px = x * SCALE;
+            let py = y * SCALE;
+            writeln!(svg, "  <rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"rgb({},{},{})\"/>",
+                px, py, SCALE, SCALE, r, g, b).unwrap();
+        }
+    }
+    writeln!(svg, "</g>").unwrap();
+    writeln!(svg, "</svg>").unwrap();
+    svg
+}
+
+/// FAST vs Harris side-by-side on the same image.
+fn render_fast_vs_harris(
+    img: &Image<u8>,
+    fast_features: &[rudolf_v::fast::Feature],
+    harris_features: &[rudolf_v::fast::Feature],
+) -> String {
+    let sw = img.width() * SCALE;
+    let sh = img.height() * SCALE;
+    let gap = 30;
+    let total_w = sw * 2 + gap;
+    let total_h = sh + 60;
+
+    let mut svg = String::new();
+    writeln!(svg, "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {} {}\" width=\"{}\" height=\"{}\">",
+        total_w, total_h, total_w, total_h).unwrap();
+    writeln!(svg, "<style>text {{ font-family: monospace; font-size: 12px; fill: #333; }}</style>").unwrap();
+    writeln!(svg, "<text x=\"10\" y=\"18\" font-weight=\"bold\" font-size=\"14\">FAST vs Harris on Chessboard</text>").unwrap();
+
+    // Left: FAST
+    writeln!(svg, "<g transform=\"translate(0, 40)\">").unwrap();
+    writeln!(svg, "<text x=\"10\" y=\"-5\">FAST-9: {} features</text>", fast_features.len()).unwrap();
+    write_image_rects(&mut svg, img);
+    write_feature_circles(&mut svg, fast_features, "ff2222");
+    writeln!(svg, "</g>").unwrap();
+
+    // Right: Harris
+    let offset = sw + gap;
+    writeln!(svg, "<g transform=\"translate({}, 40)\">", offset).unwrap();
+    writeln!(svg, "<text x=\"10\" y=\"-5\">Harris: {} features</text>", harris_features.len()).unwrap();
+    write_image_rects(&mut svg, img);
+    write_feature_circles(&mut svg, harris_features, "22cc44");
+    writeln!(svg, "</g>").unwrap();
+
+    writeln!(svg, "</svg>").unwrap();
+    svg
 }

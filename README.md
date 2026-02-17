@@ -2,10 +2,10 @@
 
 **Ru**st **D**evice **O**ptimized **L**ibrary for **F**rontend **V**ision
 
-> **Status: Phase 1 -- CPU Reference Implementation (In Progress)**
+> **Status: Phase 1 — CPU Reference Implementation (In Progress)**
 >
-> Core image infrastructure, Gaussian pyramids, and FAST corner detection are implemented and tested.
-> Harris corner response and KLT tracking are next.
+> Core image infrastructure, Gaussian pyramids, FAST and Harris corner detection are implemented and tested.
+> KLT tracking is next.
 
 ## About
 
@@ -24,14 +24,17 @@ While the original `vilib` is a state-of-the-art, CUDA-only library designed str
 # Run all tests
 cargo test
 
-# Visualize FAST corner detection and NMS
+# Visualize FAST and Harris corner detection
 cargo run --example visualize_fast
 # -> outputs SVG files in vis_output/:
-#     {scene}_fast_raw.svg     -- raw FAST detections
-#     {scene}_fast_nms.svg     -- after grid-based NMS
-#     {scene}_compare.svg      -- side-by-side comparison
-#     pyramid.svg              -- Gaussian pyramid levels
-#     multilevel_fast.svg      -- FAST at each pyramid level
+#     {scene}_fast_raw.svg     — raw FAST detections
+#     {scene}_fast_nms.svg     — after grid-based NMS
+#     {scene}_compare.svg      — side-by-side comparison
+#     pyramid.svg              — Gaussian pyramid levels
+#     multilevel_fast.svg      — FAST at each pyramid level
+#     harris_chessboard.svg    — Harris raw vs NMS on chessboard
+#     harris_response.svg      — Harris response heatmap
+#     fast_vs_harris.svg       — FAST vs Harris on same image
 
 # Run benchmarks
 cargo bench
@@ -41,12 +44,14 @@ cargo bench
 
 | Module | Description | vilib Equivalent |
 |---|---|---|
-| `image` | `Image<T>`, `ImageView<'a, T>`, `Pixel` trait, bilinear interpolation | -- |
-| `convert` | Pixel type conversions (u8 <-> f32, RGB -> grayscale) | -- |
+| `image` | `Image<T>`, `ImageView<'a, T>`, `Pixel` trait, bilinear interpolation | — |
+| `convert` | Pixel type conversions (u8 <-> f32, RGB -> grayscale) | — |
 | `convolution` | Separable 1D convolution (horizontal + vertical) | `conv_filter_row.cu`, `conv_filter_col.cu` |
 | `pyramid` | Gaussian image pyramid (blur + 2x downsample) | `pyramid_gpu.cu` |
 | `fast` | FAST-N corner detector (N=9,10,11,12) with Rosten's high-speed test | `fast_gpu_cuda_tools.cu` |
 | `nms` | Grid-based non-maximum suppression | `detector_base_gpu_cuda_tools.cu` |
+| `gradient` | Sobel gradient computation (separable) | `harris_gpu_cuda_tools.cu` |
+| `harris` | Harris corner detector (structure tensor) | `harris_gpu_cuda_tools.cu` |
 
 ## Engineering Roadmap
 
@@ -61,7 +66,7 @@ We are adopting a verification-first development strategy. The project is divide
 * [x] `Image<T>` Dynamic Container
 * [x] Gaussian Pyramid Generation
 * [x] FAST Corner Detection
-* [ ] Harris Corner Response
+* [x] Harris Corner Response
 * [ ] KLT (Lucas-Kanade) Feature Tracker
 
 ### Phase 2: `wgpu` Acceleration
