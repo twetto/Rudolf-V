@@ -19,6 +19,9 @@
 use rudolf_v::frontend::{Frontend, FrontendConfig};
 use rudolf_v::histeq::HistEqMethod;
 use rudolf_v::image::Image;
+use rudolf_v::camera::CameraIntrinsics;
+use rudolf_v::essential::RansacConfig;
+use rudolf_v::klt::LkMethod;
 
 use std::env;
 use std::fmt::Write as FmtWrite;
@@ -73,14 +76,35 @@ fn main() {
     drop(first_img); // Free memory; we'll reload in the loop.
     println!("Resolution: {}×{}", img_w, img_h);
 
+    // Load camera intrinsics for geometric verification (optional).
+    let sensor_yaml = cam0_dir.join("sensor.yaml");
+    let camera = match CameraIntrinsics::from_euroc_yaml(&sensor_yaml) {
+        Ok(cam) => {
+            println!("Camera: fx={:.1} fy={:.1} cx={:.1} cy={:.1}, {} distortion coeffs",
+                cam.fx, cam.fy, cam.cx, cam.cy, cam.distortion.len());
+            Some(cam)
+        }
+        Err(e) => {
+            eprintln!("Warning: no sensor.yaml ({}), geometric verification disabled", e);
+            None
+        }
+    };
+
     // Configure frontend.
     let config = FrontendConfig {
-        max_features: 150,
-        cell_size: 32,
+        max_features: 40,
+        cell_size: 128,
         pyramid_levels: 4,
         klt_window: 11,
         klt_max_iter: 30,
+        klt_method: LkMethod::InverseCompositional,
         histeq: HistEqMethod::Global,
+        camera,
+        ransac: RansacConfig {
+            threshold: 1e-5,
+            max_iterations: 200,
+            confidence: 0.99,
+        },
         ..Default::default()
     };
     println!("Config: max_features={}, cell={}px, pyramid={}L, klt_window={}, histeq=global",
