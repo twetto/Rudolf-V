@@ -132,12 +132,35 @@ impl KltTracker {
         curr_pyramid: &Pyramid,
         features: &[Feature],
     ) -> Vec<TrackedFeature> {
+        let mut results = Vec::with_capacity(features.len());
+        self.track_into(prev_pyramid, curr_pyramid, features, &mut results);
+        results
+    }
+
+    /// Track features into a pre-allocated result buffer.
+    ///
+    /// Clears `results` and fills it with one `TrackedFeature` per input
+    /// feature. Reusing the buffer across frames avoids per-frame Vec
+    /// allocation (which showed up as ~9% in the flamegraph via the
+    /// `spec_from_iter` → `extend_trusted` → page fault chain).
+    ///
+    /// GPU EQUIVALENT: Writing tracking results into a pre-allocated
+    /// storage buffer bound to the compute shader dispatch.
+    pub fn track_into(
+        &self,
+        prev_pyramid: &Pyramid,
+        curr_pyramid: &Pyramid,
+        features: &[Feature],
+        results: &mut Vec<TrackedFeature>,
+    ) {
         let num_levels = self.max_levels.min(prev_pyramid.num_levels()).min(curr_pyramid.num_levels());
 
-        features
-            .iter()
-            .map(|feat| self.track_single(prev_pyramid, curr_pyramid, feat, num_levels))
-            .collect()
+        results.clear();
+        results.reserve(features.len());
+
+        for feat in features {
+            results.push(self.track_single(prev_pyramid, curr_pyramid, feat, num_levels));
+        }
     }
 
     /// Track a single feature through the pyramid, coarse-to-fine.

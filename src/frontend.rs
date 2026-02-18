@@ -27,7 +27,7 @@ use crate::fast::{FastDetector, Feature};
 use crate::harris::HarrisDetector;
 use crate::histeq::{self, HistEqMethod};
 use crate::image::Image;
-use crate::klt::{KltTracker, LkMethod, TrackStatus};
+use crate::klt::{KltTracker, LkMethod, TrackedFeature, TrackStatus};
 use crate::nms::OccupancyNms;
 use crate::occupancy::OccupancyGrid;
 use crate::pyramid::{Pyramid, PyramidScratch};
@@ -149,8 +149,6 @@ impl Default for FrontendConfig {
 pub struct Frontend {
     config: FrontendConfig,
     /// Double-buffered pyramids: swap each frame to avoid allocation.
-    /// `prev_pyramid` holds the previous frame's pyramid (used for KLT tracking).
-    /// `curr_pyramid` is rebuilt each frame via `build_reuse`.
     prev_pyramid: Pyramid,
     curr_pyramid: Pyramid,
     /// Scratch buffers for pyramid construction (convolution intermediates).
@@ -161,6 +159,8 @@ pub struct Frontend {
     features: Vec<Feature>,
     /// Previous frame's feature positions (for geometric verification).
     prev_features: Vec<Feature>,
+    /// Reusable buffer for KLT tracking results (avoids per-frame alloc).
+    track_results: Vec<TrackedFeature>,
     /// Next feature ID to assign. Monotonically increasing.
     next_id: u64,
     /// Occupancy grid for spatial distribution.
@@ -233,6 +233,7 @@ impl Frontend {
             has_prev: false,
             features: Vec::new(),
             prev_features: Vec::new(),
+            track_results: Vec::new(),
             next_id: 1,
             grid,
             img_w,
@@ -298,19 +299,26 @@ impl Frontend {
                     self.config.klt_method,
                 );
 
-                let results = tracker.track(&self.prev_pyramid, &self.curr_pyramid, &self.features);
+                tracker.track_into(
+                    &self.prev_pyramid,
+                    &self.curr_pyramid,
+                    &self.features,
+                    &mut self.track_results,
+                );
 
-                // Keep only successfully tracked features.
-                let mut tracked = Vec::new();
-                for r in &results {
-                    if r.status == TrackStatus::Tracked {
-                        tracked.push(r.feature.clone());
+                // Filter features in-place: keep only successfully tracked.
+                // Avoids allocating a second Vec.
+                let mut write = 0;
+                for i in 0..self.track_results.len() {
+                    if self.track_results[i].status == TrackStatus::Tracked {
+                        self.features[write] = self.track_results[i].feature.clone();
+                        write += 1;
                         stats.tracked += 1;
                     } else {
                         stats.lost += 1;
                     }
                 }
-                self.features = tracked;
+                self.features.truncate(write);
                 timing.klt = t0.elapsed().as_secs_f64();
 
                 // Step 2b: Geometric verification (essential matrix RANSAC).
