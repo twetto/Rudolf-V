@@ -170,9 +170,13 @@ impl FastDetector {
     /// Check whether N contiguous circle pixels are all brighter or all
     /// darker than center ± threshold, and compute the corner score.
     ///
-    /// Uses the doubled-array trick to handle wrap-around: copy the 16
-    /// classifications into a 32-element array, then scan for a run of
-    /// length N.
+    /// Uses a bitmask approach instead of a doubled-array scan:
+    ///   1. Build u16 bright_mask / dark_mask from threshold classification.
+    ///   2. Check for N contiguous set bits via repeated AND-shift.
+    ///   3. If corner, find the longest run and score it.
+    ///
+    /// The repeated AND-shift is branchless and maps directly to GPU
+    /// bitwise ops in WGSL (u32 & (u32 >> 1) etc.).
     ///
     /// Returns (is_corner, score). Score = sum of (|diff| - threshold)
     /// for the qualifying pixels on the best arc.
@@ -184,91 +188,99 @@ impl FastDetector {
     ) -> (bool, f32) {
         let n = self.arc_length;
 
-        // Classify each circle pixel.
-        // +1 = brighter, -1 = darker, 0 = similar.
-        let mut class = [0i8; 16];
+        // Build bitmasks: bit i set if circle[i] is brighter/darker.
+        let mut bright_mask: u16 = 0;
+        let mut dark_mask: u16 = 0;
         for i in 0..16 {
             let diff = circle[i] - center;
             if diff > thresh {
-                class[i] = 1;
+                bright_mask |= 1 << i;
             } else if diff < -thresh {
-                class[i] = -1;
+                dark_mask |= 1 << i;
             }
         }
 
-        // Doubled array for wrap-around scanning.
-        let mut doubled = [0i8; 32];
-        doubled[..16].copy_from_slice(&class);
-        doubled[16..].copy_from_slice(&class);
-
-        let mut best_bright_score = -1.0f32;
-        let mut best_dark_score = -1.0f32;
-
-        // Scan for bright arcs.
-        let mut run_start = 0;
-        while run_start < 16 {
-            if doubled[run_start] != 1 {
-                run_start += 1;
-                continue;
-            }
-            // Find the end of this bright run.
-            let mut run_end = run_start;
-            while run_end < 32 && doubled[run_end] == 1 {
-                run_end += 1;
-            }
-            let run_len = run_end - run_start;
-            if run_len >= n {
-                // Score: sum of (|diff| - threshold) for this run, using
-                // only the unique 16 positions (avoid double-counting).
-                let score = self.arc_score(center, circle, thresh, run_start, run_len);
-                if score > best_bright_score {
-                    best_bright_score = score;
-                }
-            }
-            run_start = run_end;
+        // Quick popcount rejection: need at least N bits set.
+        let bright_has = bright_mask.count_ones() as usize >= n;
+        let dark_has = dark_mask.count_ones() as usize >= n;
+        if !bright_has && !dark_has {
+            return (false, 0.0);
         }
 
-        // Scan for dark arcs.
-        run_start = 0;
-        while run_start < 16 {
-            if doubled[run_start] != -1 {
-                run_start += 1;
-                continue;
+        // Check for N contiguous set bits in a circular 16-bit pattern.
+        // Method: double the mask into u32 to handle wrap-around, then
+        // AND-shift N-1 times. If result is nonzero, there's a run of N.
+        let mut best_score = -1.0f32;
+
+        if bright_has {
+            let m32 = (bright_mask as u32) | ((bright_mask as u32) << 16);
+            let mut acc = m32;
+            for _ in 1..n {
+                acc &= acc >> 1;
             }
-            let mut run_end = run_start;
-            while run_end < 32 && doubled[run_end] == -1 {
-                run_end += 1;
+            if acc != 0 {
+                // Corner found. Score the longest bright arc.
+                let score = self.bitmask_best_arc_score(
+                    center, circle, thresh, bright_mask);
+                best_score = best_score.max(score);
             }
-            let run_len = run_end - run_start;
-            if run_len >= n {
-                let score = self.arc_score(center, circle, thresh, run_start, run_len);
-                if score > best_dark_score {
-                    best_dark_score = score;
-                }
-            }
-            run_start = run_end;
         }
 
-        if best_bright_score >= 0.0 || best_dark_score >= 0.0 {
-            (true, best_bright_score.max(best_dark_score))
+        if dark_has {
+            let m32 = (dark_mask as u32) | ((dark_mask as u32) << 16);
+            let mut acc = m32;
+            for _ in 1..n {
+                acc &= acc >> 1;
+            }
+            if acc != 0 {
+                let score = self.bitmask_best_arc_score(
+                    center, circle, thresh, dark_mask);
+                best_score = best_score.max(score);
+            }
+        }
+
+        if best_score >= 0.0 {
+            (true, best_score)
         } else {
             (false, 0.0)
         }
     }
 
-    /// Compute the score for an arc starting at `start` with length `len`
-    /// in the doubled array. Maps indices back to [0..16) to read circle values.
-    fn arc_score(
+    /// Find the longest contiguous arc in a circular 16-bit mask and
+    /// compute its score. Used only for confirmed corners (rare path).
+    #[inline]
+    fn bitmask_best_arc_score(
         &self,
         center: i16,
         circle: &[i16; 16],
         thresh: i16,
-        start: usize,
-        len: usize,
+        mask: u16,
     ) -> f32 {
+        // Find all runs and pick the longest. Use the doubled u32 trick.
+        let m32 = (mask as u32) | ((mask as u32) << 16);
+        let mut best_start = 0usize;
+        let mut best_len = 0usize;
+        let mut i = 0u32;
+        while i < 16 {
+            if m32 & (1 << i) == 0 {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < 32 && (m32 & (1 << i)) != 0 {
+                i += 1;
+            }
+            let run_len = (i - start) as usize;
+            if run_len > best_len {
+                best_len = run_len;
+                best_start = start as usize;
+            }
+        }
+
+        // Score the best arc.
         let mut score = 0.0f32;
-        for i in start..start + len {
-            let idx = i % 16;
+        for j in best_start..best_start + best_len {
+            let idx = j % 16;
             let diff = (circle[idx] - center).abs() - thresh;
             score += diff.max(0) as f32;
         }

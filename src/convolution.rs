@@ -162,6 +162,145 @@ pub fn convolve_separable<T: Pixel>(
     convolve_cols(&intermediate, kernel_col)
 }
 
+/// Scratch buffers for separable convolution, reusable across frames.
+///
+/// Eliminates per-frame allocation overhead that causes Linux page faults
+/// (~9% of runtime in flamegraph). Pre-allocate once, reuse every frame.
+///
+/// GPU EQUIVALENT: Pre-allocated intermediate textures that persist
+/// across dispatch calls.
+pub struct ConvolveScratch {
+    pub intermediate: Image<f32>,
+    pub output: Image<f32>,
+}
+
+impl ConvolveScratch {
+    /// Create scratch buffers for the given image dimensions.
+    pub fn new(width: usize, height: usize) -> Self {
+        ConvolveScratch {
+            intermediate: Image::new(width, height),
+            output: Image::new(width, height),
+        }
+    }
+
+    /// Ensure scratch buffers are large enough for the given dimensions.
+    pub fn ensure_size(&mut self, width: usize, height: usize) {
+        if self.intermediate.width() != width || self.intermediate.height() != height {
+            self.intermediate.clear_resize(width, height);
+        }
+        if self.output.width() != width || self.output.height() != height {
+            self.output.clear_resize(width, height);
+        }
+    }
+}
+
+/// Convolve rows into a pre-allocated output buffer (f32 → f32 variant).
+/// The `dst` buffer is resized/cleared to match `src` dimensions.
+pub fn convolve_rows_into(src: &Image<f32>, kernel: &[f32], dst: &mut Image<f32>) {
+    assert!(!kernel.is_empty() && kernel.len() % 2 == 1);
+
+    let w = src.width();
+    let h = src.height();
+    let half = kernel.len() / 2;
+    dst.clear_resize(w, h);
+
+    for y in 0..h {
+        for x in 0..half.min(w) {
+            let mut acc = 0.0f32;
+            for (ki, &kv) in kernel.iter().enumerate() {
+                let sx = (x as isize) + (ki as isize) - (half as isize);
+                let sx = sx.clamp(0, (w - 1) as isize) as usize;
+                acc += src.get(sx, y) * kv;
+            }
+            dst.set(x, y, acc);
+        }
+
+        if w > 2 * half {
+            for x in half..(w - half) {
+                let mut acc = 0.0f32;
+                unsafe {
+                    for (ki, &kv) in kernel.iter().enumerate() {
+                        acc += src.get_unchecked(x + ki - half, y) * kv;
+                    }
+                    dst.set_unchecked(x, y, acc);
+                }
+            }
+        }
+
+        let right_start = if w > half { w - half } else { half.min(w) };
+        for x in right_start..w {
+            let mut acc = 0.0f32;
+            for (ki, &kv) in kernel.iter().enumerate() {
+                let sx = (x as isize) + (ki as isize) - (half as isize);
+                let sx = sx.clamp(0, (w - 1) as isize) as usize;
+                acc += src.get(sx, y) * kv;
+            }
+            dst.set(x, y, acc);
+        }
+    }
+}
+
+/// Convolve columns into a pre-allocated output buffer.
+pub fn convolve_cols_into(src: &Image<f32>, kernel: &[f32], dst: &mut Image<f32>) {
+    assert!(!kernel.is_empty() && kernel.len() % 2 == 1);
+
+    let w = src.width();
+    let h = src.height();
+    let half = kernel.len() / 2;
+    dst.clear_resize(w, h);
+
+    for y in 0..half.min(h) {
+        for x in 0..w {
+            let mut acc = 0.0f32;
+            for (ki, &kv) in kernel.iter().enumerate() {
+                let sy = (y as isize) + (ki as isize) - (half as isize);
+                let sy = sy.clamp(0, (h - 1) as isize) as usize;
+                acc += src.get(x, sy) * kv;
+            }
+            dst.set(x, y, acc);
+        }
+    }
+
+    if h > 2 * half {
+        for y in half..(h - half) {
+            for x in 0..w {
+                let mut acc = 0.0f32;
+                unsafe {
+                    for (ki, &kv) in kernel.iter().enumerate() {
+                        acc += src.get_unchecked(x, y + ki - half) * kv;
+                    }
+                    dst.set_unchecked(x, y, acc);
+                }
+            }
+        }
+    }
+
+    let bottom_start = if h > half { h - half } else { half.min(h) };
+    for y in bottom_start..h {
+        for x in 0..w {
+            let mut acc = 0.0f32;
+            for (ki, &kv) in kernel.iter().enumerate() {
+                let sy = (y as isize) + (ki as isize) - (half as isize);
+                let sy = sy.clamp(0, (h - 1) as isize) as usize;
+                acc += src.get(x, sy) * kv;
+            }
+            dst.set(x, y, acc);
+        }
+    }
+}
+
+/// Full separable 2D convolution using pre-allocated scratch buffers.
+/// Writes result into `scratch.output`.
+pub fn convolve_separable_into(
+    src: &Image<f32>,
+    kernel_row: &[f32],
+    kernel_col: &[f32],
+    scratch: &mut ConvolveScratch,
+) {
+    convolve_rows_into(src, kernel_row, &mut scratch.intermediate);
+    convolve_cols_into(&scratch.intermediate, kernel_col, &mut scratch.output);
+}
+
 /// Generate a 1D Gaussian kernel with the given half-size and sigma.
 ///
 /// Returns a kernel of length `2 * half_size + 1`, normalized so the

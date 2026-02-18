@@ -30,7 +30,7 @@ use crate::image::Image;
 use crate::klt::{KltTracker, LkMethod, TrackStatus};
 use crate::nms::OccupancyNms;
 use crate::occupancy::OccupancyGrid;
-use crate::pyramid::Pyramid;
+use crate::pyramid::{Pyramid, PyramidScratch};
 
 /// Which corner detector to use.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -148,10 +148,15 @@ impl Default for FrontendConfig {
 /// GPU kernels for each step. Our CPU reference mirrors that pipeline.
 pub struct Frontend {
     config: FrontendConfig,
-    /// Previous frame's pyramid. `None` on the very first frame.
-    /// This is a Rust `Option<T>` — the type-safe replacement for
-    /// NULL pointers. The compiler forces you to handle both cases.
-    prev_pyramid: Option<Pyramid>,
+    /// Double-buffered pyramids: swap each frame to avoid allocation.
+    /// `prev_pyramid` holds the previous frame's pyramid (used for KLT tracking).
+    /// `curr_pyramid` is rebuilt each frame via `build_reuse`.
+    prev_pyramid: Pyramid,
+    curr_pyramid: Pyramid,
+    /// Scratch buffers for pyramid construction (convolution intermediates).
+    pyr_scratch: PyramidScratch,
+    /// Whether we have a valid previous frame.
+    has_prev: bool,
     /// Currently tracked features with persistent IDs.
     features: Vec<Feature>,
     /// Previous frame's feature positions (for geometric verification).
@@ -219,9 +224,13 @@ impl Frontend {
     /// Create a new frontend for images of the given dimensions.
     pub fn new(config: FrontendConfig, img_w: usize, img_h: usize) -> Self {
         let grid = OccupancyGrid::new(img_w, img_h, config.cell_size);
+        let pyr_scratch = PyramidScratch::new(img_w, img_h, config.pyramid_sigma);
         Frontend {
             config,
-            prev_pyramid: None,
+            prev_pyramid: Pyramid { levels: Vec::new() },
+            curr_pyramid: Pyramid { levels: Vec::new() },
+            pyr_scratch,
+            has_prev: false,
             features: Vec::new(),
             prev_features: Vec::new(),
             next_id: 1,
@@ -255,9 +264,15 @@ impl Frontend {
         };
         timing.histeq = t0.elapsed().as_secs_f64();
 
-        // Step 1: Build pyramid.
+        // Step 1: Build pyramid (reusing buffers to avoid page faults).
+        // Swap: what was curr becomes prev, then rebuild curr.
         let t0 = Instant::now();
-        let curr_pyramid = Pyramid::build(input, self.config.pyramid_levels, self.config.pyramid_sigma);
+        std::mem::swap(&mut self.prev_pyramid, &mut self.curr_pyramid);
+        self.curr_pyramid.build_reuse(
+            input,
+            self.config.pyramid_levels,
+            &mut self.pyr_scratch,
+        );
         timing.pyramid = t0.elapsed().as_secs_f64();
 
         let mut stats = FrameStats {
@@ -273,7 +288,7 @@ impl Frontend {
 
         // Step 2: Track existing features if we have a previous frame.
         let t0 = Instant::now();
-        if let Some(ref prev_pyr) = self.prev_pyramid {
+        if self.has_prev {
             if !self.features.is_empty() {
                 let tracker = KltTracker::with_method(
                     self.config.klt_window,
@@ -283,7 +298,7 @@ impl Frontend {
                     self.config.klt_method,
                 );
 
-                let results = tracker.track(prev_pyr, &curr_pyramid, &self.features);
+                let results = tracker.track(&self.prev_pyramid, &self.curr_pyramid, &self.features);
 
                 // Keep only successfully tracked features.
                 let mut tracked = Vec::new();
@@ -368,7 +383,7 @@ impl Frontend {
 
         if slots_available > 0 {
             // Convert pyramid level 0 to u8 for detection.
-            let level0 = &curr_pyramid.levels[0];
+            let level0 = &self.curr_pyramid.levels[0];
             let mut u8_img = Image::new(level0.width(), level0.height());
             for (x, y, v) in level0.pixels() {
                 u8_img.set(x, y, v.clamp(0.0, 255.0).round() as u8);
@@ -417,8 +432,9 @@ impl Frontend {
         }
         timing.detect = t0.elapsed().as_secs_f64();
 
-        // Step 6: Store pyramid and feature snapshot for next frame.
-        self.prev_pyramid = Some(curr_pyramid);
+        // Step 6: Mark that we have a valid previous frame, store feature snapshot.
+        // (Pyramid swap already happened at step 1 — curr is ready for next frame's prev.)
+        self.has_prev = true;
         self.prev_features = self.features.clone();
 
         timing.total = t_total.elapsed().as_secs_f64();
@@ -437,12 +453,12 @@ impl Frontend {
 
     /// Number of frames processed so far.
     pub fn has_prev_frame(&self) -> bool {
-        self.prev_pyramid.is_some()
+        self.has_prev
     }
 
     /// Reset the frontend (clear all features, discard previous frame).
     pub fn reset(&mut self) {
-        self.prev_pyramid = None;
+        self.has_prev = false;
         self.features.clear();
         self.prev_features.clear();
         self.grid.clear();

@@ -144,6 +144,36 @@ impl<T: Pixel> Image<T> {
         Self::new_with_stride(width, height, width)
     }
 
+    /// Resize and clear the image, reusing the allocation if possible.
+    ///
+    /// If the existing buffer has enough capacity, it is reused (just
+    /// zeroed and resized). This avoids page faults from repeated
+    /// alloc/dealloc cycles — on Linux, freed pages are lazily unmapped,
+    /// and re-allocating triggers `asm_exc_page_fault` for each new page.
+    ///
+    /// GPU EQUIVALENT: Reusing a pre-allocated texture/buffer rather than
+    /// creating and destroying resources each frame.
+    #[inline]
+    pub fn clear_resize(&mut self, width: usize, height: usize) {
+        let needed = height * width;
+        if self.data.len() >= needed {
+            // Reuse existing allocation — just zero and adjust dimensions.
+            for v in &mut self.data[..needed] {
+                *v = T::default();
+            }
+            self.data.truncate(needed);
+        } else {
+            // Need more space — reallocate.
+            self.data.resize(needed, T::default());
+            for v in &mut self.data {
+                *v = T::default();
+            }
+        }
+        self.width = width;
+        self.height = height;
+        self.stride = width;
+    }
+
     /// Create a zero-initialized image with an explicit stride.
     ///
     /// # Panics

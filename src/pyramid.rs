@@ -16,7 +16,8 @@
 //   build() → convolve_separable() → convolve_rows(). The T: Pixel bound
 //   must be threaded through each layer.
 
-use crate::convolution::{convolve_separable, gaussian_kernel_1d};
+use crate::convolution::{convolve_separable, convolve_separable_into,
+                         gaussian_kernel_1d, ConvolveScratch};
 use crate::image::{Image, Pixel};
 
 /// A Gaussian image pyramid.
@@ -33,35 +34,37 @@ pub struct Pyramid {
     pub levels: Vec<Image<f32>>,
 }
 
+/// Pre-allocated scratch buffers for pyramid construction.
+///
+/// Eliminates per-frame allocation overhead. The convolution intermediate
+/// buffers and the blurred-before-downsample buffer are reused across frames.
+///
+/// Flamegraph showed ~9% of runtime in `asm_exc_page_fault` from repeated
+/// alloc/dealloc of these buffers. With scratch reuse, pages stay mapped.
+pub struct PyramidScratch {
+    conv: ConvolveScratch,
+    kernel: Vec<f32>,
+}
+
+impl PyramidScratch {
+    /// Create scratch buffers for the given image dimensions and sigma.
+    pub fn new(width: usize, height: usize, sigma: f32) -> Self {
+        let half_size = (3.0 * sigma).ceil().max(1.0) as usize;
+        PyramidScratch {
+            conv: ConvolveScratch::new(width, height),
+            kernel: gaussian_kernel_1d(half_size, sigma),
+        }
+    }
+}
+
 impl Pyramid {
     /// Build a Gaussian pyramid from an input image.
     ///
-    /// # Arguments
-    /// * `src` — Input image (any pixel type; converted to f32 internally).
-    /// * `num_levels` — Total number of pyramid levels including the original.
-    ///   Must be >= 1. Typically 3–5 for VIO.
-    /// * `sigma` — Standard deviation of the Gaussian blur kernel.
-    ///   vilib uses σ ≈ 1.0.
-    ///
-    /// # Panics
-    /// Panics if `num_levels == 0`.
-    ///
-    /// # Example
-    /// ```
-    /// use rudolf_v::image::Image;
-    /// use rudolf_v::pyramid::Pyramid;
-    ///
-    /// let img: Image<u8> = Image::new(640, 480);
-    /// let pyr = Pyramid::build(&img, 4, 1.0);
-    /// assert_eq!(pyr.num_levels(), 4);
-    /// assert_eq!(pyr.levels[0].width(), 640);
-    /// assert_eq!(pyr.levels[1].width(), 320);
-    /// ```
+    /// Allocates fresh buffers each call. For repeated use (e.g., per-frame
+    /// in a pipeline), use `build_reuse` with a `PyramidScratch` instead.
     pub fn build<T: Pixel>(src: &Image<T>, num_levels: usize, sigma: f32) -> Self {
         assert!(num_levels >= 1, "pyramid must have at least 1 level");
 
-        // Kernel half-size: ceil(3*sigma) is a common choice, but we cap
-        // at 2 for the default sigma=1.0 → 5-tap kernel, matching vilib.
         let half_size = (3.0 * sigma).ceil().max(1.0) as usize;
         let kernel = gaussian_kernel_1d(half_size, sigma);
 
@@ -82,15 +85,48 @@ impl Pyramid {
         Pyramid { levels }
     }
 
+    /// Build a Gaussian pyramid, reusing pre-allocated buffers.
+    ///
+    /// On the first call, `self.levels` may be empty — they'll be allocated.
+    /// On subsequent calls, existing level buffers are reused via `clear_resize`,
+    /// avoiding page faults from repeated alloc/dealloc.
+    pub fn build_reuse<T: Pixel>(
+        &mut self,
+        src: &Image<T>,
+        num_levels: usize,
+        scratch: &mut PyramidScratch,
+    ) {
+        assert!(num_levels >= 1);
+
+        // Ensure we have enough level slots.
+        while self.levels.len() < num_levels {
+            self.levels.push(Image::new(1, 1));
+        }
+        self.levels.truncate(num_levels);
+
+        // Level 0: convert source to f32, reusing buffer.
+        to_f32_image_into(src, &mut self.levels[0]);
+
+        // Each subsequent level: blur previous, downsample.
+        for i in 1..num_levels {
+            let (prev_levels, curr_levels) = self.levels.split_at_mut(i);
+            let prev = &prev_levels[i - 1];
+
+            // Ensure convolution scratch is big enough for this level.
+            scratch.conv.ensure_size(prev.width(), prev.height());
+            convolve_separable_into(prev, &scratch.kernel, &scratch.kernel, &mut scratch.conv);
+
+            // Downsample blurred result into current level.
+            downsample_2x_into(&scratch.conv.output, &mut curr_levels[0]);
+        }
+    }
+
     /// Number of pyramid levels.
     pub fn num_levels(&self) -> usize {
         self.levels.len()
     }
 
     /// Get a reference to a specific level.
-    ///
-    /// # Panics
-    /// Panics if `level >= num_levels()`.
     pub fn level(&self, level: usize) -> &Image<f32> {
         &self.levels[level]
     }
@@ -108,10 +144,24 @@ fn downsample_2x(src: &Image<f32>) -> Image<f32> {
 
     for y in 0..new_h {
         for x in 0..new_w {
-            dst.set(x, y, src.get(x * 2, y * 2));
+            // SAFETY: x*2 < width and y*2 < height since x < width/2 and y < height/2.
+            unsafe { dst.set_unchecked(x, y, src.get_unchecked(x * 2, y * 2)); }
         }
     }
     dst
+}
+
+/// Downsample into a pre-allocated buffer.
+fn downsample_2x_into(src: &Image<f32>, dst: &mut Image<f32>) {
+    let new_w = src.width() / 2;
+    let new_h = src.height() / 2;
+    dst.clear_resize(new_w, new_h);
+
+    for y in 0..new_h {
+        for x in 0..new_w {
+            unsafe { dst.set_unchecked(x, y, src.get_unchecked(x * 2, y * 2)); }
+        }
+    }
 }
 
 /// Convert any Pixel image to f32, preserving raw values.
@@ -123,6 +173,16 @@ fn to_f32_image<T: Pixel>(src: &Image<T>) -> Image<f32> {
         }
     }
     dst
+}
+
+/// Convert into a pre-allocated f32 buffer.
+fn to_f32_image_into<T: Pixel>(src: &Image<T>, dst: &mut Image<f32>) {
+    dst.clear_resize(src.width(), src.height());
+    for y in 0..src.height() {
+        for x in 0..src.width() {
+            unsafe { dst.set_unchecked(x, y, src.get(x, y).to_f32()); }
+        }
+    }
 }
 
 #[cfg(test)]
