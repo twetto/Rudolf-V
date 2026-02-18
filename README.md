@@ -2,7 +2,7 @@
 
 **Ru**st **D**evice **O**ptimized **L**ibrary for **F**rontend **V**ision
 
-> **Status: Phase 1 — CPU Reference Implementation (Complete)**
+> **Status: Phase 1 -- CPU Reference Implementation (Complete)**
 >
 > All core algorithms are implemented: image containers, Gaussian pyramids, FAST and Harris
 > corner detection, pyramidal KLT tracking (forward additive + inverse compositional),
@@ -29,26 +29,26 @@ cargo test
 # Visualize FAST and Harris corner detection
 cargo run --example visualize_fast
 # -> outputs SVG files in vis_output/:
-#     {scene}_fast_raw.svg     — raw FAST detections
-#     {scene}_fast_nms.svg     — after grid-based NMS
-#     {scene}_compare.svg      — side-by-side comparison
-#     pyramid.svg              — Gaussian pyramid levels
-#     multilevel_fast.svg      — FAST at each pyramid level
-#     harris_chessboard.svg    — Harris raw vs NMS on chessboard
-#     harris_response.svg      — Harris response heatmap
-#     fast_vs_harris.svg       — FAST vs Harris on same image
-#     klt_flow_1to2.svg        — KLT flow arrows (frame 1→2)
-#     klt_flow_2to3.svg        — KLT flow arrows (frame 2→3)
-#     klt_multiframe.svg       — 3-frame tracking trails
-#     klt_subpixel.svg         — sub-pixel blob tracking demo
+#     {scene}_fast_raw.svg     -- raw FAST detections
+#     {scene}_fast_nms.svg     -- after grid-based NMS
+#     {scene}_compare.svg      -- side-by-side comparison
+#     pyramid.svg              -- Gaussian pyramid levels
+#     multilevel_fast.svg      -- FAST at each pyramid level
+#     harris_chessboard.svg    -- Harris raw vs NMS on chessboard
+#     harris_response.svg      -- Harris response heatmap
+#     fast_vs_harris.svg       -- FAST vs Harris on same image
+#     klt_flow_1to2.svg        -- KLT flow arrows (frame 1->2)
+#     klt_flow_2to3.svg        -- KLT flow arrows (frame 2->3)
+#     klt_multiframe.svg       -- 3-frame tracking trails
+#     klt_subpixel.svg         -- sub-pixel blob tracking demo
 
 # Run on EuRoC MAV dataset
 cargo run --example euroc_frontend --release -- /path/to/MH_01_easy
 # Optional: limit to N frames
 cargo run --example euroc_frontend --release -- /path/to/MH_01_easy 100
-# → outputs:
-#     vis_output/euroc_tracks.svg   — feature tracks overlaid on last frame
-#     vis_output/euroc_stats.csv    — per-frame statistics
+# -> outputs:
+#     vis_output/euroc_tracks.svg   -- feature tracks overlaid on last frame
+#     vis_output/euroc_stats.csv    -- per-frame statistics
 
 # Live visualization window (requires minifb)
 cargo run --example euroc_live --release -- /path/to/MH_01_easy
@@ -62,8 +62,8 @@ cargo bench
 
 | Module | Description | vilib Equivalent |
 |---|---|---|
-| `image` | `Image<T>`, `ImageView<'a, T>`, `Pixel` trait, bilinear interpolation | — |
-| `convert` | Pixel type conversions (u8 <-> f32, RGB -> grayscale) | — |
+| `image` | `Image<T>`, `ImageView<'a, T>`, `Pixel` trait, bilinear interpolation | -- |
+| `convert` | Pixel type conversions (u8<->f32, RGB->grayscale) | -- |
 | `convolution` | Separable 1D convolution (horizontal + vertical) | `conv_filter_row.cu`, `conv_filter_col.cu` |
 | `pyramid` | Gaussian image pyramid (blur + 2x downsample) | `pyramid_gpu.cu` |
 | `fast` | FAST-N corner detector (N=9,10,11,12) with Rosten's high-speed test | `fast_gpu_cuda_tools.cu` |

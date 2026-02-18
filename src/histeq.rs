@@ -339,11 +339,9 @@ mod tests {
             }
         }
         let out = equalize_histogram(&img);
-        for y in 0..50 {
-            for x in 0..50 {
-                assert!(out.get(x, y) <= 255);
-            }
-        }
+        // Verify output is a valid image with same dimensions.
+        assert_eq!(out.width(), 50);
+        assert_eq!(out.height(), 50);
     }
 
     #[test]
@@ -361,11 +359,6 @@ mod tests {
         let out = equalize_clahe(&img, 16, 2.0);
         assert_eq!(out.width(), w);
         assert_eq!(out.height(), h);
-        for y in 0..h {
-            for x in 0..w {
-                assert!(out.get(x, y) <= 255);
-            }
-        }
     }
 
     #[test]
