@@ -199,14 +199,12 @@ fn main() {
             && last_frame_time.elapsed().as_millis() >= frame_delay_ms as u128;
 
         if should_advance {
-            let t0 = Instant::now();
 
             let img = load_grayscale(&data_dir.join(&image_files[frame_idx]));
             let (features, stats) = frontend.process(&img);
 
             // Clone features to release the mutable borrow on frontend.
             let features: Vec<Feature> = features.to_vec();
-            let proc_ms = t0.elapsed().as_secs_f32() * 1000.0;
 
             // Render frame to framebuffer.
             render_grayscale(&img, &mut fb, img_w, img_h, scale);
@@ -295,9 +293,9 @@ fn main() {
             // HUD text (top-left info bar).
             draw_rect(&mut fb, win_w, win_h, 0, 0, win_w, 14, 0x222222);
             // Simple: just print to stdout since bitmap text is painful.
-            print!("\r{:5}: trk={:<3} lost={:<3} rej={:<3} new={:<3} tot={:<3} {:.1}ms  ",
+            print!("\r{:5}: trk={:<3} lost={:<3} rej={:<3} new={:<3} tot={:<3} | {}  ",
                 frame_idx, stats.tracked, stats.lost, stats.rejected,
-                stats.new_detections, stats.total, proc_ms);
+                stats.new_detections, stats.total, stats.timing);
 
             prev_positions = curr_positions;
             frame_idx += 1;

@@ -27,23 +27,51 @@ use crate::image::{Image, Pixel};
 /// element is at index K/2. So a 5-tap kernel [-2, -1, 0, +1, +2] has
 /// its center at index 2.
 ///
-/// Works in f32 internally to accumulate without rounding per pixel.
+/// Optimized: the interior pixels (where the kernel doesn't touch the
+/// border) use unchecked access. Border pixels use clamped access.
+/// This mirrors GPU texture sampling with clamp-to-edge addressing.
 pub fn convolve_rows<T: Pixel>(src: &Image<T>, kernel: &[f32]) -> Image<f32> {
     assert!(!kernel.is_empty(), "kernel must not be empty");
     assert!(kernel.len() % 2 == 1, "kernel length must be odd (got {})", kernel.len());
 
     let w = src.width();
     let h = src.height();
-    let half = (kernel.len() / 2) as isize;
+    let half = kernel.len() / 2;
     let mut dst = Image::<f32>::new(w, h);
 
     for y in 0..h {
-        for x in 0..w {
+        // Left border: x in [0, half)
+        for x in 0..half.min(w) {
             let mut acc = 0.0f32;
             for (ki, &kv) in kernel.iter().enumerate() {
-                // Signed arithmetic to handle negative indices near left edge.
-                let sx = (x as isize) + (ki as isize) - half;
-                // Clamp to [0, w-1].
+                let sx = (x as isize) + (ki as isize) - (half as isize);
+                let sx = sx.clamp(0, (w - 1) as isize) as usize;
+                acc += src.get(sx, y).to_f32() * kv;
+            }
+            dst.set(x, y, acc);
+        }
+
+        // Interior: x in [half, w - half) — no bounds checks needed.
+        if w > 2 * half {
+            for x in half..(w - half) {
+                let mut acc = 0.0f32;
+                // SAFETY: x - half >= 0 and x + half < w, all within bounds.
+                unsafe {
+                    for (ki, &kv) in kernel.iter().enumerate() {
+                        let sx = x + ki - half;
+                        acc += src.get_unchecked(sx, y).to_f32() * kv;
+                    }
+                    dst.set_unchecked(x, y, acc);
+                }
+            }
+        }
+
+        // Right border: x in [w - half, w)
+        let right_start = if w > half { w - half } else { half.min(w) };
+        for x in right_start..w {
+            let mut acc = 0.0f32;
+            for (ki, &kv) in kernel.iter().enumerate() {
+                let sx = (x as isize) + (ki as isize) - (half as isize);
                 let sx = sx.clamp(0, (w - 1) as isize) as usize;
                 acc += src.get(sx, y).to_f32() * kv;
             }
@@ -56,20 +84,53 @@ pub fn convolve_rows<T: Pixel>(src: &Image<T>, kernel: &[f32]) -> Image<f32> {
 /// Convolve each column of `src` with a 1D kernel (vertical pass).
 ///
 /// Input is f32 (the output of convolve_rows). Output is also f32.
+/// Optimized with interior/border split like convolve_rows.
 pub fn convolve_cols(src: &Image<f32>, kernel: &[f32]) -> Image<f32> {
     assert!(!kernel.is_empty(), "kernel must not be empty");
     assert!(kernel.len() % 2 == 1, "kernel length must be odd (got {})", kernel.len());
 
     let w = src.width();
     let h = src.height();
-    let half = (kernel.len() / 2) as isize;
+    let half = kernel.len() / 2;
     let mut dst = Image::<f32>::new(w, h);
 
-    for y in 0..h {
+    // Top border rows: y in [0, half)
+    for y in 0..half.min(h) {
         for x in 0..w {
             let mut acc = 0.0f32;
             for (ki, &kv) in kernel.iter().enumerate() {
-                let sy = (y as isize) + (ki as isize) - half;
+                let sy = (y as isize) + (ki as isize) - (half as isize);
+                let sy = sy.clamp(0, (h - 1) as isize) as usize;
+                acc += src.get(x, sy) * kv;
+            }
+            dst.set(x, y, acc);
+        }
+    }
+
+    // Interior rows: y in [half, h - half) — no bounds checks needed.
+    if h > 2 * half {
+        for y in half..(h - half) {
+            for x in 0..w {
+                let mut acc = 0.0f32;
+                // SAFETY: y - half >= 0 and y + half < h, all within bounds.
+                unsafe {
+                    for (ki, &kv) in kernel.iter().enumerate() {
+                        let sy = y + ki - half;
+                        acc += src.get_unchecked(x, sy) * kv;
+                    }
+                    dst.set_unchecked(x, y, acc);
+                }
+            }
+        }
+    }
+
+    // Bottom border rows: y in [h - half, h)
+    let bottom_start = if h > half { h - half } else { half.min(h) };
+    for y in bottom_start..h {
+        for x in 0..w {
+            let mut acc = 0.0f32;
+            for (ki, &kv) in kernel.iter().enumerate() {
+                let sy = (y as isize) + (ki as isize) - (half as isize);
                 let sy = sy.clamp(0, (h - 1) as isize) as usize;
                 acc += src.get(x, sy) * kv;
             }

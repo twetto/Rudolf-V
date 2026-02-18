@@ -22,7 +22,7 @@
 // - `match` on enums to dispatch between algorithm variants.
 
 use crate::fast::Feature;
-use crate::image::{interpolate_bilinear, Image};
+use crate::image::{interpolate_bilinear, interpolate_bilinear_unchecked, Image};
 use crate::pyramid::Pyramid;
 
 /// Status of a tracked feature after one frame-to-frame tracking pass.
@@ -244,6 +244,12 @@ impl KltTracker {
     ) -> LkResult {
         let half_i = self.window_size as isize;
 
+        // Check if template window is in bounds (constant across iterations).
+        let tmpl_in_bounds = (feat_x - half_i as f32) >= 0.0
+            && (feat_y - half_i as f32) >= 0.0
+            && (feat_x + half_i as f32) < prev_img.width() as f32
+            && (feat_y + half_i as f32) < prev_img.height() as f32;
+
         for _iter in 0..self.max_iterations {
             // Accumulators for the 2×2 Hessian and 2×1 right-hand side.
             let mut h00 = 0.0f32;
@@ -251,34 +257,56 @@ impl KltTracker {
             let mut h11 = 0.0f32;
             let mut b0 = 0.0f32;
             let mut b1 = 0.0f32;
+
+            // Check if warped window + gradient margin is in bounds.
+            let warp_in_bounds = (feat_x + dx - half_i as f32 - 1.0) >= 0.0
+                && (feat_y + dy - half_i as f32 - 1.0) >= 0.0
+                && (feat_x + dx + half_i as f32 + 1.0) < curr_img.width() as f32
+                && (feat_y + dy + half_i as f32 + 1.0) < curr_img.height() as f32;
+
+            let both_in_bounds = tmpl_in_bounds && warp_in_bounds;
+
             for py in -half_i..=half_i {
                 for px in -half_i..=half_i {
                     let px_f = px as f32;
                     let py_f = py as f32;
 
-                    // Template pixel from previous frame (at original feature position).
-                    let t_val = interpolate_bilinear(
-                        prev_img,
-                        feat_x + px_f,
-                        feat_y + py_f,
-                    );
+                    let (t_val, i_val, gx, gy);
 
-                    // Warped pixel from current frame (at feature + displacement).
-                    let wx = feat_x + dx + px_f;
-                    let wy = feat_y + dy + py_f;
-                    let i_val = interpolate_bilinear(curr_img, wx, wy);
+                    if both_in_bounds {
+                        // SAFETY: both template and warped windows verified in bounds.
+                        unsafe {
+                            t_val = interpolate_bilinear_unchecked(
+                                prev_img, feat_x + px_f, feat_y + py_f);
 
-                    // Error.
+                            let wx = feat_x + dx + px_f;
+                            let wy = feat_y + dy + py_f;
+                            i_val = interpolate_bilinear_unchecked(curr_img, wx, wy);
+
+                            gx = 0.5
+                                * (interpolate_bilinear_unchecked(curr_img, wx + 1.0, wy)
+                                    - interpolate_bilinear_unchecked(curr_img, wx - 1.0, wy));
+                            gy = 0.5
+                                * (interpolate_bilinear_unchecked(curr_img, wx, wy + 1.0)
+                                    - interpolate_bilinear_unchecked(curr_img, wx, wy - 1.0));
+                        }
+                    } else {
+                        t_val = interpolate_bilinear(
+                            prev_img, feat_x + px_f, feat_y + py_f);
+
+                        let wx = feat_x + dx + px_f;
+                        let wy = feat_y + dy + py_f;
+                        i_val = interpolate_bilinear(curr_img, wx, wy);
+
+                        gx = 0.5
+                            * (interpolate_bilinear(curr_img, wx + 1.0, wy)
+                                - interpolate_bilinear(curr_img, wx - 1.0, wy));
+                        gy = 0.5
+                            * (interpolate_bilinear(curr_img, wx, wy + 1.0)
+                                - interpolate_bilinear(curr_img, wx, wy - 1.0));
+                    }
+
                     let e = t_val - i_val;
-
-                    // Forward additive: gradients at the warped position
-                    // in the current frame. Central differences, ±1 pixel.
-                    let gx = 0.5
-                        * (interpolate_bilinear(curr_img, wx + 1.0, wy)
-                            - interpolate_bilinear(curr_img, wx - 1.0, wy));
-                    let gy = 0.5
-                        * (interpolate_bilinear(curr_img, wx, wy + 1.0)
-                            - interpolate_bilinear(curr_img, wx, wy - 1.0));
 
                     // Accumulate Hessian (symmetric, so h10 = h01).
                     h00 += gx * gx;
@@ -327,7 +355,8 @@ impl KltTracker {
     /// "what incremental warp of the template best explains the error?"
     /// and then inverts that to update the displacement.
     ///
-    /// Cost per iteration: (2W+1)² × 3 bilinear lookups (template + warped + error)
+    /// Cost per iteration: (2W+1)² × 1 bilinear lookup (warped only)
+    /// since template values and gradients are precomputed.
     /// vs. forward additive's (2W+1)² × 5 (template + warped + 2 gradient + error).
     /// The Hessian inverse is just a 2×2 constant.
     fn lk_inverse_compositional(
@@ -341,8 +370,11 @@ impl KltTracker {
     ) -> LkResult {
         let half_i = self.window_size as isize;
 
-        // --- Precompute template gradients and Hessian (constant across iterations) ---
-        let patch_size = (2 * self.window_size + 1) * (2 * self.window_size + 1);
+        // --- Precompute template values, gradients, and Hessian ---
+        // All are constant across iterations (the IC advantage).
+        let side = 2 * self.window_size + 1;
+        let patch_size = side * side;
+        let mut t_buf = vec![0.0f32; patch_size];
         let mut gx_buf = vec![0.0f32; patch_size];
         let mut gy_buf = vec![0.0f32; patch_size];
 
@@ -350,21 +382,41 @@ impl KltTracker {
         let mut h01 = 0.0f32;
         let mut h11 = 0.0f32;
 
+        // Check if the template window (with ±1 gradient margin) fits in prev_img.
+        let tmpl_in_bounds = (feat_x - half_i as f32 - 1.0) >= 0.0
+            && (feat_y - half_i as f32 - 1.0) >= 0.0
+            && (feat_x + half_i as f32 + 1.0) < prev_img.width() as f32
+            && (feat_y + half_i as f32 + 1.0) < prev_img.height() as f32;
+
         let mut idx = 0;
         for py in -half_i..=half_i {
             for px in -half_i..=half_i {
                 let tx = feat_x + px as f32;
                 let ty = feat_y + py as f32;
 
-                // Gradient of the template (previous frame) at the
-                // original feature position. Central differences, ±1 pixel.
-                let gx = 0.5
-                    * (interpolate_bilinear(prev_img, tx + 1.0, ty)
-                        - interpolate_bilinear(prev_img, tx - 1.0, ty));
-                let gy = 0.5
-                    * (interpolate_bilinear(prev_img, tx, ty + 1.0)
-                        - interpolate_bilinear(prev_img, tx, ty - 1.0));
+                let (t_val, gx, gy);
+                if tmpl_in_bounds {
+                    // SAFETY: bounds checked above — entire window + gradient margin is in bounds.
+                    unsafe {
+                        t_val = interpolate_bilinear_unchecked(prev_img, tx, ty);
+                        gx = 0.5
+                            * (interpolate_bilinear_unchecked(prev_img, tx + 1.0, ty)
+                                - interpolate_bilinear_unchecked(prev_img, tx - 1.0, ty));
+                        gy = 0.5
+                            * (interpolate_bilinear_unchecked(prev_img, tx, ty + 1.0)
+                                - interpolate_bilinear_unchecked(prev_img, tx, ty - 1.0));
+                    }
+                } else {
+                    t_val = interpolate_bilinear(prev_img, tx, ty);
+                    gx = 0.5
+                        * (interpolate_bilinear(prev_img, tx + 1.0, ty)
+                            - interpolate_bilinear(prev_img, tx - 1.0, ty));
+                    gy = 0.5
+                        * (interpolate_bilinear(prev_img, tx, ty + 1.0)
+                            - interpolate_bilinear(prev_img, tx, ty - 1.0));
+                }
 
+                t_buf[idx] = t_val;
                 gx_buf[idx] = gx;
                 gy_buf[idx] = gy;
 
@@ -388,10 +440,16 @@ impl KltTracker {
         let ih01 = -inv_det * h01;
         let ih11 = inv_det * h00;
 
-        // --- Iterate: only recompute error and b each iteration ---
+        // --- Iterate: only recompute warped pixel and error each iteration ---
         for _iter in 0..self.max_iterations {
             let mut b0 = 0.0f32;
             let mut b1 = 0.0f32;
+
+            // Check if the warped window fits in curr_img.
+            let warp_in_bounds = (feat_x + dx - half_i as f32) >= 0.0
+                && (feat_y + dy - half_i as f32) >= 0.0
+                && (feat_x + dx + half_i as f32) < curr_img.width() as f32
+                && (feat_y + dy + half_i as f32) < curr_img.height() as f32;
 
             let mut idx = 0;
             for py in -half_i..=half_i {
@@ -399,19 +457,26 @@ impl KltTracker {
                     let px_f = px as f32;
                     let py_f = py as f32;
 
-                    // Template pixel (previous frame).
-                    let t_val = interpolate_bilinear(
-                        prev_img,
-                        feat_x + px_f,
-                        feat_y + py_f,
-                    );
+                    // Template pixel — precomputed, no bilinear lookup needed!
+                    let t_val = t_buf[idx];
 
                     // Warped pixel (current frame at feature + displacement).
-                    let i_val = interpolate_bilinear(
-                        curr_img,
-                        feat_x + dx + px_f,
-                        feat_y + dy + py_f,
-                    );
+                    let i_val = if warp_in_bounds {
+                        // SAFETY: bounds checked above.
+                        unsafe {
+                            interpolate_bilinear_unchecked(
+                                curr_img,
+                                feat_x + dx + px_f,
+                                feat_y + dy + py_f,
+                            )
+                        }
+                    } else {
+                        interpolate_bilinear(
+                            curr_img,
+                            feat_x + dx + px_f,
+                            feat_y + dy + py_f,
+                        )
+                    };
 
                     let e = t_val - i_val;
 

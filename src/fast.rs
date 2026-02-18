@@ -102,27 +102,29 @@ impl FastDetector {
         }
 
         let thresh = self.threshold as i16;
+        let min_cardinals: u8 = if self.arc_length >= 12 { 3 } else { 2 };
 
         for y in 3..(h - 3) {
             for x in 3..(w - 3) {
-                let center = image.get(x, y) as i16;
+                // SAFETY: x in [3, w-3) and y in [3, h-3), and all circle
+                // offsets are at most ±3, so every access is in bounds.
+                unsafe {
+                let center = image.get_unchecked(x, y) as i16;
 
                 // --- Quick rejection (Rosten's high-speed test) ---
-                // Check the 4 cardinal points (indices 0, 4, 8, 12 on the circle,
-                // which are the top, right, bottom, left pixels).
-                //
-                // A contiguous arc of length N on 16 pixels must include at least
-                // a minimum number of these 4 evenly-spaced cardinals:
-                //   FAST-9/10/11: at least 2 (an arc of 9 can span only 2 cardinals)
-                //   FAST-12:      at least 3 (an arc of 12 must span 3+ cardinals)
-                let p0 = image.get((x as isize + CIRCLE_OFFSETS[0].0) as usize,
-                                   (y as isize + CIRCLE_OFFSETS[0].1) as usize) as i16;
-                let p4 = image.get((x as isize + CIRCLE_OFFSETS[4].0) as usize,
-                                   (y as isize + CIRCLE_OFFSETS[4].1) as usize) as i16;
-                let p8 = image.get((x as isize + CIRCLE_OFFSETS[8].0) as usize,
-                                   (y as isize + CIRCLE_OFFSETS[8].1) as usize) as i16;
-                let p12 = image.get((x as isize + CIRCLE_OFFSETS[12].0) as usize,
-                                    (y as isize + CIRCLE_OFFSETS[12].1) as usize) as i16;
+                // Check 4 cardinal points (top, right, bottom, left).
+                let p0 = image.get_unchecked(
+                    (x as isize + CIRCLE_OFFSETS[0].0) as usize,
+                    (y as isize + CIRCLE_OFFSETS[0].1) as usize) as i16;
+                let p4 = image.get_unchecked(
+                    (x as isize + CIRCLE_OFFSETS[4].0) as usize,
+                    (y as isize + CIRCLE_OFFSETS[4].1) as usize) as i16;
+                let p8 = image.get_unchecked(
+                    (x as isize + CIRCLE_OFFSETS[8].0) as usize,
+                    (y as isize + CIRCLE_OFFSETS[8].1) as usize) as i16;
+                let p12 = image.get_unchecked(
+                    (x as isize + CIRCLE_OFFSETS[12].0) as usize,
+                    (y as isize + CIRCLE_OFFSETS[12].1) as usize) as i16;
 
                 let bright_count = (p0 > center + thresh) as u8
                     + (p4 > center + thresh) as u8
@@ -133,17 +135,14 @@ impl FastDetector {
                     + (p8 < center - thresh) as u8
                     + (p12 < center - thresh) as u8;
 
-                let min_cardinals: u8 = if self.arc_length >= 12 { 3 } else { 2 };
-
                 if bright_count < min_cardinals && dark_count < min_cardinals {
                     continue;
                 }
 
                 // --- Full 16-point test ---
-                // Sample all 16 circle pixels and classify.
                 let mut circle_vals = [0i16; 16];
                 for (i, &(dx, dy)) in CIRCLE_OFFSETS.iter().enumerate() {
-                    circle_vals[i] = image.get(
+                    circle_vals[i] = image.get_unchecked(
                         (x as isize + dx) as usize,
                         (y as isize + dy) as usize,
                     ) as i16;
@@ -161,6 +160,7 @@ impl FastDetector {
                         id: 0,
                     });
                 }
+                } // unsafe
             }
         }
 

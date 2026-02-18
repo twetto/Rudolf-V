@@ -77,6 +77,7 @@ impl Detector for HarrisDetector {
 }
 
 /// Frontend configuration.
+#[derive(Clone)]
 pub struct FrontendConfig {
     /// Which detector to use.
     pub detector: DetectorType,
@@ -164,6 +165,35 @@ pub struct Frontend {
     img_h: usize,
 }
 
+/// Per-stage timing breakdown from a single `process()` call.
+/// All durations in seconds (use `*_ms()` helpers for display).
+#[derive(Debug, Clone, Default)]
+pub struct TimingStats {
+    pub histeq: f64,
+    pub pyramid: f64,
+    pub klt: f64,
+    pub ransac: f64,
+    pub detect: f64,
+    pub total: f64,
+}
+
+impl TimingStats {
+    pub fn histeq_ms(&self) -> f32 { (self.histeq * 1000.0) as f32 }
+    pub fn pyramid_ms(&self) -> f32 { (self.pyramid * 1000.0) as f32 }
+    pub fn klt_ms(&self) -> f32 { (self.klt * 1000.0) as f32 }
+    pub fn ransac_ms(&self) -> f32 { (self.ransac * 1000.0) as f32 }
+    pub fn detect_ms(&self) -> f32 { (self.detect * 1000.0) as f32 }
+    pub fn total_ms(&self) -> f32 { (self.total * 1000.0) as f32 }
+}
+
+impl std::fmt::Display for TimingStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "histeq:{:.1} pyr:{:.1} klt:{:.1} ransac:{:.1} det:{:.1} total:{:.1}ms",
+            self.histeq_ms(), self.pyramid_ms(), self.klt_ms(),
+            self.ransac_ms(), self.detect_ms(), self.total_ms())
+    }
+}
+
 /// Statistics returned after processing each frame.
 #[derive(Debug, Clone)]
 pub struct FrameStats {
@@ -181,6 +211,8 @@ pub struct FrameStats {
     pub occupied_cells: usize,
     /// Total grid cells.
     pub total_cells: usize,
+    /// Per-stage timing breakdown.
+    pub timing: TimingStats,
 }
 
 impl Frontend {
@@ -208,9 +240,12 @@ impl Frontend {
         assert_eq!(image.width(), self.img_w);
         assert_eq!(image.height(), self.img_h);
 
+        use std::time::Instant;
+        let t_total = Instant::now();
+        let mut timing = TimingStats::default();
+
         // Step 0: Histogram equalization (brightness normalization).
-        // Applied before pyramid construction so that all levels benefit
-        // from consistent intensity statistics.
+        let t0 = Instant::now();
         let equalized;
         let input = if self.config.histeq != HistEqMethod::None {
             equalized = histeq::apply_histeq(image, self.config.histeq);
@@ -218,9 +253,12 @@ impl Frontend {
         } else {
             image
         };
+        timing.histeq = t0.elapsed().as_secs_f64();
 
         // Step 1: Build pyramid.
+        let t0 = Instant::now();
         let curr_pyramid = Pyramid::build(input, self.config.pyramid_levels, self.config.pyramid_sigma);
+        timing.pyramid = t0.elapsed().as_secs_f64();
 
         let mut stats = FrameStats {
             tracked: 0,
@@ -230,9 +268,11 @@ impl Frontend {
             total: 0,
             occupied_cells: 0,
             total_cells: self.grid.total_cells(),
+            timing: TimingStats::default(),
         };
 
         // Step 2: Track existing features if we have a previous frame.
+        let t0 = Instant::now();
         if let Some(ref prev_pyr) = self.prev_pyramid {
             if !self.features.is_empty() {
                 let tracker = KltTracker::with_method(
@@ -256,8 +296,10 @@ impl Frontend {
                     }
                 }
                 self.features = tracked;
+                timing.klt = t0.elapsed().as_secs_f64();
 
                 // Step 2b: Geometric verification (essential matrix RANSAC).
+                let t0 = Instant::now();
                 // Reject outlier tracks that are geometrically inconsistent.
                 if let Some(ref cam) = self.config.camera {
                     if self.features.len() >= 8 {
@@ -308,7 +350,10 @@ impl Frontend {
                         }
                     }
                 }
+                timing.ransac = t0.elapsed().as_secs_f64();
             }
+        } else {
+            // First frame: no tracking, no RANSAC.
         }
 
         // Step 3: Update occupancy grid from tracked features.
@@ -318,6 +363,7 @@ impl Frontend {
         }
 
         // Step 4: Detect new features in unoccupied cells.
+        let t0 = Instant::now();
         let slots_available = self.config.max_features.saturating_sub(self.features.len());
 
         if slots_available > 0 {
@@ -369,13 +415,17 @@ impl Frontend {
                 stats.new_detections += 1;
             }
         }
+        timing.detect = t0.elapsed().as_secs_f64();
 
         // Step 6: Store pyramid and feature snapshot for next frame.
         self.prev_pyramid = Some(curr_pyramid);
         self.prev_features = self.features.clone();
 
+        timing.total = t_total.elapsed().as_secs_f64();
+
         stats.total = self.features.len();
         stats.occupied_cells = self.grid.total_cells() - self.grid.count_empty();
+        stats.timing = timing;
 
         (&self.features, stats)
     }

@@ -240,6 +240,32 @@ impl<T: Pixel> Image<T> {
         self.data[y * self.stride + x]
     }
 
+    /// Get pixel value without bounds checking.
+    ///
+    /// # Safety
+    /// Caller must guarantee x < width and y < height.
+    /// Used in hot inner loops (convolution, KLT) where bounds are
+    /// already validated at the loop level.
+    ///
+    /// GPU EQUIVALENT: This mirrors GPU texture loads where the hardware
+    /// sampler handles addressing — no per-pixel bounds check.
+    #[inline(always)]
+    pub unsafe fn get_unchecked(&self, x: usize, y: usize) -> T {
+        debug_assert!(x < self.width && y < self.height,
+            "get_unchecked({x},{y}) out of bounds for {}x{}", self.width, self.height);
+        *self.data.get_unchecked(y * self.stride + x)
+    }
+
+    /// Set pixel value without bounds checking.
+    ///
+    /// # Safety
+    /// Caller must guarantee x < width and y < height.
+    #[inline(always)]
+    pub unsafe fn set_unchecked(&mut self, x: usize, y: usize, value: T) {
+        debug_assert!(x < self.width && y < self.height);
+        *self.data.get_unchecked_mut(y * self.stride + x) = value;
+    }
+
     /// Get a mutable reference to the pixel at (x, y).
     ///
     /// NOTE on return type: `&mut T`
@@ -585,10 +611,51 @@ pub fn interpolate_bilinear(img: &Image<f32>, x: f32, y: f32) -> f32 {
     let x1 = (x0 + 1).min(img.width() - 1);
     let y1 = (y0 + 1).min(img.height() - 1);
 
-    (1.0 - fx) * (1.0 - fy) * img.get(x0, y0)
-        + fx * (1.0 - fy) * img.get(x1, y0)
-        + (1.0 - fx) * fy * img.get(x0, y1)
-        + fx * fy * img.get(x1, y1)
+    // SAFETY: x0, x1 < width and y0, y1 < height after clamping.
+    unsafe {
+        let p00 = img.get_unchecked(x0, y0);
+        let p10 = img.get_unchecked(x1, y0);
+        let p01 = img.get_unchecked(x0, y1);
+        let p11 = img.get_unchecked(x1, y1);
+        (1.0 - fx) * (1.0 - fy) * p00
+            + fx * (1.0 - fy) * p10
+            + (1.0 - fx) * fy * p01
+            + fx * fy * p11
+    }
+}
+
+/// Bilinear interpolation without the assert or clamp overhead.
+///
+/// # Safety
+/// Caller must guarantee:
+///   - img is non-empty
+///   - x is in [0.0, width-1] and y is in [0.0, height-1]
+///
+/// Used in the KLT inner loop where the window bounds are validated
+/// once at the start and coordinates stay in range.
+///
+/// GPU EQUIVALENT: Hardware texture sampling with clamp-to-edge mode.
+#[inline(always)]
+pub unsafe fn interpolate_bilinear_unchecked(img: &Image<f32>, x: f32, y: f32) -> f32 {
+    let x0 = x as usize; // floor for non-negative
+    let y0 = y as usize;
+    let fx = x - x0 as f32;
+    let fy = y - y0 as f32;
+
+    let w = img.width();
+    let x1 = if x0 + 1 < w { x0 + 1 } else { x0 };
+    let h = img.height();
+    let y1 = if y0 + 1 < h { y0 + 1 } else { y0 };
+
+    let p00 = img.get_unchecked(x0, y0);
+    let p10 = img.get_unchecked(x1, y0);
+    let p01 = img.get_unchecked(x0, y1);
+    let p11 = img.get_unchecked(x1, y1);
+
+    (1.0 - fx) * (1.0 - fy) * p00
+        + fx * (1.0 - fy) * p10
+        + (1.0 - fx) * fy * p01
+        + fx * fy * p11
 }
 
 #[cfg(test)]
