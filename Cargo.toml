@@ -11,6 +11,10 @@ image = "0.25"
 minifb = "0.27"
 # Linear algebra (const-generic, stack-allocated) -- for geometric verification
 lalir = { git = "https://github.com/twetto/lalir" }
+# GPU compute (Vulkan/Metal/DX12/WebGPU backends)
+wgpu = "22"
+# Minimal async executor for blocking on wgpu futures in sync context
+pollster = "0.3"
 
 [dev-dependencies]
 criterion = "0.5"
@@ -22,4 +26,3 @@ harness = false
 
 [profile.release]
 debug = true
-
