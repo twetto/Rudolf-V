@@ -81,7 +81,7 @@ cargo bench
 
 We are adopting a verification-first development strategy. The project is divided into three distinct phases:
 
-### Phase 1: Pure Rust CPU Reference (Current Focus)
+### Phase 1: Pure Rust CPU Reference (Complete)
 
 **Goal:** Implement the core VIO frontend algorithms in safe, single-threaded Rust.
 
@@ -96,18 +96,57 @@ We are adopting a verification-first development strategy. The project is divide
 
 ### Phase 2: `wgpu` Acceleration
 
-**Goal:** Port the verified algorithms to WGSL compute shaders.
+**Goal:** Port the verified algorithms to WGSL compute shaders, targeting Vulkan
+on NVIDIA, AMDGPU, and Raspberry Pi 4 & 5.
 
-**Purpose:** Unlock real-time performance on embedded devices.
+**Purpose:** Unlock real-time performance on embedded and cross-platform devices.
 
-* [ ] GPU Device/Queue Abstraction
-* [ ] WGSL Compute Kernels (verified against Phase 1 CPU output)
+**Architecture — Hybrid CPU/GPU Model:**
+
+GPU handles all heavy compute *within* a frame. CPU handles orchestration
+*between* frames. The boundary falls at the KLT output readback.
+
+```
+┌─────────────────────────────── GPU (per frame) ──────────────────────────────┐
+│  Image upload → Pyramid construction → FAST/Harris → KLT tracking iterations │
+└───────────────────────────────────────┬──────────────────────────────────────┘
+                                        │ readback: tracked (x, y) positions only
+                                        ▼
+┌─────────────────────────────── CPU (per frame) ──────────────────────────────┐
+│  RANSAC outlier rejection → Occupancy grid update → Replenishment decisions  │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+The readback is mandatory because RANSAC (essential matrix estimation) requires
+feature positions on the CPU every frame. This is a small buffer (~200 features
+× 8 bytes) so latency is negligible. Pyramid levels, gradient images, and
+detection candidates never need to touch the CPU.
+
+The `GpuFrontend` struct mirrors `Frontend`'s
+`process(&mut self, image: &Image<u8>) -> (&[Feature], FrameStats)` API exactly.
+The readback is an implementation detail hidden inside `process()`. The CPU
+`Frontend` remains as an API-compatible fallback.
+
+**Milestones:**
+
+* [ ] `GpuDevice` abstraction (device/queue/command encoder wrappers)
+* [ ] Image upload + staging buffer infrastructure
+* [ ] Pyramid construction kernel (validated pixel-for-pixel against `Pyramid::build`)
+* [ ] FAST corner detection kernel
+* [ ] Harris corner response kernel
+* [ ] KLT tracking kernel (inverse compositional — constant Hessian is GPU-friendly)
+* [ ] Feature readback + `GpuFrontend::process()` integration
+* [ ] NMS / occupancy mask kernel
 
 ### Phase 3: Zero-Copy Optimization
 
 **Goal:** Optimize memory throughput.
 
 **Purpose:** Minimize CPU-GPU bandwidth usage for high-frequency odometry.
+
+* [ ] Unified memory path for platforms that support it (Apple Silicon, RPi)
+* [ ] Persistent GPU buffers across frames (avoid re-upload of static data)
+* [ ] Async readback with double-buffering (overlap GPU frame N+1 with CPU frame N)
 
 ## Scientific Basis
 
