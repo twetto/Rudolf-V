@@ -2,13 +2,15 @@
 name = "rudolf-v"
 version = "0.1.0"
 edition = "2021"
-description = "RUst Device-Optimized Library for Frontend Vision — CPU reference implementation of the vilib visual frontend"
+description = "RUst Device-Optimized Library for Frontend Vision -- CPU reference implementation of the vilib visual frontend"
 
 [dependencies]
-# Image I/O only — NOT for algorithms
+# Image I/O only -- NOT for algorithms
 image = "0.25"
 # Live visualization window (minimal framebuffer)
 minifb = "0.27"
+# Linear algebra (const-generic, stack-allocated) -- for geometric verification
+lalir = { git = "https://github.com/twetto/lalir" }
 
 [dev-dependencies]
 criterion = "0.5"

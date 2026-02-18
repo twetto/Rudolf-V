@@ -21,6 +21,8 @@
 // - Trait objects (`Box<dyn Detector>`) for runtime detector dispatch —
 //   more idiomatic than enum matching.
 
+use crate::camera::CameraIntrinsics;
+use crate::essential::{self, Correspondence, RansacConfig};
 use crate::fast::{FastDetector, Feature};
 use crate::harris::HarrisDetector;
 use crate::histeq::{self, HistEqMethod};
@@ -107,6 +109,11 @@ pub struct FrontendConfig {
     /// Histogram equalization preprocessing.
     /// Stabilizes brightness across frames when auto-exposure is active.
     pub histeq: HistEqMethod,
+    /// Camera intrinsics for geometric verification (optional).
+    /// If set, RANSAC outlier rejection is applied after KLT tracking.
+    pub camera: Option<CameraIntrinsics>,
+    /// RANSAC configuration for essential matrix estimation.
+    pub ransac: RansacConfig,
 }
 
 impl Default for FrontendConfig {
@@ -128,6 +135,8 @@ impl Default for FrontendConfig {
             klt_epsilon: 0.01,
             klt_method: LkMethod::ForwardAdditive,
             histeq: HistEqMethod::None,
+            camera: None,
+            ransac: RansacConfig::default(),
         }
     }
 }
@@ -144,6 +153,8 @@ pub struct Frontend {
     prev_pyramid: Option<Pyramid>,
     /// Currently tracked features with persistent IDs.
     features: Vec<Feature>,
+    /// Previous frame's feature positions (for geometric verification).
+    prev_features: Vec<Feature>,
     /// Next feature ID to assign. Monotonically increasing.
     next_id: u64,
     /// Occupancy grid for spatial distribution.
@@ -160,6 +171,8 @@ pub struct FrameStats {
     pub tracked: usize,
     /// Number of features lost during tracking.
     pub lost: usize,
+    /// Number of features rejected by geometric verification (RANSAC).
+    pub rejected: usize,
     /// Number of new features detected to replenish.
     pub new_detections: usize,
     /// Total features after this frame.
@@ -178,6 +191,7 @@ impl Frontend {
             config,
             prev_pyramid: None,
             features: Vec::new(),
+            prev_features: Vec::new(),
             next_id: 1,
             grid,
             img_w,
@@ -211,6 +225,7 @@ impl Frontend {
         let mut stats = FrameStats {
             tracked: 0,
             lost: 0,
+            rejected: 0,
             new_detections: 0,
             total: 0,
             occupied_cells: 0,
@@ -241,6 +256,58 @@ impl Frontend {
                     }
                 }
                 self.features = tracked;
+
+                // Step 2b: Geometric verification (essential matrix RANSAC).
+                // Reject outlier tracks that are geometrically inconsistent.
+                if let Some(ref cam) = self.config.camera {
+                    if self.features.len() >= 8 {
+                        // Build correspondences: prev_features -> current features.
+                        // Match by ID (both lists may differ if features were lost).
+                        let corrs: Vec<(usize, Correspondence)> = self.features.iter()
+                            .enumerate()
+                            .filter_map(|(idx, f)| {
+                                self.prev_features.iter()
+                                    .find(|pf| pf.id == f.id)
+                                    .map(|pf| {
+                                        let (x1, y1) = cam.normalize_undistorted(
+                                            pf.x as f64, pf.y as f64);
+                                        let (x2, y2) = cam.normalize_undistorted(
+                                            f.x as f64, f.y as f64);
+                                        (idx, Correspondence { x1, y1, x2, y2 })
+                                    })
+                            })
+                            .collect();
+
+                        if corrs.len() >= 8 {
+                            let corr_only: Vec<Correspondence> = corrs.iter()
+                                .map(|(_, c)| *c).collect();
+
+                            if let Some(result) = essential::estimate_essential_ransac(
+                                &corr_only, &self.config.ransac
+                            ) {
+                                // Remove outlier features.
+                                let mut inlier_features = Vec::new();
+                                for (ci, (feat_idx, _)) in corrs.iter().enumerate() {
+                                    if result.inliers[ci] {
+                                        inlier_features.push(self.features[*feat_idx].clone());
+                                    } else {
+                                        stats.rejected += 1;
+                                    }
+                                }
+                                // Also keep features that had no prev match (new this frame).
+                                let matched_ids: Vec<u64> = corrs.iter()
+                                    .map(|(idx, _)| self.features[*idx].id).collect();
+                                for f in &self.features {
+                                    if !matched_ids.contains(&f.id) {
+                                        inlier_features.push(f.clone());
+                                    }
+                                }
+                                stats.tracked -= stats.rejected;
+                                self.features = inlier_features;
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -303,8 +370,9 @@ impl Frontend {
             }
         }
 
-        // Step 6: Store pyramid for next frame.
+        // Step 6: Store pyramid and feature snapshot for next frame.
         self.prev_pyramid = Some(curr_pyramid);
+        self.prev_features = self.features.clone();
 
         stats.total = self.features.len();
         stats.occupied_cells = self.grid.total_cells() - self.grid.count_empty();
@@ -326,6 +394,7 @@ impl Frontend {
     pub fn reset(&mut self) {
         self.prev_pyramid = None;
         self.features.clear();
+        self.prev_features.clear();
         self.grid.clear();
         // Don't reset next_id — IDs should be globally unique.
     }

@@ -16,10 +16,13 @@
 //   T      — toggle track trails
 //   F      — toggle flow arrows
 
+use rudolf_v::camera::CameraIntrinsics;
+use rudolf_v::essential::RansacConfig;
 use rudolf_v::fast::Feature;
 use rudolf_v::frontend::{Frontend, FrontendConfig};
 use rudolf_v::histeq::HistEqMethod;
 use rudolf_v::image::Image;
+use rudolf_v::klt::LkMethod;
 
 use minifb::{Key, Window, WindowOptions};
 use std::collections::HashMap;
@@ -95,6 +98,20 @@ fn main() {
     // Frame rate limiting — EuRoC cam0 is 20 Hz.
     window.set_target_fps(60);
 
+    // Load camera intrinsics for geometric verification (optional).
+    let sensor_yaml = cam0_dir.join("sensor.yaml");
+    let camera = match CameraIntrinsics::from_euroc_yaml(&sensor_yaml) {
+        Ok(cam) => {
+            println!("Camera: fx={:.1} fy={:.1} cx={:.1} cy={:.1}, {} distortion coeffs",
+                cam.fx, cam.fy, cam.cx, cam.cy, cam.distortion.len());
+            Some(cam)
+        }
+        Err(e) => {
+            eprintln!("Warning: no sensor.yaml ({}), geometric verification disabled", e);
+            None
+        }
+    };
+
     // Frontend.
     let config = FrontendConfig {
         max_features: 40,
@@ -102,7 +119,14 @@ fn main() {
         pyramid_levels: 4,
         klt_window: 11,
         klt_max_iter: 30,
+        klt_method: LkMethod::InverseCompositional,
         histeq: HistEqMethod::Global,
+        camera,
+        ransac: RansacConfig {
+            threshold: 1e-5,
+            max_iterations: 200,
+            confidence: 0.99,
+        },
         ..Default::default()
     };
     let mut frontend = Frontend::new(config, img_w, img_h);
@@ -271,9 +295,9 @@ fn main() {
             // HUD text (top-left info bar).
             draw_rect(&mut fb, win_w, win_h, 0, 0, win_w, 14, 0x222222);
             // Simple: just print to stdout since bitmap text is painful.
-            print!("\r{:5}: trk={:<3} lost={:<3} new={:<3} tot={:<3} {:.1}ms  ",
-                frame_idx, stats.tracked, stats.lost, stats.new_detections,
-                stats.total, proc_ms);
+            print!("\r{:5}: trk={:<3} lost={:<3} rej={:<3} new={:<3} tot={:<3} {:.1}ms  ",
+                frame_idx, stats.tracked, stats.lost, stats.rejected,
+                stats.new_detections, stats.total, proc_ms);
 
             prev_positions = curr_positions;
             frame_idx += 1;

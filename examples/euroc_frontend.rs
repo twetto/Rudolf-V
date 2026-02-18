@@ -92,13 +92,13 @@ fn main() {
     let mut track_history: Vec<(u64, Vec<(f32, f32)>)> = Vec::new();
 
     // Stats CSV.
-    let mut stats_csv = String::from("frame,tracked,lost,new,total,occupied_cells\n");
+    let mut stats_csv = String::from("frame,tracked,lost,rejected,new,total,occupied_cells\n");
 
     fs::create_dir_all("vis_output").ok();
 
-    println!("\n{:>5}  {:>7}  {:>4}  {:>3}  {:>5}  {:>5}",
-        "frame", "tracked", "lost", "new", "total", "cells");
-    println!("{}", "-".repeat(42));
+    println!("\n{:>5}  {:>7}  {:>4}  {:>3}  {:>3}  {:>5}  {:>5}",
+        "frame", "tracked", "lost", "rej", "new", "total", "cells");
+    println!("{}", "-".repeat(48));
 
     let mut last_img: Option<Image<u8>> = None;
 
@@ -107,12 +107,12 @@ fn main() {
 
         let (features, stats) = frontend.process(&img);
 
-        println!("{:5}  {:7}  {:4}  {:3}  {:5}  {:5}/{}",
-            i, stats.tracked, stats.lost, stats.new_detections,
+        println!("{:5}  {:7}  {:4}  {:3}  {:3}  {:5}  {:5}/{}",
+            i, stats.tracked, stats.lost, stats.rejected, stats.new_detections,
             stats.total, stats.occupied_cells, stats.total_cells);
 
-        writeln!(stats_csv, "{},{},{},{},{},{}",
-            i, stats.tracked, stats.lost, stats.new_detections,
+        writeln!(stats_csv, "{},{},{},{},{},{},{}",
+            i, stats.tracked, stats.lost, stats.rejected, stats.new_detections,
             stats.total, stats.occupied_cells).unwrap();
 
         // Update track history.

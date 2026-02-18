@@ -72,7 +72,10 @@ cargo bench
 | `harris` | Harris corner detector (structure tensor) | `harris_gpu_cuda_tools.cu` |
 | `klt` | Pyramidal Lucas-Kanade optical flow tracker | `feature_tracker_cuda_tools.cu` |
 | `occupancy` | Occupancy grid for spatial feature distribution | `detector_base_gpu_cuda_tools.cu` |
-| `frontend` | Complete detect-track-replenish pipeline | `vilib_ros.cpp` |
+| `histeq` | Histogram equalization (global + CLAHE) for brightness normalization | -- |
+| `camera` | Pinhole camera model, EuRoC YAML parser, undistortion | -- |
+| `essential` | 8-point essential matrix + RANSAC outlier rejection (uses lalir) | -- |
+| `frontend` | Complete detect-track-replenish pipeline with geometric verification | `vilib_ros.cpp` |
 
 ## Engineering Roadmap
 
