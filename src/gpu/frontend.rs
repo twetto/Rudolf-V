@@ -173,6 +173,7 @@ impl GpuFrontend {
             config.klt_max_iter,
             config.klt_epsilon,
             config.pyramid_levels,
+            config.max_features,
         );
         let nms  = OccupancyNms::new(config.cell_size);
         let grid = OccupancyGrid::new(img_w, img_h, config.cell_size);
@@ -234,8 +235,14 @@ impl GpuFrontend {
         // ── Step 2: KLT tracking ─────────────────────────────────────────────
         let t0 = Instant::now();
         if self.has_prev && !self.features.is_empty() {
+            // Clone features into a local slice to satisfy the borrow checker:
+            // self.klt.track() needs &mut self.klt, but self.features and
+            // self.prev_pyramid are also part of self — Rust can't split the
+            // borrow across fields through an if-let like this without help.
+            // The clone is one Vec<Feature> copy (~N×16 bytes), negligible.
+            let feats_snap: Vec<Feature> = self.features.clone();
             let prev = self.prev_pyramid.as_ref().unwrap();
-            let results = self.klt.track(gpu, prev, &curr_pyramid, &self.features);
+            let results = self.klt.track(gpu, prev, &curr_pyramid, &feats_snap);
 
             // Filter in-place: keep only Tracked features.
             let mut write = 0;

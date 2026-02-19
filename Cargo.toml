@@ -22,7 +22,9 @@ criterion = "0.5"
 approx = "0.5"
 
 [[bench]]
-name = "benchmarks"
+#name = "benchmarks"
+#harness = false
+name = "gpu_benchmarks"
 harness = false
 
 [profile.release]

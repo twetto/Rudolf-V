@@ -72,18 +72,18 @@ fn main() {
 
     let pyr_pipeline = GpuPyramidPipeline::new(&gpu);
     let gpu_fast     = GpuFastDetector::new(&gpu, FAST_THRESHOLD, FAST_ARC);
-    let gpu_klt      = GpuKltTracker::new(&gpu, KLT_WIN, KLT_MAX_ITER, KLT_EPSILON, PYR_LEVELS);
+    let mut gpu_klt  = GpuKltTracker::new(&gpu, KLT_WIN, KLT_MAX_ITER, KLT_EPSILON, PYR_LEVELS, 512);
     let nms          = OccupancyNms::new(NMS_CELL);
 
     match args.len() {
         // ---- Synthetic animated mode ----
-        1 => run_synthetic(&gpu, &pyr_pipeline, &gpu_fast, &gpu_klt, &nms),
+        1 => run_synthetic(&gpu, &pyr_pipeline, &gpu_fast, &mut gpu_klt, &nms),
 
         // ---- Single image: zero-motion sanity check ----
         2 => {
             let img = load_image(&args[1]);
             eprintln!("[frontend] zero-motion mode: {}×{}", img.width(), img.height());
-            run_static(&gpu, &pyr_pipeline, &gpu_fast, &gpu_klt, &nms, &img, &img);
+            run_static(&gpu, &pyr_pipeline, &gpu_fast, &mut gpu_klt, &nms, &img, &img);
         }
 
         // ---- Two images: detect in frame1, track into frame2 ----
@@ -93,7 +93,7 @@ fn main() {
             assert_eq!((img1.width(), img1.height()), (img2.width(), img2.height()),
                 "images must be the same size");
             eprintln!("[frontend] two-frame mode: {}×{}", img1.width(), img1.height());
-            run_static(&gpu, &pyr_pipeline, &gpu_fast, &gpu_klt, &nms, &img1, &img2);
+            run_static(&gpu, &pyr_pipeline, &gpu_fast, &mut gpu_klt, &nms, &img1, &img2);
         }
     }
 }
@@ -106,7 +106,7 @@ fn run_synthetic(
     gpu:          &GpuDevice,
     pyr_pipeline: &GpuPyramidPipeline,
     gpu_fast:     &GpuFastDetector,
-    gpu_klt:      &GpuKltTracker,
+    gpu_klt:      &mut GpuKltTracker,
     nms:          &OccupancyNms,
 ) {
     let w = 240usize;
@@ -210,7 +210,7 @@ fn run_static(
     gpu:          &GpuDevice,
     pyr_pipeline: &GpuPyramidPipeline,
     gpu_fast:     &GpuFastDetector,
-    gpu_klt:      &GpuKltTracker,
+    gpu_klt:      &mut GpuKltTracker,
     nms:          &OccupancyNms,
     frame1:       &Image<u8>,
     frame2:       &Image<u8>,

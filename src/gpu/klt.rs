@@ -116,16 +116,21 @@ struct KltParams {
 /// Create once with `GpuKltTracker::new()`; call `track()` every frame.
 /// The compute pipeline is compiled at construction time.
 pub struct GpuKltTracker {
-    pipeline:    wgpu::ComputePipeline,
-    bgl:         wgpu::BindGroupLayout,
-    /// Patch half-size W. Patch is (2W+1)².
-    pub window_size:     usize,
-    /// Maximum Gauss-Newton iterations per level.
-    pub max_iterations:  usize,
-    /// Convergence threshold in pixels.
-    pub epsilon:         f32,
-    /// Number of pyramid levels to use.
-    pub max_levels:      usize,
+    pipeline:       wgpu::ComputePipeline,
+    bgl:            wgpu::BindGroupLayout,
+    pub window_size:    usize,
+    pub max_iterations: usize,
+    pub epsilon:        f32,
+    pub max_levels:     usize,
+
+    // Pre-allocated GPU buffers — reused every frame to avoid VRAM allocation
+    // overhead. Sized for max_features at construction.
+    max_features:   usize,
+    feature_buf:    wgpu::Buffer,   // STORAGE | COPY_DST  — feature positions
+    disp_buf:       wgpu::Buffer,   // STORAGE | COPY_DST  — displacements (zeroed each frame)
+    results_buf:    wgpu::Buffer,   // STORAGE | COPY_SRC  — track results
+    rb_buf:         wgpu::Buffer,   // MAP_READ | COPY_DST — CPU readback
+    params_bufs:    Vec<wgpu::Buffer>, // one UNIFORM | COPY_DST per level
 }
 
 impl GpuKltTracker {
@@ -134,11 +139,12 @@ impl GpuKltTracker {
     /// `window_size` is the patch half-width W (patch = (2W+1)²).
     /// Typical values: 4 (GAP8 / small images), 7 (vilib / HD cameras).
     pub fn new(
-        gpu: &GpuDevice,
-        window_size: usize,
+        gpu:            &GpuDevice,
+        window_size:    usize,
         max_iterations: usize,
-        epsilon: f32,
-        max_levels: usize,
+        epsilon:        f32,
+        max_levels:     usize,
+        max_features:   usize,
     ) -> Self {
         let side  = 2 * window_size + 1;
         let patch = side * side;
@@ -246,21 +252,52 @@ impl GpuKltTracker {
                 cache:               None,
             });
 
-        GpuKltTracker { pipeline, bgl, window_size, max_iterations, epsilon, max_levels }
+        // Pre-allocate buffers sized for max_features.
+        // write_buffer / clear_buffer are used each frame to update content —
+        // both go through the queue's staging ring and avoid VRAM re-allocation.
+        let feat_bytes   = (max_features * std::mem::size_of::<GpuKltFeature>()) as u64;
+        let disp_bytes   = (max_features * 2 * std::mem::size_of::<f32>()) as u64;
+        let result_bytes = (max_features * std::mem::size_of::<GpuTrackResult>()) as u64;
+
+        let feature_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("GpuKlt features"), size: feat_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let disp_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("GpuKlt displacements"), size: disp_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let results_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("GpuKlt results"), size: result_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let rb_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("GpuKlt readback"), size: result_bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // One params buffer per level — content updated via write_buffer each frame.
+        let params_bufs: Vec<wgpu::Buffer> = (0..max_levels)
+            .map(|_| gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("GpuKlt params"), size: std::mem::size_of::<KltParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }))
+            .collect();
+
+        GpuKltTracker {
+            pipeline, bgl,
+            window_size, max_iterations, epsilon, max_levels,
+            max_features,
+            feature_buf, disp_buf, results_buf, rb_buf, params_bufs,
+        }
     }
 
-    /// Track features from the previous frame to the current frame.
-    ///
-    /// Both pyramids must have been built with `GpuPyramidPipeline::build()`.
-    /// Features are the FAST detections from the previous frame.
-    ///
-    /// Returns one `TrackedFeature` per input feature with updated position
-    /// and status. The feature `id` and `score` fields are preserved.
-    ///
-    /// This call is synchronous: it submits one compute dispatch per pyramid
-    /// level and blocks for readback at the end.
     pub fn track(
-        &self,
+        &mut self,
         gpu:          &GpuDevice,
         prev_pyramid: &GpuPyramid,
         curr_pyramid: &GpuPyramid,
@@ -270,7 +307,11 @@ impl GpuKltTracker {
             return Vec::new();
         }
 
-        let n = features.len() as u32;
+        let n = features.len();
+        assert!(n <= self.max_features,
+            "GpuKltTracker: {} features exceeds max_features={}", n, self.max_features);
+
+        let n_u32 = n as u32;
         let num_levels = self.max_levels
             .min(prev_pyramid.levels.len())
             .min(curr_pyramid.levels.len());
@@ -278,80 +319,36 @@ impl GpuKltTracker {
         let img0_w = prev_pyramid.levels[0].width;
         let img0_h = prev_pyramid.levels[0].height;
 
-        // --- Upload features ---
+        // ── Upload features (write_buffer into pre-allocated storage buf) ─────
         let gpu_features: Vec<GpuKltFeature> =
             features.iter().map(GpuKltFeature::from).collect();
+        let feat_bytes = (n * std::mem::size_of::<GpuKltFeature>()) as u64;
+        gpu.queue.write_buffer(&self.feature_buf, 0, bytemuck::cast_slice(&gpu_features));
 
-        let feature_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label:    Some("GpuKlt features"),
-            contents: bytemuck::cast_slice(&gpu_features),
-            usage:    wgpu::BufferUsages::STORAGE,
-        });
+        // ── Write params for each level into pre-allocated uniform bufs ───────
+        let result_bytes = (n * std::mem::size_of::<GpuTrackResult>()) as u64;
+        let disp_bytes   = (n * 2 * std::mem::size_of::<f32>()) as u64;
 
-        // --- Displacement buffer (zeroed; updated between levels) ---
-        // Layout: [dx0, dy0, dx1, dy1, …] as f32 pairs = vec2<f32> per feature.
-        let disp_byte_len = (n as usize * 2 * std::mem::size_of::<f32>()) as u64;
-        let disp_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label:              Some("GpuKlt displacements"),
-            size:               disp_byte_len,
-            usage:              wgpu::BufferUsages::STORAGE
-                              | wgpu::BufferUsages::COPY_SRC
-                              | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        // Zero-initialise: write all-zeros to the displacement buffer.
-        gpu.queue.write_buffer(&disp_buf, 0, &vec![0u8; disp_byte_len as usize]);
+        for (i, level) in (0..num_levels).rev().enumerate() {
+            let params = KltParams {
+                n_features:     n_u32,
+                max_iterations: self.max_iterations as u32,
+                epsilon_sq:     self.epsilon * self.epsilon,
+                level:          level as u32,
+                level_scale:    1.0f32 / (1u32 << level) as f32,
+                img0_width:     img0_w,
+                img0_height:    img0_h,
+                _pad:           0,
+            };
+            gpu.queue.write_buffer(&self.params_bufs[i], 0, bytemuck::bytes_of(&params));
+        }
 
-        // --- Results buffer ---
-        let result_byte_len =
-            (n as usize * std::mem::size_of::<GpuTrackResult>()) as u64;
-        let results_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label:              Some("GpuKlt results"),
-            size:               result_byte_len,
-            usage:              wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        // --- All pyramid levels in a single command encoder ---
-        //
-        // Each pyramid level is one compute pass inside the same encoder.
-        // wgpu inserts the necessary storage-buffer pipeline barriers between
-        // passes within an encoder, so the next level correctly sees the
-        // displacement updates written by the previous level.
-        //
-        // This replaces the previous pattern of one encoder + poll(Wait) per
-        // level, which cost num_levels round-trips (~10-30ms each on dzn).
-        // Now we pay exactly one submit + one poll for the whole tracking pass.
-        let rb_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label:              Some("GpuKlt results readback"),
-            size:               result_byte_len,
-            usage:              wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        // Pre-allocate params and bind groups for all levels before encoding.
-        // They must outlive the encoder, so we collect them here.
-        let level_resources: Vec<(wgpu::Buffer, wgpu::BindGroup)> = (0..num_levels).rev()
-            .map(|level| {
-                let level_scale = 1.0f32 / (1u32 << level) as f32;
-                let params = KltParams {
-                    n_features:     n,
-                    max_iterations: self.max_iterations as u32,
-                    epsilon_sq:     self.epsilon * self.epsilon,
-                    level:          level as u32,
-                    level_scale,
-                    img0_width:     img0_w,
-                    img0_height:    img0_h,
-                    _pad:           0,
-                };
-                let params_buf = gpu.device.create_buffer_init(
-                    &wgpu::util::BufferInitDescriptor {
-                        label:    Some("GpuKlt params"),
-                        contents: bytemuck::bytes_of(&params),
-                        usage:    wgpu::BufferUsages::UNIFORM,
-                    },
-                );
-                let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        // ── Build bind groups (cheap — just descriptor writes, no VRAM alloc) ─
+        // Textures change every frame so bind groups can't be pre-built.
+        let bind_groups: Vec<wgpu::BindGroup> = (0..num_levels).rev()
+            .enumerate()
+            .map(|(i, level)| {
+                gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label:  Some("GpuKlt BG"),
                     layout: &self.bgl,
                     entries: &[
@@ -365,44 +362,48 @@ impl GpuKltTracker {
                             resource: wgpu::BindingResource::TextureView(
                                 &curr_pyramid.levels[level].read_view),
                         },
-                        wgpu::BindGroupEntry { binding: 2, resource: feature_buf.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 3, resource: disp_buf.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 4, resource: results_buf.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 5, resource: params_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: self.feature_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: self.disp_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 4, resource: self.results_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 5, resource: self.params_bufs[i].as_entire_binding() },
                     ],
-                });
-                (params_buf, bind_group)
+                })
             })
             .collect();
 
+        // ── Single encoder: clear displacements + all level passes + readback ─
+        let workgroups = (n_u32 + WG_SIZE - 1) / WG_SIZE;
         let mut encoder = gpu.device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor { label: Some("GpuKlt all levels + readback") },
+            &wgpu::CommandEncoderDescriptor { label: Some("GpuKlt") },
         );
 
-        let workgroups = (n + WG_SIZE - 1) / WG_SIZE;
-        for (_, bind_group) in &level_resources {
+        // Zero the displacement buffer — clear_buffer is a GPU memset,
+        // faster than write_buffer (no staging copy) and stays in the encoder.
+        encoder.clear_buffer(&self.disp_buf, 0, Some(disp_bytes));
+
+        for bg in &bind_groups {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label:            Some("track_level"),
-                timestamp_writes: None,
+                label: Some("track_level"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, bind_group, &[]);
+            pass.set_bind_group(0, bg, &[]);
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
 
-        encoder.copy_buffer_to_buffer(&results_buf, 0, &rb_buf, 0, result_byte_len);
+        encoder.copy_buffer_to_buffer(&self.results_buf, 0, &self.rb_buf, 0, result_bytes);
         gpu.queue.submit(std::iter::once(encoder.finish()));
 
-        let s = rb_buf.slice(..);
+        // ── Readback ──────────────────────────────────────────────────────────
+        let slice = self.rb_buf.slice(..result_bytes);
         let (tx, rx) = std::sync::mpsc::channel();
-        s.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).unwrap(); });
+        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).unwrap(); });
         gpu.device.poll(wgpu::Maintain::Wait);
-        rx.recv().unwrap().expect("KLT results map failed");
+        rx.recv().unwrap().expect("KLT readback map failed");
 
-        let mapped = s.get_mapped_range();
+        let mapped = slice.get_mapped_range();
         let gpu_results: &[GpuTrackResult] = bytemuck::cast_slice(&mapped);
 
-        let tracked: Vec<TrackedFeature> = gpu_results.iter()
+        let tracked: Vec<TrackedFeature> = gpu_results[..n].iter()
             .zip(features.iter())
             .map(|(r, f)| {
                 let status = match r.status {
@@ -411,24 +412,18 @@ impl GpuKltTracker {
                     _ => TrackStatus::OutOfBounds,
                 };
                 TrackedFeature {
-                    feature: Feature {
-                        x:     r.x,
-                        y:     r.y,
-                        score: f.score,
-                        level: f.level,
-                        id:    f.id,
-                    },
+                    feature: Feature { x: r.x, y: r.y, score: f.score, level: f.level, id: f.id },
                     status,
                 }
             })
             .collect();
 
         drop(mapped);
-        rb_buf.unmap();
-
+        self.rb_buf.unmap();
         tracked
     }
 }
+
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -482,7 +477,7 @@ mod tests {
         let gpu = GpuDevice::new().unwrap();
         let pipeline = GpuPyramidPipeline::new(&gpu);
         let pyr = pipeline.build(&gpu, &img, 3, 1.0);
-        let tracker = GpuKltTracker::new(&gpu, 7, 30, 0.01, 3);
+        let mut tracker = GpuKltTracker::new(&gpu, 7, 30, 0.01, 3, 256);
 
         let features = vec![feat(41.0, 41.0)];
         let results = tracker.track(&gpu, &pyr, &pyr, &features);
@@ -505,7 +500,7 @@ mod tests {
         let pipeline = GpuPyramidPipeline::new(&gpu);
         let pyr1 = pipeline.build(&gpu, &img1, 3, 1.0);
         let pyr2 = pipeline.build(&gpu, &img2, 3, 1.0);
-        let tracker = GpuKltTracker::new(&gpu, 7, 30, 0.01, 3);
+        let mut tracker = GpuKltTracker::new(&gpu, 7, 30, 0.01, 3, 256);
 
         let features = vec![feat(41.0, 41.0)];
         let results = tracker.track(&gpu, &pyr1, &pyr2, &features);
@@ -527,7 +522,7 @@ mod tests {
         let gpu = GpuDevice::new().unwrap();
         let pipeline = GpuPyramidPipeline::new(&gpu);
         let pyr = pipeline.build(&gpu, &img, 3, 1.0);
-        let tracker = GpuKltTracker::new(&gpu, 5, 30, 0.01, 3);
+        let mut tracker = GpuKltTracker::new(&gpu, 5, 30, 0.01, 3, 256);
 
         let features = vec![feat(30.0, 30.0)];
         let results = tracker.track(&gpu, &pyr, &pyr, &features);
@@ -550,7 +545,7 @@ mod tests {
         let pipeline = GpuPyramidPipeline::new(&gpu);
         let pyr1 = pipeline.build(&gpu, &img1, 3, 1.0);
         let pyr2 = pipeline.build(&gpu, &img2, 3, 1.0);
-        let tracker = GpuKltTracker::new(&gpu, 7, 30, 0.01, 3);
+        let mut tracker = GpuKltTracker::new(&gpu, 7, 30, 0.01, 3, 256);
 
         let features = vec![feat(41.0, 41.0)];
         let gpu_results = tracker.track(&gpu, &pyr1, &pyr2, &features);
@@ -607,7 +602,7 @@ mod tests {
         let pipeline = GpuPyramidPipeline::new(&gpu);
         let pyr1 = pipeline.build(&gpu, &img1, 3, 1.0);
         let pyr2 = pipeline.build(&gpu, &img2, 3, 1.0);
-        let tracker = GpuKltTracker::new(&gpu, 7, 30, 0.01, 3);
+        let mut tracker = GpuKltTracker::new(&gpu, 7, 30, 0.01, 3, 256);
 
         let features = vec![feat(40.0, 40.0)];
         let results = tracker.track(&gpu, &pyr1, &pyr2, &features);
