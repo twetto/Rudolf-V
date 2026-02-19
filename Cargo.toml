@@ -15,6 +15,7 @@ lalir = { git = "https://github.com/twetto/lalir" }
 wgpu = "22"
 # Minimal async executor for blocking on wgpu futures in sync context
 pollster = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 criterion = "0.5"

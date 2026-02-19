@@ -54,6 +54,11 @@ cargo run --example euroc_frontend --release -- /path/to/MH_01_easy 100
 cargo run --example euroc_live --release -- /path/to/MH_01_easy
 # Controls: Space=pause, S=step, Q/Esc=quit, +/-=speed, T=trails, F=flow
 
+# GPU roundtrip example
+cargo run --example gpu_pyramid                         # checkerboard
+cargo run --example gpu_pyramid -- path/to/image.png    # real image
+cargo run --example gpu_pyramid -- image.png 5 1.5      # 5 levels, sigma=1.5
+
 # Run benchmarks
 cargo bench
 ```
@@ -131,7 +136,7 @@ The readback is an implementation detail hidden inside `process()`. The CPU
 
 * [x] `GpuDevice` abstraction (device/queue/command encoder wrappers)
 * [x] Image upload + staging buffer infrastructure
-* [ ] Pyramid construction kernel (validated pixel-for-pixel against `Pyramid::build`)
+* [x] Pyramid construction kernel (validated pixel-for-pixel against `Pyramid::build`)
 * [ ] FAST corner detection kernel
 * [ ] Harris corner response kernel
 * [ ] KLT tracking kernel (inverse compositional — constant Hessian is GPU-friendly)
