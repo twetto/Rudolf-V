@@ -130,7 +130,7 @@ The readback is an implementation detail hidden inside `process()`. The CPU
 **Milestones:**
 
 * [x] `GpuDevice` abstraction (device/queue/command encoder wrappers)
-* [ ] Image upload + staging buffer infrastructure
+* [x] Image upload + staging buffer infrastructure
 * [ ] Pyramid construction kernel (validated pixel-for-pixel against `Pyramid::build`)
 * [ ] FAST corner detection kernel
 * [ ] Harris corner response kernel

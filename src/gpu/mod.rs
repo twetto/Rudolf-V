@@ -20,3 +20,4 @@
 // See README.md Phase 2 for the full architecture diagram.
 
 pub mod device;
+pub mod image;

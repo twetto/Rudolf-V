@@ -26,4 +26,4 @@ flamegraph.svg
 perf.data*
 profile.json.gz
 run_benchmark_euroc.sh
-run_gpu_tests.sh
+run_gpu_tests*.sh
