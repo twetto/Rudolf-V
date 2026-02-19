@@ -139,7 +139,7 @@ The readback is an implementation detail hidden inside `process()`. The CPU
 * [x] Pyramid construction kernel (validated pixel-for-pixel against `Pyramid::build`)
 * [x] FAST corner detection kernel
 * [ ] Harris corner response kernel
-* [ ] KLT tracking kernel (inverse compositional — constant Hessian is GPU-friendly)
+* [x] KLT tracking kernel (inverse compositional — constant Hessian is GPU-friendly)
 * [ ] Feature readback + `GpuFrontend::process()` integration
 * [ ] NMS / occupancy mask kernel
 
