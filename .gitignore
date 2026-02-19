@@ -27,3 +27,4 @@ perf.data*
 profile.json.gz
 run_benchmark_euroc.sh
 run_gpu_*.sh
+run_example_*.sh

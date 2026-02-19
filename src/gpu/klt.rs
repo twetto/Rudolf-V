@@ -312,92 +312,16 @@ impl GpuKltTracker {
             mapped_at_creation: false,
         });
 
-        // --- One dispatch per pyramid level, coarse → fine ---
-        for level in (0..num_levels).rev() {
-            let level_scale = 1.0f32 / (1u32 << level) as f32;
-
-            let params = KltParams {
-                n_features:     n,
-                max_iterations: self.max_iterations as u32,
-                epsilon_sq:     self.epsilon * self.epsilon,
-                level:          level as u32,
-                level_scale,
-                img0_width:     img0_w,
-                img0_height:    img0_h,
-                _pad:           0,
-            };
-            let params_buf = gpu.device.create_buffer_init(
-                &wgpu::util::BufferInitDescriptor {
-                    label:    Some("GpuKlt params"),
-                    contents: bytemuck::bytes_of(&params),
-                    usage:    wgpu::BufferUsages::UNIFORM,
-                },
-            );
-
-            let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label:  Some("GpuKlt BG"),
-                layout: &self.bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding:  0,
-                        resource: wgpu::BindingResource::TextureView(
-                            &prev_pyramid.levels[level].read_view,
-                        ),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding:  1,
-                        resource: wgpu::BindingResource::TextureView(
-                            &curr_pyramid.levels[level].read_view,
-                        ),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding:  2,
-                        resource: feature_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding:  3,
-                        resource: disp_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding:  4,
-                        resource: results_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding:  5,
-                        resource: params_buf.as_entire_binding(),
-                    },
-                ],
-            });
-
-            let mut encoder = gpu.device.create_command_encoder(
-                &wgpu::CommandEncoderDescriptor { label: Some("GpuKlt dispatch") },
-            );
-            {
-                let mut pass = encoder.begin_compute_pass(
-                    &wgpu::ComputePassDescriptor {
-                        label:             Some("track_level"),
-                        timestamp_writes:  None,
-                    },
-                );
-                pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, &bind_group, &[]);
-                let workgroups = (n + WG_SIZE - 1) / WG_SIZE;
-                pass.dispatch_workgroups(workgroups, 1, 1);
-            }
-
-            // For non-final levels (level > 0), the shader already multiplied
-            // dx/dy by 2 before writing to displacements[]. We just submit
-            // and continue — no CPU-side scaling needed.
-            gpu.queue.submit(std::iter::once(encoder.finish()));
-
-            // Block until this level's dispatch is complete before the next
-            // level reads the updated displacements.
-            // A future optimisation: chain all levels in a single submit with
-            // pipeline barriers (requires compute-to-compute ordering).
-            gpu.device.poll(wgpu::Maintain::Wait);
-        }
-
-        // --- Read back results ---
+        // --- All pyramid levels in a single command encoder ---
+        //
+        // Each pyramid level is one compute pass inside the same encoder.
+        // wgpu inserts the necessary storage-buffer pipeline barriers between
+        // passes within an encoder, so the next level correctly sees the
+        // displacement updates written by the previous level.
+        //
+        // This replaces the previous pattern of one encoder + poll(Wait) per
+        // level, which cost num_levels round-trips (~10-30ms each on dzn).
+        // Now we pay exactly one submit + one poll for the whole tracking pass.
         let rb_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label:              Some("GpuKlt results readback"),
             size:               result_byte_len,
@@ -405,9 +329,67 @@ impl GpuKltTracker {
             mapped_at_creation: false,
         });
 
+        // Pre-allocate params and bind groups for all levels before encoding.
+        // They must outlive the encoder, so we collect them here.
+        let level_resources: Vec<(wgpu::Buffer, wgpu::BindGroup)> = (0..num_levels).rev()
+            .map(|level| {
+                let level_scale = 1.0f32 / (1u32 << level) as f32;
+                let params = KltParams {
+                    n_features:     n,
+                    max_iterations: self.max_iterations as u32,
+                    epsilon_sq:     self.epsilon * self.epsilon,
+                    level:          level as u32,
+                    level_scale,
+                    img0_width:     img0_w,
+                    img0_height:    img0_h,
+                    _pad:           0,
+                };
+                let params_buf = gpu.device.create_buffer_init(
+                    &wgpu::util::BufferInitDescriptor {
+                        label:    Some("GpuKlt params"),
+                        contents: bytemuck::bytes_of(&params),
+                        usage:    wgpu::BufferUsages::UNIFORM,
+                    },
+                );
+                let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label:  Some("GpuKlt BG"),
+                    layout: &self.bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(
+                                &prev_pyramid.levels[level].read_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(
+                                &curr_pyramid.levels[level].read_view),
+                        },
+                        wgpu::BindGroupEntry { binding: 2, resource: feature_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: disp_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 4, resource: results_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 5, resource: params_buf.as_entire_binding() },
+                    ],
+                });
+                (params_buf, bind_group)
+            })
+            .collect();
+
         let mut encoder = gpu.device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor { label: Some("GpuKlt readback") },
+            &wgpu::CommandEncoderDescriptor { label: Some("GpuKlt all levels + readback") },
         );
+
+        let workgroups = (n + WG_SIZE - 1) / WG_SIZE;
+        for (_, bind_group) in &level_resources {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label:            Some("track_level"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+
         encoder.copy_buffer_to_buffer(&results_buf, 0, &rb_buf, 0, result_byte_len);
         gpu.queue.submit(std::iter::once(encoder.finish()));
 
