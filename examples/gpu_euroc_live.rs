@@ -108,8 +108,10 @@ fn main() {
     let config = GpuFrontendConfig {
         //max_features:    40,
         //cell_size:       128,
-        max_features:    2000,
-        cell_size:       16,
+        //max_features:    2000,
+        //cell_size:       16,
+        max_features:    100,
+        cell_size:       96,
         pyramid_levels:  4,
         klt_window:      11,
         klt_max_iter:    30,
