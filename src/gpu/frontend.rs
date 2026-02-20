@@ -12,9 +12,9 @@
 //   HistEq             CPU          Applied before GPU upload.
 //   Image upload       GPU          u8 → R32Float texture via staging buf.
 //   Pyramid build      GPU          GpuPyramidPipeline (Gaussian + downsample)
-//   KLT tracking       GPU          GpuKltTracker (inverse compositional)
-//   FAST detection     GPU          GpuFastDetector (Bresenham circle + arcs)
-//   NMS                CPU          OccupancyNms — microseconds, not worth porting
+//   KLT tracking       GPU          ┐
+//   FAST detection     GPU          ├─ Fused: one encoder, one submit, one poll
+//   NMS                GPU          ┘
 //   Occupancy grid     CPU          OccupancyGrid — byte mask, trivial
 //   RANSAC             CPU          essential::estimate_essential_ransac — pure
 //                                   linear algebra on O(N) tracked positions
@@ -48,7 +48,6 @@ use crate::gpu::pyramid::{GpuPyramid, GpuPyramidPipeline};
 use crate::histeq::{self, HistEqMethod};
 use crate::image::Image;
 use crate::klt::TrackStatus;
-use crate::nms::OccupancyNms;
 use crate::occupancy::OccupancyGrid;
 
 // ---------------------------------------------------------------------------
@@ -145,7 +144,6 @@ pub struct GpuFrontend {
     klt:          GpuKltTracker,
 
     // CPU post-processing.
-    nms:  OccupancyNms,
     grid: OccupancyGrid,
 
     // Per-frame state.
@@ -166,7 +164,10 @@ impl GpuFrontend {
     /// at startup, not every frame.
     pub fn new(gpu: &GpuDevice, config: GpuFrontendConfig, img_w: usize, img_h: usize) -> Self {
         let pyr_pipeline = GpuPyramidPipeline::new(gpu);
-        let fast         = GpuFastDetector::new(gpu, config.fast_threshold, config.fast_arc_length);
+        let fast         = GpuFastDetector::new(
+            gpu, config.fast_threshold, config.fast_arc_length,
+            img_w, img_h, config.cell_size,
+        );
         let klt          = GpuKltTracker::new(
             gpu,
             config.klt_window,
@@ -175,12 +176,11 @@ impl GpuFrontend {
             config.pyramid_levels,
             config.max_features,
         );
-        let nms  = OccupancyNms::new(config.cell_size);
         let grid = OccupancyGrid::new(img_w, img_h, config.cell_size);
 
         GpuFrontend {
             config,
-            pyr_pipeline, fast, klt, nms, grid,
+            pyr_pipeline, fast, klt, grid,
             prev_pyramid:  None,
             features:      Vec::new(),
             prev_features: Vec::new(),
@@ -233,20 +233,67 @@ impl GpuFrontend {
         };
 
         // ── Step 2: KLT tracking ─────────────────────────────────────────────
+        // ── Step 4: FAST+NMS detection ────────────────────────────────────────
+        //
+        // PIPELINE FUSION: both operations are recorded into one encoder and
+        // submitted together, paying only a single poll(Wait) per frame.
+        //
+        //   prepare() — write_buffers + build bind groups (staging ring, no poll)
+        //   encoder:  clear disp → KLT passes → copy results
+        //             clear score → FAST passes → NMS → copy winners
+        //   submit + arm_readback × 2 + poll(Wait)   ← ONE round-trip
+        //   collect_results() + collect_winners()
+        //
+        // When there are no previous features (first frame), KLT is skipped and
+        // only FAST runs — via the standalone detect() wrapper.
+
         let t0 = Instant::now();
-        if self.has_prev && !self.features.is_empty() {
-            // Clone features into a local slice to satisfy the borrow checker:
-            // self.klt.track() needs &mut self.klt, but self.features and
-            // self.prev_pyramid are also part of self — Rust can't split the
-            // borrow across fields through an if-let like this without help.
-            // The clone is one Vec<Feature> copy (~N×16 bytes), negligible.
+        let slots = self.config.max_features.saturating_sub(self.features.len());
+
+        let (klt_results, winners) = if self.has_prev && !self.features.is_empty() {
             let feats_snap: Vec<Feature> = self.features.clone();
             let prev = self.prev_pyramid.as_ref().unwrap();
-            let results = self.klt.track(gpu, prev, &curr_pyramid, &feats_snap);
 
-            // Filter in-place: keep only Tracked features.
+            // prepare() does all write_buffer calls for both components.
+            self.klt.prepare(gpu, &feats_snap, prev, &curr_pyramid);
+
+            let mut encoder = gpu.device.create_command_encoder(
+                &wgpu::CommandEncoderDescriptor { label: Some("GpuFrontend fused") });
+
+            self.klt.record_into(&mut encoder);
+            if slots > 0 {
+                self.fast.record_into(gpu, &mut encoder, &curr_pyramid.levels[0]);
+            }
+
+            gpu.queue.submit(std::iter::once(encoder.finish()));
+
+            // Arm both readbacks before the single poll.
+            self.klt.arm_readback();
+            if slots > 0 { self.fast.arm_readback(); }
+
+            gpu.device.poll(wgpu::Maintain::Wait);   // ← ONE poll
+
+            let results  = self.klt.collect_results(&feats_snap);
+            let detected = if slots > 0 { self.fast.collect_winners(0) } else { Vec::new() };
+            (Some((feats_snap, results)), detected)
+        } else {
+            // First frame — only detection needed.
+            let detected = if slots > 0 {
+                self.fast.detect(gpu, &curr_pyramid.levels[0], 0)
+            } else {
+                Vec::new()
+            };
+            (None, detected)
+        };
+
+        timing.klt    = t0.elapsed().as_secs_f64();
+        timing.detect = 0.0; // folded into klt timing above
+
+        // ── Apply KLT results ─────────────────────────────────────────────────
+        if let Some((feats_snap, results)) = klt_results {
+            let _ = feats_snap; // already used in collect_results
             let mut write = 0;
-            for (_i, result) in results.iter().enumerate() {
+            for result in &results {
                 if result.status == TrackStatus::Tracked {
                     self.features[write] = result.feature.clone();
                     write += 1;
@@ -257,15 +304,11 @@ impl GpuFrontend {
             }
             self.features.truncate(write);
         }
-        timing.klt = t0.elapsed().as_secs_f64();
 
         // ── Step 2b: Geometric verification (RANSAC, CPU) ────────────────────
         let t0 = Instant::now();
         if let Some(ref cam) = self.config.camera {
             if self.features.len() >= 8 {
-                // Build correspondences: match by feature ID between
-                // prev_features (positions in frame t-1) and current
-                // features (positions in frame t after KLT).
                 let corrs: Vec<(usize, Correspondence)> = self.features.iter()
                     .enumerate()
                     .filter_map(|(idx, f)| {
@@ -294,8 +337,6 @@ impl GpuFrontend {
                                 stats.rejected += 1;
                             }
                         }
-                        // Preserve features that had no previous match
-                        // (newly detected this frame — can't form a correspondence).
                         let matched_ids: Vec<u64> =
                             corrs.iter().map(|(idx, _)| self.features[*idx].id).collect();
                         for f in &self.features {
@@ -317,46 +358,24 @@ impl GpuFrontend {
             self.grid.mark(f.x, f.y);
         }
 
-        // ── Step 4: Detect + replenish ────────────────────────────────────────
-        let t0 = Instant::now();
+        // ── Step 4: Replenish from fused winners (already collected above) ────
+        let mask = self.grid.unoccupied_mask();
         let slots = self.config.max_features.saturating_sub(self.features.len());
-
-        if slots > 0 {
-            // Run GPU FAST on pyramid level 0.
-            let mut raw = self.fast.detect(gpu, &curr_pyramid.levels[0]);
-
-            // Filter to unoccupied cells only — mirrors CPU frontend's
-            // detect_masked() call. The occupancy grid was just updated from
-            // surviving tracked features, so this ensures new detections
-            // don't pile on top of existing ones.
-            let mask = self.grid.unoccupied_mask();
-            raw.retain(|f| {
-                let x = f.x as usize;
-                let y = f.y as usize;
-                x < mask.width() && y < mask.height() && mask.get(x, y) > 0
-            });
-
-            // Sort by score descending so NMS picks the strongest corner per cell.
-            raw.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-
-            // NMS over the unoccupied-only candidates, then assign IDs.
-            let suppressed = self.nms.suppress(&raw, self.img_w, self.img_h);
-
-            for f in suppressed.iter().take(slots) {
-                let new_feat = Feature {
-                    x:     f.x,
-                    y:     f.y,
-                    score: f.score,
-                    level: f.level,
-                    id:    self.next_id,
-                };
+        let mut added = 0;
+        for f in &winners {
+            if added >= slots { break; }
+            let x = f.x as usize;
+            let y = f.y as usize;
+            if x < mask.width() && y < mask.height() && mask.get(x, y) > 0 {
+                self.features.push(Feature {
+                    x: f.x, y: f.y, score: f.score, level: f.level, id: self.next_id,
+                });
                 self.next_id += 1;
-                self.features.push(new_feat);
                 self.grid.mark(f.x, f.y);
                 stats.new_detections += 1;
+                added += 1;
             }
         }
-        timing.detect = t0.elapsed().as_secs_f64();
 
         // ── Step 5: Advance state ─────────────────────────────────────────────
         self.prev_pyramid  = Some(curr_pyramid);

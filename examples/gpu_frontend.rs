@@ -2,7 +2,7 @@
 //
 // Chains the full Rudolf-V GPU frontend in the order a VIO system would run it:
 //
-//   Frame(t)   → GpuPyramidPipeline → GpuFastDetector → OccupancyNms (CPU)
+//   Frame(t)   → GpuPyramidPipeline → GpuFastDetector+NMS (GPU, single encoder)
 //   Frame(t+1) → GpuPyramidPipeline → GpuKltTracker → tracked positions
 //
 // Output: live minifb window with two panels:
@@ -32,14 +32,13 @@ use std::time::{Duration, Instant};
 
 use minifb::{Key, Window, WindowOptions};
 
-use rudolf_v::fast::{FastDetector, Feature};
+use rudolf_v::fast::Feature;
 use rudolf_v::gpu::device::GpuDevice;
 use rudolf_v::gpu::fast::GpuFastDetector;
 use rudolf_v::gpu::klt::GpuKltTracker;
 use rudolf_v::gpu::pyramid::GpuPyramidPipeline;
 use rudolf_v::image::Image;
 use rudolf_v::klt::TrackStatus;
-use rudolf_v::nms::OccupancyNms;
 
 // ---------------------------------------------------------------------------
 // Pipeline parameters
@@ -71,19 +70,18 @@ fn main() {
     eprintln!("[frontend] {}", gpu.adapter_info);
 
     let pyr_pipeline = GpuPyramidPipeline::new(&gpu);
-    let gpu_fast     = GpuFastDetector::new(&gpu, FAST_THRESHOLD, FAST_ARC);
+    let mut gpu_fast = GpuFastDetector::new(&gpu, FAST_THRESHOLD, FAST_ARC, 240, 180, NMS_CELL);
     let mut gpu_klt  = GpuKltTracker::new(&gpu, KLT_WIN, KLT_MAX_ITER, KLT_EPSILON, PYR_LEVELS, 512);
-    let nms          = OccupancyNms::new(NMS_CELL);
 
     match args.len() {
         // ---- Synthetic animated mode ----
-        1 => run_synthetic(&gpu, &pyr_pipeline, &gpu_fast, &mut gpu_klt, &nms),
+        1 => run_synthetic(&gpu, &pyr_pipeline, &mut gpu_fast, &mut gpu_klt),
 
         // ---- Single image: zero-motion sanity check ----
         2 => {
             let img = load_image(&args[1]);
             eprintln!("[frontend] zero-motion mode: {}×{}", img.width(), img.height());
-            run_static(&gpu, &pyr_pipeline, &gpu_fast, &mut gpu_klt, &nms, &img, &img);
+            run_static(&gpu, &pyr_pipeline, &mut gpu_fast, &mut gpu_klt, &img, &img);
         }
 
         // ---- Two images: detect in frame1, track into frame2 ----
@@ -93,7 +91,7 @@ fn main() {
             assert_eq!((img1.width(), img1.height()), (img2.width(), img2.height()),
                 "images must be the same size");
             eprintln!("[frontend] two-frame mode: {}×{}", img1.width(), img1.height());
-            run_static(&gpu, &pyr_pipeline, &gpu_fast, &mut gpu_klt, &nms, &img1, &img2);
+            run_static(&gpu, &pyr_pipeline, &mut gpu_fast, &mut gpu_klt, &img1, &img2);
         }
     }
 }
@@ -105,9 +103,8 @@ fn main() {
 fn run_synthetic(
     gpu:          &GpuDevice,
     pyr_pipeline: &GpuPyramidPipeline,
-    gpu_fast:     &GpuFastDetector,
+    gpu_fast:     &mut GpuFastDetector,
     gpu_klt:      &mut GpuKltTracker,
-    nms:          &OccupancyNms,
 ) {
     let w = 240usize;
     let h = 180usize;
@@ -153,9 +150,7 @@ fn run_synthetic(
         let detect_ms;
         if redetect {
             let t0 = Instant::now();
-            let mut raw = gpu_fast.detect(gpu, &pyr_t.levels[0]);
-            raw.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
-            features = nms.suppress(&raw, w, h);
+            features = gpu_fast.detect(gpu, &pyr_t.levels[0], 0);
             detect_ms = t0.elapsed().as_secs_f64() * 1000.0;
             eprintln!("[frontend] frame {frame_idx}: redetected {} corners", features.len());
         } else {
@@ -209,9 +204,8 @@ fn run_synthetic(
 fn run_static(
     gpu:          &GpuDevice,
     pyr_pipeline: &GpuPyramidPipeline,
-    gpu_fast:     &GpuFastDetector,
+    gpu_fast:     &mut GpuFastDetector,
     gpu_klt:      &mut GpuKltTracker,
-    nms:          &OccupancyNms,
     frame1:       &Image<u8>,
     frame2:       &Image<u8>,
 ) {
@@ -226,9 +220,7 @@ fn run_static(
 
     // --- FAST + NMS ---
     let t0 = Instant::now();
-    let mut raw = gpu_fast.detect(gpu, &pyr1.levels[0]);
-    raw.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
-    let features = nms.suppress(&raw, w, h);
+    let features = gpu_fast.detect(gpu, &pyr1.levels[0], 0);
     let detect_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     // --- GPU KLT ---

@@ -1,20 +1,14 @@
 // examples/gpu_fast.rs — CPU vs GPU FAST corner detector visualiser.
 //
-// For each test scene, produces an SVG with four panels:
+// For each test scene, produces an SVG with three panels:
 //
-//   ┌─────────────────┬─────────────────┬─────────────────┬─────────────────┐
-//   │  CPU raw        │  CPU + NMS      │  GPU raw        │  GPU + NMS      │
-//   │  (red circles)  │  (green + grid) │  (orange)       │  (cyan + grid)  │
-//   └─────────────────┴─────────────────┴─────────────────┴─────────────────┘
+//   ┌─────────────────┬─────────────────┬─────────────────┐
+//   │  CPU raw        │  CPU + NMS      │  GPU + NMS      │
+//   │  (red circles)  │  (green + grid) │  (cyan + grid)  │
+//   └─────────────────┴─────────────────┴─────────────────┘
 //
-// NMS NOTE: features are sorted by score descending before NMS so the
-// highest-scoring corner wins each cell on both CPU and GPU. Without sorting,
-// the CPU winner is determined by raster-scan order and the GPU winner by
-// atomic claim order — producing different cells even when raw sets match.
-//
-// TIMING NOTE: GPU includes upload + detect + readback. The fixed overhead
-// of staging buffer allocation and device.poll(Wait) dominates for small
-// images (~15–90 ms). The GPU breakeven point is roughly 500×400+.
+// GPU NMS is now performed on-GPU in the same encoder as FAST detection,
+// so detect() returns already-suppressed winners directly.
 //
 // USAGE
 //   cargo run --example gpu_fast
@@ -37,7 +31,6 @@ const NMS_CELL:   usize = 16;
 const SCALE:      usize = 4;
 
 /// Max image dimension before skipping per-pixel SVG rendering.
-/// Beyond this, SVG files exceed ~50 MB and browsers struggle to load them.
 const MAX_RENDER_DIM: usize = 256;
 
 fn main() {
@@ -49,12 +42,11 @@ fn main() {
 
     let gpu_pipeline = GpuPyramidPipeline::new(&gpu);
     let cpu_det = FastDetector::new(THRESHOLD, ARC_LENGTH);
-    let gpu_det = GpuFastDetector::new(&gpu, THRESHOLD, ARC_LENGTH);
-    let nms     = OccupancyNms::new(NMS_CELL);
+    let cpu_nms = OccupancyNms::new(NMS_CELL);
 
     let mut scenes: Vec<(String, Image<u8>)> = vec![
-        ("rectangles".into(),   make_multi_rect()),
-        ("circle_blobs".into(), make_blobs()),
+        ("rectangles".into(),    make_multi_rect()),
+        ("circle_blobs".into(),  make_blobs()),
         ("gradient_step".into(), make_gradient_step()),
     ];
 
@@ -73,39 +65,46 @@ fn main() {
     for (name, img) in &scenes {
         println!("\n=== Scene: {name} ({}×{}) ===", img.width(), img.height());
 
-        // CPU — sort by score so NMS picks highest-score winner per cell.
+        // CPU: raw detection + manual NMS for comparison.
         let t0 = Instant::now();
         let mut cpu_raw = cpu_det.detect(img);
         cpu_raw.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
         let cpu_time = t0.elapsed();
-        let cpu_nms = nms.suppress(&cpu_raw, img.width(), img.height());
+        let cpu_suppressed = cpu_nms.suppress(&cpu_raw, img.width(), img.height());
         println!("  CPU: {} raw → {} NMS  ({:.2} ms)",
-            cpu_raw.len(), cpu_nms.len(), cpu_time.as_secs_f64() * 1000.0);
+            cpu_raw.len(), cpu_suppressed.len(), cpu_time.as_secs_f64() * 1000.0);
 
-        // GPU — same sort before NMS.
+        // GPU: FAST + NMS chained in one encoder, one round-trip.
+        // Detector is created per-scene sized to the image dimensions.
+        let mut gpu_det = GpuFastDetector::new(
+            &gpu, THRESHOLD, ARC_LENGTH,
+            img.width(), img.height(), NMS_CELL,
+        );
         let t0 = Instant::now();
         let gpu_pyr = gpu_pipeline.build(&gpu, img, 1, 1.0);
-        let mut gpu_raw = gpu_det.detect(&gpu, &gpu_pyr.levels[0]);
-        gpu_raw.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        let gpu_suppressed = gpu_det.detect(&gpu, &gpu_pyr.levels[0], 0);
         let gpu_time = t0.elapsed();
-        let gpu_nms = nms.suppress(&gpu_raw, img.width(), img.height());
-        println!("  GPU: {} raw → {} NMS  ({:.2} ms, includes upload+detect+readback)",
-            gpu_raw.len(), gpu_nms.len(), gpu_time.as_secs_f64() * 1000.0);
+        println!("  GPU: {} corners  ({:.2} ms, FAST+NMS+readback)",
+            gpu_suppressed.len(), gpu_time.as_secs_f64() * 1000.0);
 
-        let (match_pct, max_err) = position_agreement(&cpu_raw, &gpu_raw);
-        println!("  Agreement: {match_pct:.1}% raw  (max pos error: {max_err:.1} px)");
+        let (match_pct, max_err) = position_agreement(&cpu_suppressed, &gpu_suppressed);
+        println!("  NMS agreement: {match_pct:.1}%  (max pos error: {max_err:.1} px)");
 
-        let svg = render_four_panel(img, &cpu_raw, &cpu_nms, &gpu_raw, &gpu_nms, name);
+        let svg = render_panels(img, &cpu_raw, &cpu_suppressed, &gpu_suppressed, name);
         let path = format!("vis_output/gpu_{name}.svg");
         fs::write(&path, svg).expect("write failed");
         println!("  → {path}");
     }
 
-    // Multi-level
+    // Multi-level: one detector sized for the largest level (level 0).
     println!("\n=== Multi-level GPU FAST ===");
     let img = make_multi_rect();
+    let mut gpu_det_ml = GpuFastDetector::new(
+        &gpu, THRESHOLD, ARC_LENGTH,
+        img.width(), img.height(), NMS_CELL,
+    );
     let gpu_pyr = gpu_pipeline.build(&gpu, &img, 4, 1.0);
-    let svg = render_multilevel(&img, &gpu, &gpu_det, &gpu_pyr, 4);
+    let svg = render_multilevel(&img, &gpu, &mut gpu_det_ml, &gpu_pyr, 4);
     fs::write("vis_output/gpu_multilevel_fast.svg", svg).unwrap();
     println!("  → vis_output/gpu_multilevel_fast.svg");
 
@@ -122,7 +121,7 @@ fn position_agreement(cpu: &[Feature], gpu: &[Feature]) -> (f32, f32) {
     let mut max_err = 0.0f32;
     for c in cpu {
         if let Some(g) = gpu.iter().find(|g| {
-            (g.x - c.x).abs() < 1.5 && (g.y - c.y).abs() < 1.5
+            (g.x - c.x).abs() < (NMS_CELL as f32) && (g.y - c.y).abs() < (NMS_CELL as f32)
         }) {
             matched += 1;
             let err = ((g.x - c.x).powi(2) + (g.y - c.y).powi(2)).sqrt();
@@ -136,10 +135,11 @@ fn position_agreement(cpu: &[Feature], gpu: &[Feature]) -> (f32, f32) {
 // SVG rendering
 // ---------------------------------------------------------------------------
 
-fn render_four_panel(
+fn render_panels(
     img: &Image<u8>,
-    cpu_raw: &[Feature], cpu_nms: &[Feature],
-    gpu_raw: &[Feature], gpu_nms: &[Feature],
+    cpu_raw: &[Feature],
+    cpu_nms: &[Feature],
+    gpu_nms: &[Feature],
     name: &str,
 ) -> String {
     let sw = img.width() * SCALE;
@@ -147,7 +147,7 @@ fn render_four_panel(
     let gap = 20;
     let top_pad = 50;
     let bot_pad = 20;
-    let total_w = sw * 4 + gap * 3;
+    let total_w = sw * 3 + gap * 2;
     let total_h = sh + top_pad + bot_pad;
 
     let mut svg = String::new();
@@ -159,10 +159,9 @@ fn render_four_panel(
         {name} — CPU vs GPU FAST-{ARC_LENGTH} (thr={THRESHOLD})</text>").unwrap();
 
     let panels: &[(usize, &[Feature], bool, &str, String)] = &[
-        (0,             cpu_raw, false, "ff3333", format!("CPU raw ({} corners)", cpu_raw.len())),
-        (sw+gap,        cpu_nms, true,  "22cc44", format!("CPU+NMS ({} corners)", cpu_nms.len())),
-        (2*(sw+gap),    gpu_raw, false, "ff8800", format!("GPU raw ({} corners)", gpu_raw.len())),
-        (3*(sw+gap),    gpu_nms, true,  "00cccc", format!("GPU+NMS ({} corners)", gpu_nms.len())),
+        (0,          cpu_raw, false, "ff3333", format!("CPU raw ({} corners)", cpu_raw.len())),
+        (sw+gap,     cpu_nms, true,  "22cc44", format!("CPU+NMS ({} corners)", cpu_nms.len())),
+        (2*(sw+gap), gpu_nms, true,  "00cccc", format!("GPU+NMS ({} corners)", gpu_nms.len())),
     ];
 
     for (x_off, features, show_grid, color, label) in panels {
@@ -181,7 +180,7 @@ fn render_four_panel(
 fn render_multilevel(
     img: &Image<u8>,
     gpu: &GpuDevice,
-    det: &GpuFastDetector,
+    det: &mut GpuFastDetector,
     pyr: &rudolf_v::gpu::pyramid::GpuPyramid,
     num_levels: usize,
 ) -> String {
@@ -206,7 +205,7 @@ fn render_multilevel(
         let lw = level.width as usize;
         let lh = level.height as usize;
         let gpu_pixels = pyr.readback_level(gpu, lvl);
-        let features = det.detect_at_level(gpu, level, lvl);
+        let features = det.detect(gpu, level, lvl);
         println!("  GPU level {lvl} ({}×{}): {} corners", lw, lh, features.len());
 
         let sw = lw * SCALE;
@@ -252,8 +251,6 @@ fn render_multilevel(
 
 fn write_image_rects(svg: &mut String, img: &Image<u8>) {
     if img.width() > MAX_RENDER_DIM || img.height() > MAX_RENDER_DIM {
-        // For large images, render a solid background with a caption.
-        // One <rect> per pixel would make the SVG too large for browsers.
         let sw = img.width() * SCALE;
         let sh = img.height() * SCALE;
         writeln!(svg, "  <rect x=\"0\" y=\"0\" width=\"{sw}\" height=\"{sh}\" fill=\"#555\"/>").unwrap();

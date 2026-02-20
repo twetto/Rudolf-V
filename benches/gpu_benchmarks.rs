@@ -98,7 +98,7 @@ fn bench_fast(c: &mut Criterion) {
     let gpu = GpuDevice::new().expect("no Vulkan GPU");
     let pyr_pipeline = GpuPyramidPipeline::new(&gpu);
     let pyr = pyr_pipeline.build(&gpu, &img, 1, 1.0);
-    let gpu_fast = GpuFastDetector::new(&gpu, 20, 9);
+    let mut gpu_fast = GpuFastDetector::new(&gpu, 20, 9, 752, 480, 16);
     let cpu_fast = FastDetector::new(20, 9);
 
     let mut group = c.benchmark_group("fast");
@@ -109,7 +109,7 @@ fn bench_fast(c: &mut Criterion) {
     });
 
     group.bench_function("gpu_detect_752x480", |b| {
-        b.iter(|| gpu_fast.detect(&gpu, &pyr.levels[0]))
+        b.iter(|| gpu_fast.detect(&gpu, &pyr.levels[0], 0))
     });
 
     group.finish();
@@ -154,7 +154,8 @@ fn bench_klt(c: &mut Criterion) {
             BenchmarkId::new("cpu_IC_4pyr", format!("{n}feat")),
             features,
             |b, feats| {
-                let tracker = KltTracker::with_method(7, 30, 0.01, 4, LkMethod::InverseCompositional);
+                //let tracker = KltTracker::with_method(7, 30, 0.01, 4, LkMethod::InverseCompositional);
+                let tracker = KltTracker::with_method(11, 30, 0.01, 4, LkMethod::InverseCompositional);
                 b.iter(|| tracker.track(&cpu_pyr1, &cpu_pyr2, feats))
             },
         );
@@ -164,7 +165,8 @@ fn bench_klt(c: &mut Criterion) {
             BenchmarkId::new("gpu_IC_4pyr", format!("{n}feat")),
             features,
             |b, feats| {
-                let mut tracker = GpuKltTracker::new(&gpu, 7, 30, 0.01, 4, 256);
+                //let mut tracker = GpuKltTracker::new(&gpu, 7, 30, 0.01, 4, 256);
+                let mut tracker = GpuKltTracker::new(&gpu, 11, 30, 0.01, 4, 256);
                 b.iter(|| tracker.track(&gpu, &gpu_pyr1, &gpu_pyr2, feats))
             },
         );
@@ -188,7 +190,8 @@ fn bench_frontend(c: &mut Criterion) {
         max_features:   40,
         cell_size:      128,
         pyramid_levels: 4,
-        klt_window:     7,
+        //klt_window:     7,
+        klt_window:     11,
         klt_max_iter:   30,
         klt_method:     LkMethod::InverseCompositional,
         histeq:         HistEqMethod::Global,
@@ -199,7 +202,8 @@ fn bench_frontend(c: &mut Criterion) {
         max_features:   40,
         cell_size:      128,
         pyramid_levels: 4,
-        klt_window:     7,
+        //klt_window:     7,
+        klt_window:     11,
         klt_max_iter:   30,
         histeq:         HistEqMethod::Global,
         ..Default::default()
@@ -252,14 +256,16 @@ fn bench_klt_allocation(c: &mut Criterion) {
     // Recreate tracker each iteration — pay new() cost every frame (old behaviour)
     group.bench_function("new_per_call", |b| {
         b.iter(|| {
-            let mut tracker = GpuKltTracker::new(&gpu, 7, 30, 0.01, 4, 256);
+            //let mut tracker = GpuKltTracker::new(&gpu, 7, 30, 0.01, 4, 256);
+            let mut tracker = GpuKltTracker::new(&gpu, 11, 30, 0.01, 4, 256);
             tracker.track(&gpu, &gpu_pyr1, &gpu_pyr2, &features)
         })
     });
 
     // Reuse pre-allocated buffers (current behaviour)
     group.bench_function("reuse_buffers", |b| {
-        let mut tracker = GpuKltTracker::new(&gpu, 7, 30, 0.01, 4, 256);
+        //let mut tracker = GpuKltTracker::new(&gpu, 7, 30, 0.01, 4, 256);
+        let mut tracker = GpuKltTracker::new(&gpu, 11, 30, 0.01, 4, 256);
         b.iter(|| tracker.track(&gpu, &gpu_pyr1, &gpu_pyr2, &features))
     });
 
@@ -320,7 +326,8 @@ fn bench_euroc(c: &mut Criterion) {
         max_features:   40,
         cell_size:      128,
         pyramid_levels: 4,
-        klt_window:     7,
+        //klt_window:     7,
+        klt_window:     11,
         klt_max_iter:   30,
         klt_method:     LkMethod::InverseCompositional,
         histeq:         HistEqMethod::Global,
@@ -331,7 +338,8 @@ fn bench_euroc(c: &mut Criterion) {
         max_features:   40,
         cell_size:      128,
         pyramid_levels: 4,
-        klt_window:     7,
+        //klt_window:     7,
+        klt_window:     11,
         klt_max_iter:   30,
         histeq:         HistEqMethod::Global,
         ..Default::default()

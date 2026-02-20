@@ -44,8 +44,6 @@
 //   compiled once; each level creates a new bind group with the correct
 //   texture pair. Bind groups are cheap to create.
 
-use wgpu::util::DeviceExt;
-
 use crate::fast::Feature;
 use crate::gpu::device::GpuDevice;
 use crate::gpu::pyramid::GpuPyramid;
@@ -131,6 +129,14 @@ pub struct GpuKltTracker {
     results_buf:    wgpu::Buffer,   // STORAGE | COPY_SRC  — track results
     rb_buf:         wgpu::Buffer,   // MAP_READ | COPY_DST — CPU readback
     params_bufs:    Vec<wgpu::Buffer>, // one UNIFORM | COPY_DST per level
+
+    // State set by prepare(), consumed by record_into()/arm_readback()/collect_results().
+    n_prepared:     usize,
+    result_bytes_p: u64,
+    disp_bytes_p:   u64,
+    workgroups_p:   u32,
+    bind_groups_p:  Vec<wgpu::BindGroup>,
+    readback_rx:    Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
 }
 
 impl GpuKltTracker {
@@ -293,20 +299,27 @@ impl GpuKltTracker {
             window_size, max_iterations, epsilon, max_levels,
             max_features,
             feature_buf, disp_buf, results_buf, rb_buf, params_bufs,
+            n_prepared: 0, result_bytes_p: 0, disp_bytes_p: 0, workgroups_p: 0,
+            bind_groups_p: Vec::new(),
+            readback_rx: None,
         }
     }
 
-    pub fn track(
+    /// Write feature data and params; build bind groups for this frame.
+    ///
+    /// Returns `false` if `features` is empty — caller can skip encoding entirely.
+    /// Must be called before `record_into()`.
+    pub fn prepare(
         &mut self,
         gpu:          &GpuDevice,
+        features:     &[Feature],
         prev_pyramid: &GpuPyramid,
         curr_pyramid: &GpuPyramid,
-        features:     &[Feature],
-    ) -> Vec<TrackedFeature> {
+    ) -> bool {
         if features.is_empty() {
-            return Vec::new();
+            self.n_prepared = 0;
+            return false;
         }
-
         let n = features.len();
         assert!(n <= self.max_features,
             "GpuKltTracker: {} features exceeds max_features={}", n, self.max_features);
@@ -315,20 +328,18 @@ impl GpuKltTracker {
         let num_levels = self.max_levels
             .min(prev_pyramid.levels.len())
             .min(curr_pyramid.levels.len());
-
         let img0_w = prev_pyramid.levels[0].width;
         let img0_h = prev_pyramid.levels[0].height;
 
-        // ── Upload features (write_buffer into pre-allocated storage buf) ─────
+        // Upload features via staging ring (no VRAM alloc).
         let gpu_features: Vec<GpuKltFeature> =
             features.iter().map(GpuKltFeature::from).collect();
-        let feat_bytes = (n * std::mem::size_of::<GpuKltFeature>()) as u64;
         gpu.queue.write_buffer(&self.feature_buf, 0, bytemuck::cast_slice(&gpu_features));
 
-        // ── Write params for each level into pre-allocated uniform bufs ───────
         let result_bytes = (n * std::mem::size_of::<GpuTrackResult>()) as u64;
         let disp_bytes   = (n * 2 * std::mem::size_of::<f32>()) as u64;
 
+        // Write params for each level.
         for (i, level) in (0..num_levels).rev().enumerate() {
             let params = KltParams {
                 n_features:     n_u32,
@@ -343,9 +354,9 @@ impl GpuKltTracker {
             gpu.queue.write_buffer(&self.params_bufs[i], 0, bytemuck::bytes_of(&params));
         }
 
-        // ── Build bind groups (cheap — just descriptor writes, no VRAM alloc) ─
-        // Textures change every frame so bind groups can't be pre-built.
-        let bind_groups: Vec<wgpu::BindGroup> = (0..num_levels).rev()
+        // Build bind groups (cheap descriptor writes; wgpu resources are Arc-backed
+        // so storing them in self is safe — no Rust lifetime needed).
+        self.bind_groups_p = (0..num_levels).rev()
             .enumerate()
             .map(|(i, level)| {
                 gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -371,39 +382,51 @@ impl GpuKltTracker {
             })
             .collect();
 
-        // ── Single encoder: clear displacements + all level passes + readback ─
-        let workgroups = (n_u32 + WG_SIZE - 1) / WG_SIZE;
-        let mut encoder = gpu.device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor { label: Some("GpuKlt") },
-        );
+        self.n_prepared     = n;
+        self.result_bytes_p = result_bytes;
+        self.disp_bytes_p   = disp_bytes;
+        self.workgroups_p   = (n_u32 + WG_SIZE - 1) / WG_SIZE;
+        true
+    }
 
-        // Zero the displacement buffer — clear_buffer is a GPU memset,
-        // faster than write_buffer (no staging copy) and stays in the encoder.
-        encoder.clear_buffer(&self.disp_buf, 0, Some(disp_bytes));
-
-        for bg in &bind_groups {
+    /// Record KLT passes into `encoder`.
+    /// Must be called after `prepare()` returned `true`.
+    pub fn record_into(&self, encoder: &mut wgpu::CommandEncoder) {
+        assert!(self.n_prepared > 0, "call prepare() before record_into()");
+        encoder.clear_buffer(&self.disp_buf, 0, Some(self.disp_bytes_p));
+        for bg in &self.bind_groups_p {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("track_level"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, bg, &[]);
-            pass.dispatch_workgroups(workgroups, 1, 1);
+            pass.dispatch_workgroups(self.workgroups_p, 1, 1);
         }
+        encoder.copy_buffer_to_buffer(
+            &self.results_buf, 0, &self.rb_buf, 0, self.result_bytes_p);
+    }
 
-        encoder.copy_buffer_to_buffer(&self.results_buf, 0, &self.rb_buf, 0, result_bytes);
-        gpu.queue.submit(std::iter::once(encoder.finish()));
-
-        // ── Readback ──────────────────────────────────────────────────────────
-        let slice = self.rb_buf.slice(..result_bytes);
+    /// Map the readback buffer asynchronously.
+    /// Must be called after `queue.submit()` and before `device.poll(Wait)`.
+    pub fn arm_readback(&mut self) {
         let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).unwrap(); });
-        gpu.device.poll(wgpu::Maintain::Wait);
-        rx.recv().unwrap().expect("KLT readback map failed");
+        self.rb_buf
+            .slice(..self.result_bytes_p)
+            .map_async(wgpu::MapMode::Read, move |r| { tx.send(r).unwrap(); });
+        self.readback_rx = Some(rx);
+    }
 
-        let mapped = slice.get_mapped_range();
+    /// Collect track results. Must be called after `device.poll(Wait)`.
+    /// `features` must be the same slice passed to `prepare()`.
+    pub fn collect_results(&mut self, features: &[Feature]) -> Vec<TrackedFeature> {
+        let rx = self.readback_rx.take()
+            .expect("call arm_readback() before collect_results()");
+        rx.recv().unwrap().expect("KLT readback failed");
+
+        let n = self.n_prepared;
+        let mapped = self.rb_buf.slice(..self.result_bytes_p).get_mapped_range();
         let gpu_results: &[GpuTrackResult] = bytemuck::cast_slice(&mapped);
-
-        let tracked: Vec<TrackedFeature> = gpu_results[..n].iter()
+        let tracked = gpu_results[..n].iter()
             .zip(features.iter())
             .map(|(r, f)| {
                 let status = match r.status {
@@ -417,10 +440,33 @@ impl GpuKltTracker {
                 }
             })
             .collect();
-
         drop(mapped);
         self.rb_buf.unmap();
+        // Release bind groups so textures from this frame can be freed.
+        self.bind_groups_p.clear();
         tracked
+    }
+
+    /// Convenience wrapper: prepare + record + submit + poll + collect.
+    /// Use for standalone tracking (tests, benchmarks).
+    /// For pipeline fusion use `prepare` → `record_into` → `arm_readback` → `collect_results`.
+    pub fn track(
+        &mut self,
+        gpu:          &GpuDevice,
+        prev_pyramid: &GpuPyramid,
+        curr_pyramid: &GpuPyramid,
+        features:     &[Feature],
+    ) -> Vec<TrackedFeature> {
+        if !self.prepare(gpu, features, prev_pyramid, curr_pyramid) {
+            return Vec::new();
+        }
+        let mut encoder = gpu.device.create_command_encoder(
+            &wgpu::CommandEncoderDescriptor { label: Some("GpuKlt standalone") });
+        self.record_into(&mut encoder);
+        gpu.queue.submit(std::iter::once(encoder.finish()));
+        self.arm_readback();
+        gpu.device.poll(wgpu::Maintain::Wait);
+        self.collect_results(features)
     }
 }
 
