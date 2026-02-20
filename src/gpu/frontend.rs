@@ -118,7 +118,7 @@ impl Default for GpuFrontendConfig {
 /// GPU pipelines are compiled at construction time.
 ///
 /// # Example
-/// ```ignore
+/// ```text
 /// let gpu = GpuDevice::new().unwrap();
 /// let config = GpuFrontendConfig {
 ///     max_features: 150,

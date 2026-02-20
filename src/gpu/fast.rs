@@ -293,7 +293,7 @@ impl GpuFastDetector {
     /// Write params and record FAST+NMS passes into `encoder`.
     ///
     /// Call order for full pipeline fusion (one submit, one poll):
-    /// ```ignore
+    /// ```text
     /// fast.record_into(gpu, &mut encoder, level);
     /// klt.record_into(&mut encoder);          // other work
     /// queue.submit(encoder.finish());
