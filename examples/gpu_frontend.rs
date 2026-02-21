@@ -34,7 +34,7 @@ use minifb::{Key, Window, WindowOptions};
 
 use rudolf_v::fast::Feature;
 use rudolf_v::gpu::device::GpuDevice;
-use rudolf_v::gpu::fast::GpuFastDetector;
+use rudolf_v::gpu::fast::{GpuFastDetector, NmsStrategy};
 use rudolf_v::gpu::klt::GpuKltTracker;
 use rudolf_v::gpu::pyramid::GpuPyramidPipeline;
 use rudolf_v::image::Image;
@@ -70,7 +70,7 @@ fn main() {
     eprintln!("[frontend] {}", gpu.adapter_info);
 
     let pyr_pipeline = GpuPyramidPipeline::new(&gpu);
-    let mut gpu_fast = GpuFastDetector::new(&gpu, FAST_THRESHOLD, FAST_ARC, 240, 180, NMS_CELL);
+    let mut gpu_fast = GpuFastDetector::new(&gpu, FAST_THRESHOLD, FAST_ARC, 240, 180, NMS_CELL, NmsStrategy::Cpu);
     let mut gpu_klt  = GpuKltTracker::new(&gpu, KLT_WIN, KLT_MAX_ITER, KLT_EPSILON, PYR_LEVELS, 512);
 
     match args.len() {

@@ -42,7 +42,7 @@ use crate::essential::{self, Correspondence, RansacConfig};
 use crate::fast::Feature;
 use crate::frontend::{FrameStats, TimingStats};
 use crate::gpu::device::GpuDevice;
-use crate::gpu::fast::GpuFastDetector;
+use crate::gpu::fast::{GpuFastDetector, NmsStrategy};
 use crate::gpu::klt::GpuKltTracker;
 use crate::gpu::pyramid::{GpuPyramid, GpuPyramidPipeline};
 use crate::histeq::{self, HistEqMethod};
@@ -54,6 +54,24 @@ use crate::occupancy::OccupancyGrid;
 // Configuration
 // ---------------------------------------------------------------------------
 
+/// Controls how KLT and FAST are submitted to the GPU each frame.
+///
+/// | Hardware                         | Recommended | Reason                                   |
+/// |----------------------------------|-------------|------------------------------------------|
+/// | iGPU / SoC (780M, Jetson, RPi5) | `Separate`  | Unified memory — driver scheduling wins  |
+/// | Discrete GPU (RTX, RX series)    | `Fused`     | Saves one PCIe `poll(Wait)` per frame    |
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SubmitStrategy {
+    /// KLT and FAST submitted in separate encoders (default).
+    /// Better for iGPU / unified memory: driver schedules each independently,
+    /// GPU cache drains between stages.
+    #[default]
+    Separate,
+    /// KLT and FAST recorded into one encoder, one submit, one poll.
+    /// Better for discrete GPU where PCIe round-trips cost ~1–2 ms each.
+    Fused,
+}
+
 /// Configuration for the GPU visual frontend.
 ///
 /// Mirrors `FrontendConfig` from frontend.rs. Fields that select between
@@ -61,6 +79,12 @@ use crate::occupancy::OccupancyGrid;
 /// GPU frontend always uses IC KLT and GPU FAST.
 #[derive(Clone)]
 pub struct GpuFrontendConfig {
+    /// GPU submit strategy: separate encoders (iGPU) or fused (discrete GPU).
+    /// See [`SubmitStrategy`] for guidance. Defaults to `Separate`.
+    pub submit_strategy: SubmitStrategy,
+    /// NMS strategy: CPU readback (iGPU) or GPU NMS pass (discrete GPU).
+    /// See [`NmsStrategy`] for guidance. Defaults to `Cpu`.
+    pub nms_strategy: NmsStrategy,
     /// FAST corner detection threshold (pixel intensity difference).
     pub fast_threshold: u8,
     /// FAST arc length — minimum contiguous bright/dark pixels (9–12).
@@ -92,6 +116,8 @@ pub struct GpuFrontendConfig {
 impl Default for GpuFrontendConfig {
     fn default() -> Self {
         GpuFrontendConfig {
+            submit_strategy: SubmitStrategy::Separate,
+            nms_strategy:    NmsStrategy::Cpu,
             fast_threshold:  20,
             fast_arc_length: 9,
             max_features:    200,
@@ -166,7 +192,7 @@ impl GpuFrontend {
         let pyr_pipeline = GpuPyramidPipeline::new(gpu);
         let fast         = GpuFastDetector::new(
             gpu, config.fast_threshold, config.fast_arc_length,
-            img_w, img_h, config.cell_size,
+            img_w, img_h, config.cell_size, config.nms_strategy,
         );
         let klt          = GpuKltTracker::new(
             gpu,
@@ -233,77 +259,81 @@ impl GpuFrontend {
         };
 
         // ── Step 2: KLT tracking ─────────────────────────────────────────────
-        // ── Step 4: FAST+NMS detection ────────────────────────────────────────
         //
-        // PIPELINE FUSION: both operations are recorded into one encoder and
-        // submitted together, paying only a single poll(Wait) per frame.
-        //
-        //   prepare() — write_buffers + build bind groups (staging ring, no poll)
-        //   encoder:  clear disp → KLT passes → copy results
-        //             clear score → FAST passes → NMS → copy winners
-        //   submit + arm_readback × 2 + poll(Wait)   ← ONE round-trip
-        //   collect_results() + collect_winners()
-        //
-        // When there are no previous features (first frame), KLT is skipped and
-        // only FAST runs — via the standalone detect() wrapper.
+        // `Separate` (default): one submit per stage — better for iGPU/unified
+        //   memory where poll(Wait) is cheap and driver scheduling helps.
+        // `Fused`: KLT + FAST in one encoder, one submit, one poll — better for
+        //   discrete GPU where each PCIe round-trip costs ~1–2 ms.
 
         let t0 = Instant::now();
-        let slots = self.config.max_features.saturating_sub(self.features.len());
+        let slots_before_klt = self.config.max_features.saturating_sub(self.features.len());
 
-        let (klt_results, winners) = if self.has_prev && !self.features.is_empty() {
-            let feats_snap: Vec<Feature> = self.features.clone();
-            let prev = self.prev_pyramid.as_ref().unwrap();
+        // `winners` is populated differently depending on strategy:
+        // Separate — filled in Step 4 after KLT.
+        // Fused    — filled here alongside KLT results.
+        let fused_winners: Option<Vec<Feature>> =
+            if self.config.submit_strategy == SubmitStrategy::Fused
+                && self.has_prev
+                && !self.features.is_empty()
+            {
+                let feats_snap: Vec<Feature> = self.features.clone();
+                let prev = self.prev_pyramid.as_ref().unwrap();
 
-            // prepare() does all write_buffer calls for both components.
-            self.klt.prepare(gpu, &feats_snap, prev, &curr_pyramid);
+                self.klt.prepare(gpu, &feats_snap, prev, &curr_pyramid);
 
-            let mut encoder = gpu.device.create_command_encoder(
-                &wgpu::CommandEncoderDescriptor { label: Some("GpuFrontend fused") });
-
-            self.klt.record_into(&mut encoder);
-            if slots > 0 {
-                self.fast.record_into(gpu, &mut encoder, &curr_pyramid.levels[0]);
-            }
-
-            gpu.queue.submit(std::iter::once(encoder.finish()));
-
-            // Arm both readbacks before the single poll.
-            self.klt.arm_readback();
-            if slots > 0 { self.fast.arm_readback(); }
-
-            gpu.device.poll(wgpu::Maintain::Wait);   // ← ONE poll
-
-            let results  = self.klt.collect_results(&feats_snap);
-            let detected = if slots > 0 { self.fast.collect_winners(0) } else { Vec::new() };
-            (Some((feats_snap, results)), detected)
-        } else {
-            // First frame — only detection needed.
-            let detected = if slots > 0 {
-                self.fast.detect(gpu, &curr_pyramid.levels[0], 0)
-            } else {
-                Vec::new()
-            };
-            (None, detected)
-        };
-
-        timing.klt    = t0.elapsed().as_secs_f64();
-        timing.detect = 0.0; // folded into klt timing above
-
-        // ── Apply KLT results ─────────────────────────────────────────────────
-        if let Some((feats_snap, results)) = klt_results {
-            let _ = feats_snap; // already used in collect_results
-            let mut write = 0;
-            for result in &results {
-                if result.status == TrackStatus::Tracked {
-                    self.features[write] = result.feature.clone();
-                    write += 1;
-                    stats.tracked += 1;
-                } else {
-                    stats.lost += 1;
+                let mut encoder = gpu.device.create_command_encoder(
+                    &wgpu::CommandEncoderDescriptor { label: Some("GpuFrontend fused") });
+                self.klt.record_into(&mut encoder);
+                if slots_before_klt > 0 {
+                    self.fast.record_into(gpu, &mut encoder, &curr_pyramid.levels[0]);
                 }
-            }
-            self.features.truncate(write);
-        }
+                gpu.queue.submit(std::iter::once(encoder.finish()));
+
+                self.klt.arm_readback();
+                if slots_before_klt > 0 { self.fast.arm_readback(); }
+                gpu.device.poll(wgpu::Maintain::Wait);
+
+                let results = self.klt.collect_results(&feats_snap);
+                let detected = if slots_before_klt > 0 {
+                    self.fast.collect_winners(0)
+                } else {
+                    Vec::new()
+                };
+
+                let mut write = 0;
+                for result in &results {
+                    if result.status == TrackStatus::Tracked {
+                        self.features[write] = result.feature.clone();
+                        write += 1;
+                        stats.tracked += 1;
+                    } else {
+                        stats.lost += 1;
+                    }
+                }
+                self.features.truncate(write);
+                Some(detected)
+            } else {
+                // Separate: run KLT standalone; FAST runs independently in Step 4.
+                if self.has_prev && !self.features.is_empty() {
+                    let feats_snap: Vec<Feature> = self.features.clone();
+                    let prev = self.prev_pyramid.as_ref().unwrap();
+                    let results = self.klt.track(gpu, prev, &curr_pyramid, &feats_snap);
+
+                    let mut write = 0;
+                    for result in &results {
+                        if result.status == TrackStatus::Tracked {
+                            self.features[write] = result.feature.clone();
+                            write += 1;
+                            stats.tracked += 1;
+                        } else {
+                            stats.lost += 1;
+                        }
+                    }
+                    self.features.truncate(write);
+                }
+                None
+            };
+        timing.klt = t0.elapsed().as_secs_f64();
 
         // ── Step 2b: Geometric verification (RANSAC, CPU) ────────────────────
         let t0 = Instant::now();
@@ -358,24 +388,40 @@ impl GpuFrontend {
             self.grid.mark(f.x, f.y);
         }
 
-        // ── Step 4: Replenish from fused winners (already collected above) ────
-        let mask = self.grid.unoccupied_mask();
+        // ── Step 4: Detect + replenish ────────────────────────────────────────
+        // slots computed after KLT — reflects true feature gap.
+        // Fused: winners already collected above; FAST ran in parallel with KLT.
+        // Separate: run FAST now as its own submit.
+        let t0 = Instant::now();
         let slots = self.config.max_features.saturating_sub(self.features.len());
-        let mut added = 0;
-        for f in &winners {
-            if added >= slots { break; }
-            let x = f.x as usize;
-            let y = f.y as usize;
-            if x < mask.width() && y < mask.height() && mask.get(x, y) > 0 {
-                self.features.push(Feature {
-                    x: f.x, y: f.y, score: f.score, level: f.level, id: self.next_id,
-                });
-                self.next_id += 1;
-                self.grid.mark(f.x, f.y);
-                stats.new_detections += 1;
-                added += 1;
+
+        let winners = if let Some(w) = fused_winners {
+            w  // already collected in fused KLT block above
+        } else if slots > 0 {
+            self.fast.detect(gpu, &curr_pyramid.levels[0], 0)
+        } else {
+            Vec::new()
+        };
+
+        if slots > 0 {
+            let mask = self.grid.unoccupied_mask();
+            let mut added = 0;
+            for f in &winners {
+                if added >= slots { break; }
+                let x = f.x as usize;
+                let y = f.y as usize;
+                if x < mask.width() && y < mask.height() && mask.get(x, y) > 0 {
+                    self.features.push(Feature {
+                        x: f.x, y: f.y, score: f.score, level: f.level, id: self.next_id,
+                    });
+                    self.next_id += 1;
+                    self.grid.mark(f.x, f.y);
+                    stats.new_detections += 1;
+                    added += 1;
+                }
             }
         }
+        timing.detect = t0.elapsed().as_secs_f64();
 
         // ── Step 5: Advance state ─────────────────────────────────────────────
         self.prev_pyramid  = Some(curr_pyramid);

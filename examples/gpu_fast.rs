@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use rudolf_v::fast::{FastDetector, Feature};
 use rudolf_v::gpu::device::GpuDevice;
-use rudolf_v::gpu::fast::GpuFastDetector;
+use rudolf_v::gpu::fast::{GpuFastDetector, NmsStrategy};
 use rudolf_v::gpu::pyramid::GpuPyramidPipeline;
 use rudolf_v::image::Image;
 use rudolf_v::nms::OccupancyNms;
@@ -78,7 +78,7 @@ fn main() {
         // Detector is created per-scene sized to the image dimensions.
         let mut gpu_det = GpuFastDetector::new(
             &gpu, THRESHOLD, ARC_LENGTH,
-            img.width(), img.height(), NMS_CELL,
+            img.width(), img.height(), NMS_CELL, NmsStrategy::Cpu,
         );
         let t0 = Instant::now();
         let gpu_pyr = gpu_pipeline.build(&gpu, img, 1, 1.0);
@@ -101,7 +101,7 @@ fn main() {
     let img = make_multi_rect();
     let mut gpu_det_ml = GpuFastDetector::new(
         &gpu, THRESHOLD, ARC_LENGTH,
-        img.width(), img.height(), NMS_CELL,
+        img.width(), img.height(), NMS_CELL, NmsStrategy::Cpu,
     );
     let gpu_pyr = gpu_pipeline.build(&gpu, &img, 4, 1.0);
     let svg = render_multilevel(&img, &gpu, &mut gpu_det_ml, &gpu_pyr, 4);

@@ -27,7 +27,7 @@ use std::time::Duration;
 use rudolf_v::fast::FastDetector;
 use rudolf_v::frontend::{Frontend, FrontendConfig};
 use rudolf_v::gpu::device::GpuDevice;
-use rudolf_v::gpu::fast::GpuFastDetector;
+use rudolf_v::gpu::fast::{GpuFastDetector, NmsStrategy};
 use rudolf_v::gpu::frontend::{GpuFrontend, GpuFrontendConfig};
 use rudolf_v::gpu::klt::GpuKltTracker;
 use rudolf_v::gpu::pyramid::GpuPyramidPipeline;
@@ -98,7 +98,7 @@ fn bench_fast(c: &mut Criterion) {
     let gpu = GpuDevice::new().expect("no Vulkan GPU");
     let pyr_pipeline = GpuPyramidPipeline::new(&gpu);
     let pyr = pyr_pipeline.build(&gpu, &img, 1, 1.0);
-    let mut gpu_fast = GpuFastDetector::new(&gpu, 20, 9, 752, 480, 16);
+    let mut gpu_fast = GpuFastDetector::new(&gpu, 20, 9, 752, 480, 16, NmsStrategy::Cpu);
     let cpu_fast = FastDetector::new(20, 9);
 
     let mut group = c.benchmark_group("fast");
@@ -146,7 +146,7 @@ fn bench_klt(c: &mut Criterion) {
     let mut group = c.benchmark_group("klt");
     group.warm_up_time(Duration::from_secs(2));
 
-    for (label, features) in [("40feat", &features_40), ("150feat", &features_150)] {
+    for (_label, features) in [("40feat", &features_40), ("150feat", &features_150)] {
         let n = features.len();
 
         // CPU IC (same method GPU uses)
@@ -154,8 +154,7 @@ fn bench_klt(c: &mut Criterion) {
             BenchmarkId::new("cpu_IC_4pyr", format!("{n}feat")),
             features,
             |b, feats| {
-                //let tracker = KltTracker::with_method(7, 30, 0.01, 4, LkMethod::InverseCompositional);
-                let tracker = KltTracker::with_method(11, 30, 0.01, 4, LkMethod::InverseCompositional);
+                let tracker = KltTracker::with_method(7, 30, 0.01, 4, LkMethod::InverseCompositional);
                 b.iter(|| tracker.track(&cpu_pyr1, &cpu_pyr2, feats))
             },
         );
@@ -165,8 +164,7 @@ fn bench_klt(c: &mut Criterion) {
             BenchmarkId::new("gpu_IC_4pyr", format!("{n}feat")),
             features,
             |b, feats| {
-                //let mut tracker = GpuKltTracker::new(&gpu, 7, 30, 0.01, 4, 256);
-                let mut tracker = GpuKltTracker::new(&gpu, 11, 30, 0.01, 4, 256);
+                let mut tracker = GpuKltTracker::new(&gpu, 7, 30, 0.01, 4, 256);
                 b.iter(|| tracker.track(&gpu, &gpu_pyr1, &gpu_pyr2, feats))
             },
         );
@@ -190,8 +188,7 @@ fn bench_frontend(c: &mut Criterion) {
         max_features:   40,
         cell_size:      128,
         pyramid_levels: 4,
-        //klt_window:     7,
-        klt_window:     11,
+        klt_window:     7,
         klt_max_iter:   30,
         klt_method:     LkMethod::InverseCompositional,
         histeq:         HistEqMethod::Global,
@@ -202,8 +199,7 @@ fn bench_frontend(c: &mut Criterion) {
         max_features:   40,
         cell_size:      128,
         pyramid_levels: 4,
-        //klt_window:     7,
-        klt_window:     11,
+        klt_window:     7,
         klt_max_iter:   30,
         histeq:         HistEqMethod::Global,
         ..Default::default()
@@ -256,16 +252,14 @@ fn bench_klt_allocation(c: &mut Criterion) {
     // Recreate tracker each iteration — pay new() cost every frame (old behaviour)
     group.bench_function("new_per_call", |b| {
         b.iter(|| {
-            //let mut tracker = GpuKltTracker::new(&gpu, 7, 30, 0.01, 4, 256);
-            let mut tracker = GpuKltTracker::new(&gpu, 11, 30, 0.01, 4, 256);
+            let mut tracker = GpuKltTracker::new(&gpu, 7, 30, 0.01, 4, 256);
             tracker.track(&gpu, &gpu_pyr1, &gpu_pyr2, &features)
         })
     });
 
     // Reuse pre-allocated buffers (current behaviour)
     group.bench_function("reuse_buffers", |b| {
-        //let mut tracker = GpuKltTracker::new(&gpu, 7, 30, 0.01, 4, 256);
-        let mut tracker = GpuKltTracker::new(&gpu, 11, 30, 0.01, 4, 256);
+        let mut tracker = GpuKltTracker::new(&gpu, 7, 30, 0.01, 4, 256);
         b.iter(|| tracker.track(&gpu, &gpu_pyr1, &gpu_pyr2, &features))
     });
 
@@ -326,8 +320,7 @@ fn bench_euroc(c: &mut Criterion) {
         max_features:   40,
         cell_size:      128,
         pyramid_levels: 4,
-        //klt_window:     7,
-        klt_window:     11,
+        klt_window:     7,
         klt_max_iter:   30,
         klt_method:     LkMethod::InverseCompositional,
         histeq:         HistEqMethod::Global,
@@ -338,8 +331,7 @@ fn bench_euroc(c: &mut Criterion) {
         max_features:   40,
         cell_size:      128,
         pyramid_levels: 4,
-        //klt_window:     7,
-        klt_window:     11,
+        klt_window:     7,
         klt_max_iter:   30,
         histeq:         HistEqMethod::Global,
         ..Default::default()
