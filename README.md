@@ -2,12 +2,12 @@
 
 **Ru**st **D**evice **O**ptimized **L**ibrary for **F**rontend **V**ision
 
-> **Status: Phase 1 -- CPU Reference Implementation (Complete)**
+> **Status: Phase 2 — GPU Acceleration (Complete)**
 >
-> All core algorithms are implemented: image containers, Gaussian pyramids, FAST and Harris
-> corner detection, pyramidal KLT tracking (forward additive + inverse compositional),
-> occupancy grid, and the complete frontend pipeline.
-> Ready for Phase 2: GPU acceleration via wgpu.
+> The full GPU frontend pipeline is implemented and validated against the CPU reference.
+> Pyramid construction, FAST detection, KLT tracking, and NMS all run as WGSL compute
+> shaders via wgpu. `GpuFrontend::process()` is API-compatible with the CPU `Frontend`.
+> Ready for Phase 3: async readback and double-buffering.
 
 ## About
 
@@ -81,6 +81,11 @@ cargo bench
 | `camera` | Pinhole camera model, EuRoC YAML parser, undistortion | -- |
 | `essential` | 8-point essential matrix + RANSAC outlier rejection (uses lalir) | -- |
 | `frontend` | Complete detect-track-replenish pipeline with geometric verification | `vilib_ros.cpp` |
+| `gpu::device` | `GpuDevice` abstraction (device/queue/adapter selection) | -- |
+| `gpu::pyramid` | WGSL Gaussian pyramid kernel | `pyramid_gpu.cu` |
+| `gpu::fast` | WGSL FAST kernel with selectable NMS strategy | `fast_gpu_cuda_tools.cu` |
+| `gpu::klt` | WGSL inverse-compositional KLT kernel | `feature_tracker_cuda_tools.cu` |
+| `gpu::frontend` | `GpuFrontend` — API-compatible GPU replacement for `Frontend` | `vilib_ros.cpp` |
 
 ## Engineering Roadmap
 
@@ -90,7 +95,7 @@ We are adopting a verification-first development strategy. The project is divide
 
 **Goal:** Implement the core VIO frontend algorithms in safe, single-threaded Rust.
 
-**Purpose:** Since debugging GPU shaders is difficult, this CPU implementation will serve as the **Test Oracle** (Ground Truth). We will not write a single line of shader code until the math is verified here.
+**Purpose:** Since debugging GPU shaders is difficult, this CPU implementation serves as the **Test Oracle** (Ground Truth). We did not write a single line of shader code until the math was verified here.
 
 * [x] `Image<T>` Dynamic Container
 * [x] Gaussian Pyramid Generation
@@ -99,7 +104,7 @@ We are adopting a verification-first development strategy. The project is divide
 * [x] KLT (Lucas-Kanade) Feature Tracker
 * [x] Occupancy Grid + Frontend Pipeline
 
-### Phase 2: `wgpu` Acceleration
+### Phase 2: `wgpu` Acceleration (Complete)
 
 **Goal:** Port the verified algorithms to WGSL compute shaders, targeting Vulkan
 on NVIDIA, AMDGPU, and Raspberry Pi 4 & 5.
@@ -113,7 +118,7 @@ GPU handles all heavy compute *within* a frame. CPU handles orchestration
 
 ```
 ┌─────────────────────────────── GPU (per frame) ──────────────────────────────┐
-│  Image upload → Pyramid construction → FAST/Harris → KLT tracking iterations │
+│  Image upload → Pyramid construction → FAST detection → KLT tracking         │
 └───────────────────────────────────────┬──────────────────────────────────────┘
                                         │ readback: tracked (x, y) positions only
                                         ▼
@@ -127,10 +132,22 @@ feature positions on the CPU every frame. This is a small buffer (~200 features
 × 8 bytes) so latency is negligible. Pyramid levels, gradient images, and
 detection candidates never need to touch the CPU.
 
-The `GpuFrontend` struct mirrors `Frontend`'s
-`process(&mut self, image: &Image<u8>) -> (&[Feature], FrameStats)` API exactly.
-The readback is an implementation detail hidden inside `process()`. The CPU
-`Frontend` remains as an API-compatible fallback.
+**Hardware tuning knobs:**
+
+Two enums on `GpuFrontendConfig` let you match the frontend to your hardware:
+
+| Setting | iGPU / SoC (780M, Jetson, RPi) | Discrete GPU (RTX, RX) |
+|---|---|---|
+| `SubmitStrategy` | `Separate` (default) | `Fused` |
+| `NmsStrategy` | `Cpu` (default) | `Gpu` |
+
+`SubmitStrategy::Fused` records KLT and FAST into a single command encoder,
+saving one `poll(Wait)` round-trip per frame (~1–2 ms over PCIe).
+
+`NmsStrategy::Cpu` reads back the full score buffer (~1.4 MB for 752×480) and
+runs cell-max NMS on the CPU. On unified memory this readback is essentially
+free. `NmsStrategy::Gpu` runs an extra compute pass and reads back only the
+per-cell winners (~17 KB), saving ~175 µs of PCIe transfer on discrete hardware.
 
 **Milestones:**
 
@@ -138,20 +155,20 @@ The readback is an implementation detail hidden inside `process()`. The CPU
 * [x] Image upload + staging buffer infrastructure
 * [x] Pyramid construction kernel (validated pixel-for-pixel against `Pyramid::build`)
 * [x] FAST corner detection kernel
-* [ ] Harris corner response kernel
 * [x] KLT tracking kernel (inverse compositional — constant Hessian is GPU-friendly)
-* [ ] Feature readback + `GpuFrontend::process()` integration
-* [ ] NMS / occupancy mask kernel
+* [x] `NmsStrategy::{Cpu, Gpu}` — selectable NMS for iGPU and discrete GPU
+* [x] `SubmitStrategy::{Separate, Fused}` — selectable command encoder submit strategy
+* [x] `GpuFrontend::process()` integration (API-compatible with CPU `Frontend`)
+* [ ] Harris corner response kernel
 
 ### Phase 3: Zero-Copy Optimization
 
-**Goal:** Optimize memory throughput.
+**Goal:** Optimize memory throughput for high-frequency odometry.
 
-**Purpose:** Minimize CPU-GPU bandwidth usage for high-frequency odometry.
+**Purpose:** Minimize CPU-GPU synchronization overhead on platforms where it matters.
 
-* [ ] Unified memory path for platforms that support it (Apple Silicon, RPi)
-* [ ] Persistent GPU buffers across frames (avoid re-upload of static data)
 * [ ] Async readback with double-buffering (overlap GPU frame N+1 with CPU frame N)
+* [ ] Unified memory path for platforms that support it (Apple Silicon, RPi)
 
 ## Scientific Basis
 
