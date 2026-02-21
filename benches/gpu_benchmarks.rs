@@ -28,7 +28,7 @@ use rudolf_v::fast::FastDetector;
 use rudolf_v::frontend::{Frontend, FrontendConfig};
 use rudolf_v::gpu::device::GpuDevice;
 use rudolf_v::gpu::fast::{GpuFastDetector, NmsStrategy};
-use rudolf_v::gpu::frontend::{GpuFrontend, GpuFrontendConfig};
+use rudolf_v::gpu::frontend::{GpuFrontend, GpuFrontendConfig, SubmitStrategy};
 use rudolf_v::gpu::klt::GpuKltTracker;
 use rudolf_v::gpu::pyramid::GpuPyramidPipeline;
 use rudolf_v::histeq::HistEqMethod;
@@ -196,12 +196,14 @@ fn bench_frontend(c: &mut Criterion) {
     };
 
     let gpu_config = GpuFrontendConfig {
-        max_features:   40,
-        cell_size:      128,
-        pyramid_levels: 4,
-        klt_window:     7,
-        klt_max_iter:   30,
-        histeq:         HistEqMethod::Global,
+        submit_strategy: SubmitStrategy::Separate,
+        nms_strategy:    NmsStrategy::Cpu,
+        max_features:    40,
+        cell_size:       128,
+        pyramid_levels:  4,
+        klt_window:      7,
+        klt_max_iter:    30,
+        histeq:          HistEqMethod::Global,
         ..Default::default()
     };
 
@@ -328,12 +330,14 @@ fn bench_euroc(c: &mut Criterion) {
     };
 
     let gpu_config = GpuFrontendConfig {
-        max_features:   40,
-        cell_size:      128,
-        pyramid_levels: 4,
-        klt_window:     7,
-        klt_max_iter:   30,
-        histeq:         HistEqMethod::Global,
+        submit_strategy: SubmitStrategy::Separate,
+        nms_strategy:    NmsStrategy::Cpu,
+        max_features:    40,
+        cell_size:       128,
+        pyramid_levels:  4,
+        klt_window:      7,
+        klt_max_iter:    30,
+        histeq:          HistEqMethod::Global,
         ..Default::default()
     };
 

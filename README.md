@@ -134,20 +134,27 @@ detection candidates never need to touch the CPU.
 
 **Hardware tuning knobs:**
 
-Two enums on `GpuFrontendConfig` let you match the frontend to your hardware:
+Two enums on `GpuFrontendConfig` expose the underlying tradeoffs:
 
-| Setting | iGPU / SoC (780M, Jetson, RPi) | Discrete GPU (RTX, RX) |
+| Setting | Options | Default |
 |---|---|---|
-| `SubmitStrategy` | `Separate` (default) | `Fused` |
-| `NmsStrategy` | `Cpu` (default) | `Gpu` |
+| `SubmitStrategy` | `Separate`, `Fused` | `Separate` |
+| `NmsStrategy` | `Cpu`, `Gpu` | `Cpu` |
 
 `SubmitStrategy::Fused` records KLT and FAST into a single command encoder,
-saving one `poll(Wait)` round-trip per frame (~1–2 ms over PCIe).
+reducing `poll(Wait)` round-trips. `SubmitStrategy::Separate` lets the driver
+schedule each stage independently; the CPU work between KLT and FAST (RANSAC,
+grid update) acts as a natural gap that keeps the GPU fed without explicit fusion.
 
 `NmsStrategy::Cpu` reads back the full score buffer (~1.4 MB for 752×480) and
-runs cell-max NMS on the CPU. On unified memory this readback is essentially
-free. `NmsStrategy::Gpu` runs an extra compute pass and reads back only the
-per-cell winners (~17 KB), saving ~175 µs of PCIe transfer on discrete hardware.
+runs cell-max NMS on the CPU. `NmsStrategy::Gpu` adds a compute pass and reads
+back only per-cell winners (~17 KB), which was designed to save PCIe bandwidth
+on discrete hardware.
+
+In practice, benchmarks on both an AMD 780M iGPU and an RTX 3060 show
+`Separate+Cpu` fastest on all tested hardware. The knobs are retained for
+experimentation and for platforms not yet measured (e.g. high-latency PCIe
+configurations, Apple Silicon, RPi 4/5).
 
 **Milestones:**
 
