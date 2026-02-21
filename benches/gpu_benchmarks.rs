@@ -25,7 +25,7 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use std::time::Duration;
 
 use rudolf_v::fast::FastDetector;
-use rudolf_v::frontend::{Frontend, FrontendConfig};
+use rudolf_v::frontend::{Frontend, FrontendConfig, TimingStats};
 use rudolf_v::gpu::device::GpuDevice;
 use rudolf_v::gpu::fast::{GpuFastDetector, NmsStrategy};
 use rudolf_v::gpu::frontend::{GpuFrontend, GpuFrontendConfig, SubmitStrategy};
@@ -306,7 +306,7 @@ fn bench_euroc(c: &mut Criterion) {
     let num_frames = image_files.len().min(50);
 
     eprintln!("Loading {} EuRoC frames...", num_frames);
-    let frames: Vec<Image<u8>> = (0..num_frames).map(|i| {
+    let frames: Vec<Image<u8>> = (1000..1000+num_frames).map(|i| {
         let img = image::open(data_dir.join(&image_files[i])).expect("load failed");
         let gray = img.to_luma8();
         let (w, h) = gray.dimensions();
@@ -340,6 +340,70 @@ fn bench_euroc(c: &mut Criterion) {
         histeq:          HistEqMethod::Global,
         ..Default::default()
     };
+
+    // --- Per-stage timing breakdown (single run) ---
+    {
+        let mut fe = Frontend::new(cpu_config.clone(), img_w, img_h);
+        let mut t = TimingStats::default();
+        for (i, frame) in frames.iter().enumerate() {
+            let (_, stats) = fe.process(frame);
+            t.histeq  += stats.timing.histeq;
+            t.pyramid += stats.timing.pyramid;
+            t.klt     += stats.timing.klt;
+            t.ransac  += stats.timing.ransac;
+            t.detect  += stats.timing.detect;
+            t.total   += stats.timing.total;
+            if i < 5 || i == num_frames - 1 {
+                eprintln!(
+                    "  frame {:3}: tracked={:2} lost={:2} new={:2} total={:2} | {}",
+                    i, stats.tracked, stats.lost, stats.new_detections, stats.total, stats.timing
+                );
+            }
+        }
+        let n = num_frames as f64;
+        eprintln!("\nRudolf-V CPU per-stage averages over {} frames:", num_frames);
+        eprintln!(
+            "  histeq: {:.2}ms  pyramid: {:.2}ms  klt: {:.2}ms  ransac: {:.2}ms  detect: {:.2}ms  total: {:.2}ms\n",
+            t.histeq / n * 1000.0,
+            t.pyramid / n * 1000.0,
+            t.klt / n * 1000.0,
+            t.ransac / n * 1000.0,
+            t.detect / n * 1000.0,
+            t.total / n * 1000.0,
+        );
+    }
+
+    // --- GPU per-stage timing breakdown (single run) ---
+    {
+        let mut fe = GpuFrontend::new(&gpu, gpu_config.clone(), img_w, img_h);
+        let mut t = TimingStats::default();
+        for (i, frame) in frames.iter().enumerate() {
+            let (_, stats) = fe.process(&gpu, frame);
+            t.histeq  += stats.timing.histeq;
+            t.pyramid += stats.timing.pyramid;
+            t.klt     += stats.timing.klt;
+            t.ransac  += stats.timing.ransac;
+            t.detect  += stats.timing.detect;
+            t.total   += stats.timing.total;
+            if i < 5 || i == num_frames - 1 {
+                eprintln!(
+                    "  frame {:3}: tracked={:2} lost={:2} new={:2} total={:2} | {}",
+                    i, stats.tracked, stats.lost, stats.new_detections, stats.total, stats.timing
+                );
+            }
+        }
+        let n = num_frames as f64;
+        eprintln!("\nRudolf-V GPU per-stage averages over {} frames:", num_frames);
+        eprintln!(
+            "  histeq: {:.2}ms  pyramid: {:.2}ms  klt: {:.2}ms  ransac: {:.2}ms  detect: {:.2}ms  total: {:.2}ms\n",
+            t.histeq / n * 1000.0,
+            t.pyramid / n * 1000.0,
+            t.klt / n * 1000.0,
+            t.ransac / n * 1000.0,
+            t.detect / n * 1000.0,
+            t.total / n * 1000.0,
+        );
+    }
 
     let mut group = c.benchmark_group("euroc");
     group.sample_size(10);
