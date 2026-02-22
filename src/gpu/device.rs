@@ -279,7 +279,18 @@ impl GpuDevice {
             backend: raw_info.backend,
         };
 
-        // Build the requested limits from the profile.
+        // Auto-detect RPi when the caller passed Native but the adapter is V3D.
+        // This makes GpuDevice::new() work correctly on RPi without requiring
+        // every call site to know about DeviceProfile::RaspberryPi.
+        let profile = match profile {
+            DeviceProfile::Native if raw_info.name.to_ascii_lowercase().contains("v3d") => {
+                eprintln!("[rudolf-v] V3D adapter detected — using RaspberryPi profile");
+                DeviceProfile::RaspberryPi
+            }
+            other => other,
+        };
+
+        // Build the requested limits from the (possibly auto-upgraded) profile.
         let limits = limits_for_profile(profile);
 
         // wgpu 22: request_device returns (Device, Queue) directly; the tuple
@@ -372,6 +383,8 @@ fn limits_for_profile(profile: DeviceProfile) -> wgpu::Limits {
             max_compute_workgroup_size_x: 256,
             max_compute_workgroup_size_y: 256,
             max_compute_workgroup_size_z: 64,
+            // VideoCore VI caps textures at 4096×4096 (vs wgpu default 8192).
+            max_texture_dimension_2d: 4096,
             // Conservative storage buffer size: 128 MiB.
             // RPi 4 has 4 GiB RAM shared with CPU; 128 MiB for GPU buffers
             // is safe for our pyramid + feature buffer workloads.
