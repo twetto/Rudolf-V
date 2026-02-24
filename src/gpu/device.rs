@@ -385,6 +385,7 @@ fn limits_for_profile(profile: DeviceProfile) -> wgpu::Limits {
             max_compute_workgroup_size_z: 64,
             // VideoCore VI caps textures at 4096×4096 (vs wgpu default 8192).
             max_texture_dimension_2d: 4096,
+            max_texture_dimension_1d: 4096,
             // Conservative storage buffer size: 128 MiB.
             // RPi 4 has 4 GiB RAM shared with CPU; 128 MiB for GPU buffers
             // is safe for our pyramid + feature buffer workloads.
