@@ -39,17 +39,14 @@
 // buffer so subsequent finer-level passes can skip this feature cheaply.
 //
 //
-// TEMPLATE BUFFER IN FUNCTION SCOPE
-// ───────────────────────────────────
-// `var t_buf: array<f32, {{PATCH}}>` is a fixed-size array in the thread's
-// private address space. WGSL allows this when the size is a compile-time
-// constant — {{PATCH}} is substituted by gpu/klt.rs before shader
-// compilation, just like {{WG_SIZE}} for the workgroup size.
-//
-// On AMD/NVIDIA, small arrays may stay in the register file; larger ones
-// (like our 225-element arrays) spill to "local memory" — VRAM accessed
-// per-thread at the L1 cache granularity. This is still fast for sequential
-// access patterns like our patch loop.
+// PATCH BUFFERS IN STORAGE (not private) ADDRESS SPACE
+// ─────────────────────────────────────────────────────
+// The three per-feature arrays (template values, gx, gy) are stored in
+// global storage buffers indexed as [feat_idx * PATCH + pixel_idx].
+// This avoids per-thread private memory pressure — critical for
+// VideoCore VI (RPi 4) which has severely limited private memory and
+// silently corrupts spilled arrays. It also enables future wavefront-
+// per-patch cooperation (§4) where multiple threads share patch data.
 //
 //
 // NEW WGSL CONCEPTS
@@ -106,6 +103,22 @@ const LOST_SENTINEL: f32 = 1.0e20;
 
 /// Constant parameters for this pass.
 @group(0) @binding(5) var<uniform>             params:        KltParams;
+
+/// Per-feature patch buffers in global memory (storage, not private).
+/// Indexed as [feat_idx * {{PATCH}}u + patch_pixel_idx].
+/// Using storage buffers instead of private arrays avoids per-thread stack
+/// pressure — critical for VideoCore VI (RPi 4) which silently corrupts
+/// spilled private arrays. Also enables future wavefront-per-patch (§4)
+/// where multiple threads cooperate on one patch.
+@group(0) @binding(6) var<storage, read_write> t_buf:  array<f32>;
+@group(0) @binding(7) var<storage, read_write> gx_buf: array<f32>;
+@group(0) @binding(8) var<storage, read_write> gy_buf: array<f32>;
+
+/// Per-feature Hessian inverse: (ih00, ih01, ih11) packed as vec4 (w unused).
+/// Stored in global memory to reduce register pressure during Phase 2 —
+/// VideoCore VI corrupts values when too many f32s are live across a loop
+/// containing storage buffer reads.
+@group(0) @binding(9) var<storage, read_write> h_inv:  array<vec4<f32>>;
 
 // ---------------------------------------------------------------------------
 // Structs (repr(C) equivalents in Rust)
@@ -214,12 +227,8 @@ fn track_level(@builtin(global_invocation_id) gid: vec3<u32>) {
     // All of these are constant across iterations (the IC advantage).
     // -----------------------------------------------------------------------
 
-    // Function-scope arrays for the patch — size is a compile-time constant
-    // baked in by the Rust wrapper. These live in the thread's private
-    // address space (local memory if too large for the register file).
-    var t_buf:  array<f32, {{PATCH}}>;
-    var gx_buf: array<f32, {{PATCH}}>;
-    var gy_buf: array<f32, {{PATCH}}>;
+    // Storage buffer base offset for this feature's patch data.
+    let buf_base = feat_idx * {{PATCH}}u;
 
     var h00 = 0.0;
     var h01 = 0.0;
@@ -240,9 +249,10 @@ fn track_level(@builtin(global_invocation_id) gid: vec3<u32>) {
             let gy = 0.5 * (bilinear(prev_tex, tx, ty + 1.0)
                           - bilinear(prev_tex, tx, ty - 1.0));
 
-            t_buf[bidx]  = t_val;
-            gx_buf[bidx] = gx;
-            gy_buf[bidx] = gy;
+            let si = buf_base + bidx;
+            t_buf[si]  = t_val;
+            gx_buf[si] = gx;
+            gy_buf[si] = gy;
 
             // Accumulate symmetric 2×2 Hessian.
             h00 += gx * gx;
@@ -267,13 +277,21 @@ fn track_level(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let inv_det = 1.0 / det;
     // H⁻¹ = (1/det) * [[h11, -h01], [-h01, h00]]
-    let ih00 =  inv_det * h11;
-    let ih01 = -inv_det * h01;
-    let ih11 =  inv_det * h00;
+    // Store to global memory immediately — keeping these live in registers
+    // across the Phase 2 loop causes V3DV (VideoCore VI) to corrupt spilled
+    // values. The store lets the compiler kill these registers before Phase 2.
+    h_inv[feat_idx] = vec4<f32>(inv_det * h11, -inv_det * h01, inv_det * h00, 0.0);
 
     // -----------------------------------------------------------------------
     // IC Phase 2: iterate — only warped pixel needs to be re-sampled.
     // -----------------------------------------------------------------------
+
+    // Reload Hessian inverse from storage — fresh let bindings with minimal
+    // live range keep register pressure below V3DV's spill threshold.
+    let hv = h_inv[feat_idx];
+    let ih00 = hv.x;
+    let ih01 = hv.y;
+    let ih11 = hv.z;
 
     for (var iter: u32 = 0u; iter < params.max_iterations; iter++) {
         var b0 = 0.0;
@@ -287,11 +305,12 @@ fn track_level(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let wy = fy + dy + f32(py);
 
                 let i_val = bilinear(curr_tex, wx, wy);
-                let e = t_buf[bidx] - i_val;
+                let si = buf_base + bidx;
+                let e = t_buf[si] - i_val;
 
                 // Accumulate right-hand side b = Σ ∇T * e.
-                b0 += gx_buf[bidx] * e;
-                b1 += gy_buf[bidx] * e;
+                b0 += gx_buf[si] * e;
+                b1 += gy_buf[si] * e;
 
                 bidx++;
             }

@@ -21,8 +21,11 @@
 //   {{PATCH}}   = SIDE²               (e.g. 225)
 //   {{WG_SIZE}} = 1-D workgroup size  (e.g. 64)
 //
-// This makes the template buffer a compile-time-sized array in the shader's
-// private address space, avoiding dynamic allocation.
+// The per-feature patch data (template values, gradients) is stored in
+// pre-allocated storage buffers indexed by [feat_idx * PATCH + pixel_idx],
+// avoiding private-address-space pressure. This is critical for RPi 4
+// (VideoCore VI) which silently corrupts spilled private arrays, and
+// enables future wavefront-per-patch cooperation (§4).
 //
 //
 // NEW WGPU CONCEPTS
@@ -124,11 +127,19 @@ pub struct GpuKltTracker {
     // Pre-allocated GPU buffers — reused every frame to avoid VRAM allocation
     // overhead. Sized for max_features at construction.
     max_features:   usize,
+    patch_size:     usize,          // SIDE² = (2*window_size+1)²
     feature_buf:    wgpu::Buffer,   // STORAGE | COPY_DST  — feature positions
     disp_buf:       wgpu::Buffer,   // STORAGE | COPY_DST  — displacements (zeroed each frame)
     results_buf:    wgpu::Buffer,   // STORAGE | COPY_SRC  — track results
     rb_buf:         wgpu::Buffer,   // MAP_READ | COPY_DST — CPU readback
     params_bufs:    Vec<wgpu::Buffer>, // one UNIFORM | COPY_DST per level
+    // Per-feature patch data in storage buffers (not private shader memory).
+    // Each is max_features × PATCH floats. Avoids VideoCore VI private-memory
+    // corruption and enables future wavefront-per-patch (§4).
+    t_buf:          wgpu::Buffer,   // STORAGE — template pixel values
+    gx_buf:         wgpu::Buffer,   // STORAGE — template x-gradients
+    gy_buf:         wgpu::Buffer,   // STORAGE — template y-gradients
+    h_inv_buf:      wgpu::Buffer,   // STORAGE — per-feature Hessian inverse (vec4)
 
     // State set by prepare(), consumed by record_into()/arm_readback()/collect_results().
     n_prepared:     usize,
@@ -238,6 +249,50 @@ impl GpuKltTracker {
                     },
                     count: None,
                 },
+                // 6 — t_buf (storage read_write: template pixel values)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // 7 — gx_buf (storage read_write: template x-gradients)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // 8 — gy_buf (storage read_write: template y-gradients)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // 9 — h_inv (storage read_write: per-feature Hessian inverse)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -294,11 +349,39 @@ impl GpuKltTracker {
             }))
             .collect();
 
+        // Per-feature patch storage buffers: max_features × PATCH floats each.
+        // These replace private-address-space arrays in the shader, avoiding
+        // VideoCore VI's private memory corruption on RPi 4.
+        let patch_buf_bytes = (max_features * patch * std::mem::size_of::<f32>()) as u64;
+        let t_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("GpuKlt t_buf"), size: patch_buf_bytes,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let gx_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("GpuKlt gx_buf"), size: patch_buf_bytes,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let gy_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("GpuKlt gy_buf"), size: patch_buf_bytes,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        // Per-feature Hessian inverse: vec4<f32> per feature (16 bytes each).
+        let h_inv_bytes = (max_features * 4 * std::mem::size_of::<f32>()) as u64;
+        let h_inv_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("GpuKlt h_inv"), size: h_inv_bytes,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
         GpuKltTracker {
             pipeline, bgl,
             window_size, max_iterations, epsilon, max_levels,
-            max_features,
+            max_features, patch_size: patch,
             feature_buf, disp_buf, results_buf, rb_buf, params_bufs,
+            t_buf, gx_buf, gy_buf, h_inv_buf,
             n_prepared: 0, result_bytes_p: 0, disp_bytes_p: 0, workgroups_p: 0,
             bind_groups_p: Vec::new(),
             readback_rx: None,
@@ -377,6 +460,10 @@ impl GpuKltTracker {
                         wgpu::BindGroupEntry { binding: 3, resource: self.disp_buf.as_entire_binding() },
                         wgpu::BindGroupEntry { binding: 4, resource: self.results_buf.as_entire_binding() },
                         wgpu::BindGroupEntry { binding: 5, resource: self.params_bufs[i].as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 6, resource: self.t_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 7, resource: self.gx_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 8, resource: self.gy_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 9, resource: self.h_inv_buf.as_entire_binding() },
                     ],
                 })
             })
@@ -386,6 +473,11 @@ impl GpuKltTracker {
         self.result_bytes_p = result_bytes;
         self.disp_bytes_p   = disp_bytes;
         self.workgroups_p   = (n_u32 + WG_SIZE - 1) / WG_SIZE;
+
+        // Explicitly zero displacements — V3DV's clear_buffer may be unreliable.
+        let zeros = vec![0u8; disp_bytes as usize];
+        gpu.queue.write_buffer(&self.disp_buf, 0, &zeros);
+
         true
     }
 
