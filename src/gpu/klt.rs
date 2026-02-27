@@ -56,13 +56,34 @@ use crate::klt::{TrackedFeature, TrackStatus};
 // Constants
 // ---------------------------------------------------------------------------
 
-/// 1-D workgroup size. Each thread handles one feature independently.
+/// 1-D workgroup size for the scalar shader (1 thread = 1 feature).
 /// 64 is a good default: enough parallelism, fits in a single wavefront on
 /// AMD (64 lanes) and two warps on NVIDIA (32 lanes each).
 const WG_SIZE: u32 = 64;
 
+/// Default workgroup size for the warp shader (1 workgroup = 1 feature).
+/// 64 is the cross-platform sweet spot:
+///   - RPi 4 (VideoCore VI, subgroup=16): 4 subgroups → good latency hiding
+///   - AMD RDNA3 (subgroup=64): single wavefront → barriers are free
+///   - NVIDIA Turing (subgroup=32): 2 warps → good occupancy
+/// Benchmarked on RPi 4, Radeon 780M, GTX 1660Ti.
+const WG_WARP: u32 = 64;
+
 /// Sentinel displacement value indicating a lost feature.
 /// Must match LOST_SENTINEL in klt.wgsl.
+
+/// KLT dispatch strategy.
+///
+/// `Scalar`: original shader — 1 thread per feature, sequential pixel iteration.
+/// `Warp`:   §4 wavefront-per-patch — 1 workgroup per feature, cooperative pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum KltDispatch {
+    /// 1 thread = 1 feature. Simple, works everywhere.
+    Scalar,
+    /// 1 workgroup = 1 feature. WG_SIZE threads cooperate on patch pixels.
+    /// Requires power-of-2 workgroup size for shared memory reduction.
+    Warp(u32),  // workgroup size (must be power of 2, e.g. 16, 32, 64)
+}
 
 // ---------------------------------------------------------------------------
 // GPU-side structs (must match WGSL layout exactly — repr(C))
@@ -119,6 +140,7 @@ struct KltParams {
 pub struct GpuKltTracker {
     pipeline:       wgpu::ComputePipeline,
     bgl:            wgpu::BindGroupLayout,
+    dispatch:       KltDispatch,
     pub window_size:    usize,
     pub max_iterations: usize,
     pub epsilon:        f32,
@@ -151,7 +173,7 @@ pub struct GpuKltTracker {
 }
 
 impl GpuKltTracker {
-    /// Create a GPU KLT tracker.
+    /// Create a GPU KLT tracker with the default Warp(64) dispatch.
     ///
     /// `window_size` is the patch half-width W (patch = (2W+1)²).
     /// Typical values: 4 (GAP8 / small images), 7 (vilib / HD cameras).
@@ -163,19 +185,69 @@ impl GpuKltTracker {
         max_levels:     usize,
         max_features:   usize,
     ) -> Self {
+        Self::new_with_dispatch(
+            gpu, window_size, max_iterations, epsilon, max_levels, max_features,
+            KltDispatch::Warp(WG_WARP),
+        )
+    }
+
+    /// Create a GPU KLT tracker with the Scalar dispatch (fallback).
+    /// 1 thread = 1 feature, no shared memory, no barriers.
+    pub fn new_scalar(
+        gpu:            &GpuDevice,
+        window_size:    usize,
+        max_iterations: usize,
+        epsilon:        f32,
+        max_levels:     usize,
+        max_features:   usize,
+    ) -> Self {
+        Self::new_with_dispatch(
+            gpu, window_size, max_iterations, epsilon, max_levels, max_features,
+            KltDispatch::Scalar,
+        )
+    }
+
+    /// Create a GPU KLT tracker with explicit dispatch strategy.
+    ///
+    /// `dispatch`:
+    ///   - `Scalar`: 1 thread per feature (klt.wgsl)
+    ///   - `Warp(wg)`: 1 workgroup of `wg` threads per feature (klt_warp.wgsl)
+    pub fn new_with_dispatch(
+        gpu:            &GpuDevice,
+        window_size:    usize,
+        max_iterations: usize,
+        epsilon:        f32,
+        max_levels:     usize,
+        max_features:   usize,
+        dispatch:       KltDispatch,
+    ) -> Self {
         let side  = 2 * window_size + 1;
         let patch = side * side;
 
+        // Select shader source and workgroup size based on dispatch mode.
+        let (shader_template, wg_size) = match dispatch {
+            KltDispatch::Scalar => {
+                (include_str!("../shaders/klt.wgsl"), WG_SIZE)
+            }
+            KltDispatch::Warp(wg) => {
+                assert!(wg.is_power_of_two(), "Warp WG_SIZE must be power of 2, got {wg}");
+                assert!(wg >= 4, "Warp WG_SIZE must be >= 4, got {wg}");
+                (include_str!("../shaders/klt_warp.wgsl"), wg)
+            }
+        };
+
         // Bake all compile-time constants into the shader source.
-        let shader_template = include_str!("../shaders/klt.wgsl");
         let shader_src = shader_template
             .replace("{{HALF}}",    &window_size.to_string())
             .replace("{{SIDE}}",    &side.to_string())
             .replace("{{PATCH}}",   &patch.to_string())
-            .replace("{{WG_SIZE}}", &WG_SIZE.to_string());
+            .replace("{{WG_SIZE}}", &wg_size.to_string());
 
         let shader = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label:  Some("klt.wgsl"),
+            label:  Some(match dispatch {
+                KltDispatch::Scalar => "klt.wgsl",
+                KltDispatch::Warp(_) => "klt_warp.wgsl",
+            }),
             source: wgpu::ShaderSource::Wgsl(shader_src.into()),
         });
 
@@ -377,7 +449,7 @@ impl GpuKltTracker {
         });
 
         GpuKltTracker {
-            pipeline, bgl,
+            pipeline, bgl, dispatch,
             window_size, max_iterations, epsilon, max_levels,
             max_features, patch_size: patch,
             feature_buf, disp_buf, results_buf, rb_buf, params_bufs,
@@ -472,7 +544,12 @@ impl GpuKltTracker {
         self.n_prepared     = n;
         self.result_bytes_p = result_bytes;
         self.disp_bytes_p   = disp_bytes;
-        self.workgroups_p   = (n_u32 + WG_SIZE - 1) / WG_SIZE;
+        // Scalar: ceil(n / WG_SIZE) workgroups, multiple features per WG.
+        // Warp:   n workgroups, one feature per WG.
+        self.workgroups_p   = match self.dispatch {
+            KltDispatch::Scalar => (n_u32 + WG_SIZE - 1) / WG_SIZE,
+            KltDispatch::Warp(_) => n_u32,
+        };
 
         // Explicitly zero displacements — V3DV's clear_buffer may be unreliable.
         let zeros = vec![0u8; disp_bytes as usize];

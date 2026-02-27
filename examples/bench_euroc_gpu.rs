@@ -24,7 +24,7 @@
 use rudolf_v::camera::CameraIntrinsics;
 use rudolf_v::essential::RansacConfig;
 use rudolf_v::gpu::device::GpuDevice;
-use rudolf_v::gpu::frontend::{GpuFrontend, GpuFrontendConfig};
+use rudolf_v::gpu::frontend::{GpuFrontend, GpuFrontendConfig, SubmitStrategy};
 use rudolf_v::histeq::HistEqMethod;
 use rudolf_v::image::Image;
 
@@ -32,18 +32,6 @@ use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-
-fn downsample_4x(img: &Image<u8>) -> Image<u8> {
-    let w = img.width() / 4;
-    let h = img.height() / 4;
-    let mut out = vec![0u8; w * h];
-    for y in 0..h {
-        for x in 0..w {
-            out[y * w + x] = img.get(x * 4, y * 4);
-        }
-    }
-    Image::from_vec(w, h, out)
-}
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -82,14 +70,9 @@ fn main() {
 
     // Pre-load all frames into memory to exclude I/O from timing.
     println!("Loading {} frames from {}...", num_frames, dataset_path.display());
-    //let frames: Vec<Image<u8>> = image_files[..num_frames]
-    //    .iter()
-    //    .map(|f| load_grayscale(&data_dir.join(f)))
-    //    .collect();
-
     let frames: Vec<Image<u8>> = image_files[..num_frames]
         .iter()
-        .map(|f| downsample_4x(&load_grayscale(&data_dir.join(f))))
+        .map(|f| load_grayscale(&data_dir.join(f)))
         .collect();
 
     let (img_w, img_h) = (frames[0].width(), frames[0].height());
@@ -124,6 +107,7 @@ fn main() {
     }
 
     let config = GpuFrontendConfig {
+        submit_strategy: SubmitStrategy::Fused,
         max_features,
         cell_size,
         pyramid_levels,
