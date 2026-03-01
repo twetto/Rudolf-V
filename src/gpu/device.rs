@@ -683,4 +683,89 @@ mod tests {
             (dx, dy)
         }
     }
+
+    // ---- Texture sampler feature query ----------------------
+
+    #[test]
+    #[ignore = "GPU integration: run via outer subprocess wrapper"]
+    fn inner_texture_format_support() {
+        // Replicate adapter selection from init_async — we need the Adapter
+        // object which GpuDevice doesn't store.
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            flags: wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER,
+            ..Default::default()
+        });
+
+        let adapter = instance
+            .enumerate_adapters(wgpu::Backends::VULKAN)
+            .into_iter()
+            .find(|a| {
+                matches!(
+                    a.get_info().device_type,
+                    wgpu::DeviceType::DiscreteGpu
+                        | wgpu::DeviceType::IntegratedGpu
+                        | wgpu::DeviceType::VirtualGpu
+                        | wgpu::DeviceType::Other
+                )
+            })
+            .or_else(|| {
+                instance
+                    .enumerate_adapters(wgpu::Backends::VULKAN)
+                    .into_iter()
+                    .next()
+            })
+            .expect("no Vulkan adapter found");
+
+        let info = adapter.get_info();
+        println!("=== Texture Format Support ===");
+        println!("Adapter: {} ({:?}, {:?})", info.name, info.backend, info.device_type);
+
+        // 1. Device-level feature flag
+        let features = adapter.features();
+        let f32_filterable = features.contains(wgpu::Features::FLOAT32_FILTERABLE);
+        println!("FLOAT32_FILTERABLE: {f32_filterable}");
+
+        // 2. Per-format filterability (what the TMU can actually do)
+        let r32_flags = adapter.get_texture_format_features(wgpu::TextureFormat::R32Float);
+        let r16_flags = adapter.get_texture_format_features(wgpu::TextureFormat::R16Float);
+        let r8_flags = adapter.get_texture_format_features(wgpu::TextureFormat::R8Unorm);
+
+        let r32_ok = r32_flags
+            .flags
+            .contains(wgpu::TextureFormatFeatureFlags::FILTERABLE);
+        let r16_ok = r16_flags
+            .flags
+            .contains(wgpu::TextureFormatFeatureFlags::FILTERABLE);
+        let r8_ok = r8_flags
+            .flags
+            .contains(wgpu::TextureFormatFeatureFlags::FILTERABLE);
+
+        println!("R32Float filterable: {r32_ok}");
+        println!("R16Float filterable: {r16_ok}");
+        println!("R8Unorm  filterable: {r8_ok}");
+
+        // Summary: which implementation path to take
+        let path = match (r32_ok, r16_ok, r8_ok) {
+            (true, _, _) => "R32Float sampler (direct, simplest path)",
+            (false, true, _) => "R16Float conversion needed before sampling",
+            (false, false, true) => "R8Unorm conversion + scale in shader",
+            (false, false, false) => "No filterable format — keep manual bilinear",
+        };
+        println!("Recommended path: {path}");
+
+        println!("GPU_TEST_OK");
+    }
+
+    #[test]
+    #[ignore = "requires a real Vulkan GPU"]
+    fn test_texture_format_support() {
+        let out = run_gpu_test_in_subprocess(
+            "gpu::device::tests::inner_texture_format_support",
+        );
+        assert!(
+            out.contains("GPU_TEST_OK"),
+            "inner test did not print GPU_TEST_OK:\n{out}"
+        );
+    }
 }
