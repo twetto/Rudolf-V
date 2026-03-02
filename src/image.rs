@@ -296,6 +296,26 @@ impl<T: Pixel> Image<T> {
         *self.data.get_unchecked_mut(y * self.stride + x) = value;
     }
 
+    /// Raw pointer to the start of row `y`.
+    ///
+    /// Eliminates repeated `y * stride` multiplication in hot inner loops
+    /// (KLT bilinear patch extraction). Within a patch row, consecutive
+    /// pixels are accessed via `ptr.add(x)` — a single addition instead
+    /// of a full index computation per pixel.
+    ///
+    /// # Safety
+    /// Caller must ensure `y < height`. Accesses through the returned
+    /// pointer must stay within `[0, stride)` offset.
+    ///
+    /// GPU EQUIVALENT: Computing a row base address once and using offsets
+    /// — what the texture sampler does internally.
+    #[inline(always)]
+    pub unsafe fn row_ptr(&self, y: usize) -> *const T {
+        debug_assert!(y < self.height,
+            "row_ptr({y}) out of bounds for height {}", self.height);
+        self.data.as_ptr().add(y * self.stride)
+    }
+
     /// Get a mutable reference to the pixel at (x, y).
     ///
     /// NOTE on return type: `&mut T`

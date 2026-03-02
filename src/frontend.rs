@@ -27,7 +27,7 @@ use crate::fast::{FastDetector, Feature};
 use crate::harris::HarrisDetector;
 use crate::histeq::{self, HistEqMethod};
 use crate::image::Image;
-use crate::klt::{KltTracker, LkMethod, TrackedFeature, TrackStatus};
+use crate::klt::{KltScratch, KltTracker, LkMethod, TrackedFeature, TrackStatus};
 use crate::nms::OccupancyNms;
 use crate::occupancy::OccupancyGrid;
 use crate::pyramid::{Pyramid, PyramidScratch};
@@ -161,6 +161,8 @@ pub struct Frontend {
     prev_features: Vec<Feature>,
     /// Reusable buffer for KLT tracking results (avoids per-frame alloc).
     track_results: Vec<TrackedFeature>,
+    /// Scratch buffers for KLT IC precompute + iteration (avoids per-feature alloc).
+    klt_scratch: KltScratch,
     /// Next feature ID to assign. Monotonically increasing.
     next_id: u64,
     /// Occupancy grid for spatial distribution.
@@ -225,6 +227,7 @@ impl Frontend {
     pub fn new(config: FrontendConfig, img_w: usize, img_h: usize) -> Self {
         let grid = OccupancyGrid::new(img_w, img_h, config.cell_size);
         let pyr_scratch = PyramidScratch::new(img_w, img_h, config.pyramid_sigma);
+        let klt_scratch = KltScratch::new(config.klt_window);
         Frontend {
             config,
             prev_pyramid: Pyramid { levels: Vec::new() },
@@ -234,6 +237,7 @@ impl Frontend {
             features: Vec::new(),
             prev_features: Vec::new(),
             track_results: Vec::new(),
+            klt_scratch,
             next_id: 1,
             grid,
             img_w,
@@ -299,11 +303,12 @@ impl Frontend {
                     self.config.klt_method,
                 );
 
-                tracker.track_into(
+                tracker.track_into_opt(
                     &self.prev_pyramid,
                     &self.curr_pyramid,
                     &self.features,
                     &mut self.track_results,
+                    &mut self.klt_scratch,
                 );
 
                 // Filter features in-place: keep only successfully tracked.

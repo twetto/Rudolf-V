@@ -100,11 +100,11 @@ fn main() {
         std::process::exit(1);
     }
     let data_dir = PathBuf::from(&args[1]);
-    let num_frames: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(200);
+    let max_frames: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
 
     // Discover and load images.
     let image_files = list_euroc_images(&data_dir);
-    let num_frames = num_frames.min(image_files.len());
+    let num_frames = image_files.len().min(max_frames);
     println!("Loading {num_frames} frames from {}...", data_dir.display());
 
     let frames: Vec<Image<u8>> = image_files[..num_frames]

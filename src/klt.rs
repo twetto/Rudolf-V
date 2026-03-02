@@ -15,6 +15,12 @@
 //
 // Both share the same coarse-to-fine pyramid strategy.
 //
+// The IC path is optimized for throughput:
+// - Constant bilinear weights (integer patch offsets → frac is invariant)
+// - Row-pointer access (one stride multiply per row, not per pixel)
+// - Two-phase iteration (extract → accumulate over contiguous buffers)
+// - Hoisted scratch buffers (zero per-feature allocation)
+//
 // NEW RUST CONCEPTS:
 // - Enums with variants (TrackStatus, LkMethod) — Rust enums can carry
 //   data, making them algebraic data types (tagged unions).
@@ -24,6 +30,10 @@
 use crate::fast::Feature;
 use crate::image::{interpolate_bilinear, interpolate_bilinear_unchecked, Image};
 use crate::pyramid::Pyramid;
+
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
 
 /// Status of a tracked feature after one frame-to-frame tracking pass.
 ///
@@ -59,6 +69,49 @@ pub struct TrackedFeature {
     /// Tracking outcome.
     pub status: TrackStatus,
 }
+
+/// Pre-allocated scratch buffers for KLT tracking.
+///
+/// Eliminates per-feature heap allocation. The IC precompute needs
+/// (t_buf, gx_buf, gy_buf) and the two-phase iteration adds warped_buf.
+/// All are sized to the largest patch: (2 * window_size + 1)².
+///
+/// GPU EQUIVALENT: Pre-allocated storage buffers bound once per dispatch,
+/// not re-created per workgroup invocation.
+pub struct KltScratch {
+    t_buf: Vec<f32>,
+    gx_buf: Vec<f32>,
+    gy_buf: Vec<f32>,
+    warped_buf: Vec<f32>,
+}
+
+impl KltScratch {
+    /// Create scratch buffers for the given window half-size.
+    pub fn new(window_size: usize) -> Self {
+        let patch_size = (2 * window_size + 1) * (2 * window_size + 1);
+        KltScratch {
+            t_buf: vec![0.0; patch_size],
+            gx_buf: vec![0.0; patch_size],
+            gy_buf: vec![0.0; patch_size],
+            warped_buf: vec![0.0; patch_size],
+        }
+    }
+
+    /// Ensure buffers are large enough (no-op if already sized).
+    #[inline]
+    fn ensure_size(&mut self, patch_size: usize) {
+        if self.t_buf.len() < patch_size {
+            self.t_buf.resize(patch_size, 0.0);
+            self.gx_buf.resize(patch_size, 0.0);
+            self.gy_buf.resize(patch_size, 0.0);
+            self.warped_buf.resize(patch_size, 0.0);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tracker
+// ---------------------------------------------------------------------------
 
 /// Pyramidal KLT optical flow tracker.
 ///
@@ -120,12 +173,9 @@ impl KltTracker {
 
     /// Track features from the previous frame to the current frame.
     ///
-    /// Takes two pre-built pyramids (both f32, as produced by
-    /// `Pyramid::build`) and a list of features detected in the
-    /// previous frame.
-    ///
-    /// Returns a `TrackedFeature` for each input feature, with
-    /// updated position and status.
+    /// Convenience wrapper that allocates a temporary scratch buffer.
+    /// For per-frame use in a pipeline, prefer `track_into_opt` with
+    /// a persistent `KltScratch` to avoid allocation each call.
     pub fn track(
         &self,
         prev_pyramid: &Pyramid,
@@ -133,19 +183,15 @@ impl KltTracker {
         features: &[Feature],
     ) -> Vec<TrackedFeature> {
         let mut results = Vec::with_capacity(features.len());
-        self.track_into(prev_pyramid, curr_pyramid, features, &mut results);
+        let mut scratch = KltScratch::new(self.window_size);
+        self.track_into_opt(prev_pyramid, curr_pyramid, features, &mut results, &mut scratch);
         results
     }
 
     /// Track features into a pre-allocated result buffer.
     ///
-    /// Clears `results` and fills it with one `TrackedFeature` per input
-    /// feature. Reusing the buffer across frames avoids per-frame Vec
-    /// allocation (which showed up as ~9% in the flamegraph via the
-    /// `spec_from_iter` → `extend_trusted` → page fault chain).
-    ///
-    /// GPU EQUIVALENT: Writing tracking results into a pre-allocated
-    /// storage buffer bound to the compute shader dispatch.
+    /// Convenience wrapper that allocates a temporary scratch buffer.
+    /// For per-frame use in a pipeline, prefer `track_into_opt`.
     pub fn track_into(
         &self,
         prev_pyramid: &Pyramid,
@@ -153,13 +199,40 @@ impl KltTracker {
         features: &[Feature],
         results: &mut Vec<TrackedFeature>,
     ) {
-        let num_levels = self.max_levels.min(prev_pyramid.num_levels()).min(curr_pyramid.num_levels());
+        let mut scratch = KltScratch::new(self.window_size);
+        self.track_into_opt(prev_pyramid, curr_pyramid, features, results, &mut scratch);
+    }
+
+    /// Track features using pre-allocated scratch and result buffers.
+    ///
+    /// This is the primary entry point for production use. Both `results`
+    /// and `scratch` persist across frames, eliminating all per-frame and
+    /// per-feature allocation.
+    ///
+    /// GPU EQUIVALENT: Writing tracking results into a pre-allocated
+    /// storage buffer bound to the compute shader dispatch.
+    pub fn track_into_opt(
+        &self,
+        prev_pyramid: &Pyramid,
+        curr_pyramid: &Pyramid,
+        features: &[Feature],
+        results: &mut Vec<TrackedFeature>,
+        scratch: &mut KltScratch,
+    ) {
+        let num_levels = self.max_levels
+            .min(prev_pyramid.num_levels())
+            .min(curr_pyramid.num_levels());
+
+        let side = 2 * self.window_size + 1;
+        scratch.ensure_size(side * side);
 
         results.clear();
         results.reserve(features.len());
 
         for feat in features {
-            results.push(self.track_single(prev_pyramid, curr_pyramid, feat, num_levels));
+            results.push(self.track_single(
+                prev_pyramid, curr_pyramid, feat, num_levels, scratch,
+            ));
         }
     }
 
@@ -170,6 +243,7 @@ impl KltTracker {
         curr_pyr: &Pyramid,
         feature: &Feature,
         num_levels: usize,
+        scratch: &mut KltScratch,
     ) -> TrackedFeature {
         // Start with zero displacement at the coarsest level.
         let mut dx = 0.0f32;
@@ -196,7 +270,7 @@ impl KltTracker {
                     self.lk_forward_additive(prev_img, curr_img, feat_x, feat_y, dx, dy)
                 }
                 LkMethod::InverseCompositional => {
-                    self.lk_inverse_compositional(prev_img, curr_img, feat_x, feat_y, dx, dy)
+                    self.lk_inverse_compositional(prev_img, curr_img, feat_x, feat_y, dx, dy, scratch)
                 }
             };
 
@@ -250,6 +324,10 @@ impl KltTracker {
             status,
         }
     }
+
+    // =====================================================================
+    // Forward additive (reference implementation)
+    // =====================================================================
 
     /// Iterative forward-additive Lucas-Kanade at a single pyramid level.
     ///
@@ -366,22 +444,35 @@ impl KltTracker {
         LkResult::MaxIter(dx, dy)
     }
 
-    /// Iterative inverse-compositional Lucas-Kanade at a single pyramid level.
+    // =====================================================================
+    // Inverse compositional (optimized)
+    // =====================================================================
+
+    /// Optimized inverse-compositional Lucas-Kanade at a single level.
     ///
     /// Baker & Matthews (2004): gradients are evaluated at the template
     /// position in the previous frame. Since the template doesn't change,
     /// the Hessian H = J^T * J is constant across iterations — computed
     /// once, then only the error image is recomputed per iteration.
     ///
-    /// This is what your C tracker does on the GAP8. The key insight:
-    /// instead of asking "where did the template warp to?", IC asks
-    /// "what incremental warp of the template best explains the error?"
-    /// and then inverts that to update the displacement.
+    /// Optimizations over a naive implementation:
     ///
-    /// Cost per iteration: (2W+1)² × 1 bilinear lookup (warped only)
-    /// since template values and gradients are precomputed.
-    /// vs. forward additive's (2W+1)² × 5 (template + warped + 2 gradient + error).
-    /// The Hessian inverse is just a 2×2 constant.
+    /// - CONSTANT BILINEAR WEIGHTS: patch offsets (px, py) are integers, so
+    ///   frac(feat_x + px) = frac(feat_x) for all px. The four bilinear
+    ///   weights are computed once per feature, not per pixel. This is NOT
+    ///   an approximation — it's algebraically exact.
+    ///
+    /// - ROW-POINTER ACCESS: pre-compute raw pointers to image rows, then
+    ///   index horizontally with ptr.add(x). Eliminates y * stride
+    ///   multiplication from the inner loop.
+    ///
+    /// - TWO-PHASE ITERATION:
+    ///     Phase 1: extract all warped pixels into contiguous warped_buf.
+    ///     Phase 2: accumulate b0 += gx*e, b1 += gy*e over contiguous data.
+    ///   Phase 2 is a paired dot-product — ready for SIMD.
+    ///
+    /// - HOISTED SCRATCH: t_buf, gx_buf, gy_buf, warped_buf are pre-allocated
+    ///   in KltScratch and reused across all features and pyramid levels.
     fn lk_inverse_compositional(
         &self,
         prev_img: &Image<f32>,
@@ -390,134 +481,200 @@ impl KltTracker {
         feat_y: f32,
         mut dx: f32,
         mut dy: f32,
+        scratch: &mut KltScratch,
     ) -> LkResult {
-        let half_i = self.window_size as isize;
+        let half = self.window_size as isize;
+        let side = (2 * self.window_size + 1) as isize;
+        let patch_size = (side * side) as usize;
 
-        // --- Precompute template values, gradients, and Hessian ---
-        // All are constant across iterations (the IC advantage).
-        let side = 2 * self.window_size + 1;
-        let patch_size = side * side;
-        let mut t_buf = vec![0.0f32; patch_size];
-        let mut gx_buf = vec![0.0f32; patch_size];
-        let mut gy_buf = vec![0.0f32; patch_size];
+        // =================================================================
+        // PRECOMPUTE: template values, gradients, Hessian
+        // =================================================================
+
+        // Constant bilinear weights for template sampling.
+        let fx = feat_x - feat_x.floor();
+        let fy = feat_y - feat_y.floor();
+        let w00 = (1.0 - fx) * (1.0 - fy);
+        let w10 = fx * (1.0 - fy);
+        let w01 = (1.0 - fx) * fy;
+        let w11 = fx * fy;
+
+        // Base integer coordinate: top-left corner of the patch.
+        let base_x_i = feat_x.floor() as isize - half;
+        let base_y_i = feat_y.floor() as isize - half;
+
+        // Gradient margin: gx needs columns ± 1, gy needs rows ± 1.
+        let tmpl_in_bounds = base_x_i >= 1
+            && base_y_i >= 1
+            && base_x_i + side + 2 <= prev_img.width() as isize
+            && base_y_i + side + 2 <= prev_img.height() as isize;
 
         let mut h00 = 0.0f32;
         let mut h01 = 0.0f32;
         let mut h11 = 0.0f32;
 
-        // Check if the template window (with ±1 gradient margin) fits in prev_img.
-        let tmpl_in_bounds = (feat_x - half_i as f32 - 1.0) >= 0.0
-            && (feat_y - half_i as f32 - 1.0) >= 0.0
-            && (feat_x + half_i as f32 + 1.0) < prev_img.width() as f32
-            && (feat_y + half_i as f32 + 1.0) < prev_img.height() as f32;
+        let t_buf = &mut scratch.t_buf[..patch_size];
+        let gx_buf = &mut scratch.gx_buf[..patch_size];
+        let gy_buf = &mut scratch.gy_buf[..patch_size];
 
-        let mut idx = 0;
-        for py in -half_i..=half_i {
-            for px in -half_i..=half_i {
-                let tx = feat_x + px as f32;
-                let ty = feat_y + py as f32;
+        if tmpl_in_bounds {
+            // ── Fast path: row-pointer + constant-weight bilinear ──
+            let base_x = base_x_i as usize;
+            let base_y = base_y_i as usize;
 
-                let (t_val, gx, gy);
-                if tmpl_in_bounds {
-                    // SAFETY: bounds checked above — entire window + gradient margin is in bounds.
-                    unsafe {
-                        t_val = interpolate_bilinear_unchecked(prev_img, tx, ty);
-                        gx = 0.5
-                            * (interpolate_bilinear_unchecked(prev_img, tx + 1.0, ty)
-                                - interpolate_bilinear_unchecked(prev_img, tx - 1.0, ty));
-                        gy = 0.5
-                            * (interpolate_bilinear_unchecked(prev_img, tx, ty + 1.0)
-                                - interpolate_bilinear_unchecked(prev_img, tx, ty - 1.0));
+            let mut idx = 0;
+            for ly in 0..side as usize {
+                let iy = base_y + ly;
+                unsafe {
+                    // Four rows covering template + gradient neighborhoods:
+                    //   template:   (iy, iy+1)
+                    //   gx:         same rows, columns ± 1
+                    //   gy-:        (iy-1, iy)
+                    //   gy+:        (iy+1, iy+2)
+                    let r_m1 = prev_img.row_ptr(iy - 1);
+                    let r_0  = prev_img.row_ptr(iy);
+                    let r_1  = prev_img.row_ptr(iy + 1);
+                    let r_p2 = prev_img.row_ptr(iy + 2);
+
+                    for lx in 0..side as usize {
+                        let ix = base_x + lx;
+
+                        // Template value.
+                        let t_val = bilerp_ptr(r_0, r_1, ix, w00, w10, w01, w11);
+
+                        // Gradient gx: central difference in x, same rows.
+                        let gx = 0.5 * (
+                            bilerp_ptr(r_0, r_1, ix + 1, w00, w10, w01, w11)
+                          - bilerp_ptr(r_0, r_1, ix - 1, w00, w10, w01, w11)
+                        );
+
+                        // Gradient gy: central difference in y, same columns.
+                        let gy = 0.5 * (
+                            bilerp_ptr(r_1, r_p2, ix, w00, w10, w01, w11)
+                          - bilerp_ptr(r_m1, r_0, ix, w00, w10, w01, w11)
+                        );
+
+                        t_buf[idx] = t_val;
+                        gx_buf[idx] = gx;
+                        gy_buf[idx] = gy;
+
+                        h00 += gx * gx;
+                        h01 += gx * gy;
+                        h11 += gy * gy;
+
+                        idx += 1;
                     }
-                } else {
-                    t_val = interpolate_bilinear(prev_img, tx, ty);
-                    gx = 0.5
-                        * (interpolate_bilinear(prev_img, tx + 1.0, ty)
-                            - interpolate_bilinear(prev_img, tx - 1.0, ty));
-                    gy = 0.5
-                        * (interpolate_bilinear(prev_img, tx, ty + 1.0)
-                            - interpolate_bilinear(prev_img, tx, ty - 1.0));
                 }
+            }
+        } else {
+            // ── Border fallback: clamped bilinear (rare — edge features) ──
+            let mut idx = 0;
+            for py in -half..=half {
+                for px in -half..=half {
+                    let tx = feat_x + px as f32;
+                    let ty = feat_y + py as f32;
 
-                t_buf[idx] = t_val;
-                gx_buf[idx] = gx;
-                gy_buf[idx] = gy;
+                    let t_val = interpolate_bilinear(prev_img, tx, ty);
+                    let gx = 0.5 * (
+                        interpolate_bilinear(prev_img, tx + 1.0, ty)
+                      - interpolate_bilinear(prev_img, tx - 1.0, ty)
+                    );
+                    let gy = 0.5 * (
+                        interpolate_bilinear(prev_img, tx, ty + 1.0)
+                      - interpolate_bilinear(prev_img, tx, ty - 1.0)
+                    );
 
-                h00 += gx * gx;
-                h01 += gx * gy;
-                h11 += gy * gy;
+                    t_buf[idx] = t_val;
+                    gx_buf[idx] = gx;
+                    gy_buf[idx] = gy;
 
-                idx += 1;
+                    h00 += gx * gx;
+                    h01 += gx * gy;
+                    h11 += gy * gy;
+
+                    idx += 1;
+                }
             }
         }
 
-        // Precompute H^{-1} (constant!).
+        // Precompute H^{-1} (constant across all iterations).
         let det = h00 * h11 - h01 * h01;
         if det.abs() < 1e-6 {
             return LkResult::Singular;
         }
         let inv_det = 1.0 / det;
-
-        // H^{-1} elements (2×2 symmetric).
-        let ih00 = inv_det * h11;
+        let ih00 =  inv_det * h11;
         let ih01 = -inv_det * h01;
-        let ih11 = inv_det * h00;
+        let ih11 =  inv_det * h00;
 
-        // --- Iterate: only recompute warped pixel and error each iteration ---
+        // =================================================================
+        // ITERATE: two-phase extraction + accumulation
+        // =================================================================
+
+        let warped_buf = &mut scratch.warped_buf[..patch_size];
+
         for _iter in 0..self.max_iterations {
-            let mut b0 = 0.0f32;
-            let mut b1 = 0.0f32;
+            // ── Phase 1: extract warped pixels into contiguous buffer ──
 
-            // Check if the warped window fits in curr_img.
-            let warp_in_bounds = (feat_x + dx - half_i as f32) >= 0.0
-                && (feat_y + dy - half_i as f32) >= 0.0
-                && (feat_x + dx + half_i as f32) < curr_img.width() as f32
-                && (feat_y + dy + half_i as f32) < curr_img.height() as f32;
+            // Constant bilinear weights for this iteration's warp position.
+            let wx = feat_x + dx;
+            let wy = feat_y + dy;
+            let fx_w = wx - wx.floor();
+            let fy_w = wy - wy.floor();
+            let ww00 = (1.0 - fx_w) * (1.0 - fy_w);
+            let ww10 = fx_w * (1.0 - fy_w);
+            let ww01 = (1.0 - fx_w) * fy_w;
+            let ww11 = fx_w * fy_w;
 
-            let mut idx = 0;
-            for py in -half_i..=half_i {
-                for px in -half_i..=half_i {
-                    let px_f = px as f32;
-                    let py_f = py as f32;
+            let bx_i = wx.floor() as isize - half;
+            let by_i = wy.floor() as isize - half;
 
-                    // Template pixel — precomputed, no bilinear lookup needed!
-                    let t_val = t_buf[idx];
+            // No gradient margin needed — just the bilinear +1 neighbor.
+            let warp_in_bounds = bx_i >= 0
+                && by_i >= 0
+                && bx_i + side + 1 <= curr_img.width() as isize
+                && by_i + side + 1 <= curr_img.height() as isize;
 
-                    // Warped pixel (current frame at feature + displacement).
-                    let i_val = if warp_in_bounds {
-                        // SAFETY: bounds checked above.
-                        unsafe {
-                            interpolate_bilinear_unchecked(
-                                curr_img,
-                                feat_x + dx + px_f,
-                                feat_y + dy + py_f,
-                            )
+            if warp_in_bounds {
+                let bx = bx_i as usize;
+                let by = by_i as usize;
+
+                let mut idx = 0;
+                for ly in 0..side as usize {
+                    unsafe {
+                        let r0 = curr_img.row_ptr(by + ly);
+                        let r1 = curr_img.row_ptr(by + ly + 1);
+
+                        for lx in 0..side as usize {
+                            warped_buf[idx] = bilerp_ptr(
+                                r0, r1, bx + lx, ww00, ww10, ww01, ww11,
+                            );
+                            idx += 1;
                         }
-                    } else {
-                        interpolate_bilinear(
+                    }
+                }
+            } else {
+                // Border fallback.
+                let mut idx = 0;
+                for py in -half..=half {
+                    for px in -half..=half {
+                        warped_buf[idx] = interpolate_bilinear(
                             curr_img,
-                            feat_x + dx + px_f,
-                            feat_y + dy + py_f,
-                        )
-                    };
-
-                    let e = t_val - i_val;
-
-                    // Use precomputed template gradients.
-                    b0 += gx_buf[idx] * e;
-                    b1 += gy_buf[idx] * e;
-
-                    idx += 1;
+                            wx + px as f32,
+                            wy + py as f32,
+                        );
+                        idx += 1;
+                    }
                 }
             }
 
-            // delta = H^{-1} * b (using precomputed inverse).
+            // ── Phase 2: accumulate b = J^T * error (contiguous data) ──
+            let (b0, b1) = accumulate_ic(t_buf, warped_buf, gx_buf, gy_buf);
+
+            // Solve: delta = H^{-1} * b.
             let delta_x = ih00 * b0 + ih01 * b1;
             let delta_y = ih01 * b0 + ih11 * b1;
 
-            // In IC, the update is conceptually applied to the template warp
-            // and then inverted. For pure translation, this simplifies to
-            // the same additive update as forward additive:
             dx += delta_x;
             dy += delta_y;
 
@@ -530,12 +687,78 @@ impl KltTracker {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Private helpers
+// ---------------------------------------------------------------------------
+
 /// Internal result of iterative LK at one pyramid level.
 enum LkResult {
     Converged(f32, f32),
     MaxIter(f32, f32),
     Singular,
 }
+
+/// Bilinear interpolation from two pre-fetched row pointers with constant
+/// weights.
+///
+/// Given row pointers `r0` (row y0) and `r1` (row y0+1), samples the
+/// 2×2 neighborhood at column `ix`:
+///
+///     r0[ix]   r0[ix+1]
+///     r1[ix]   r1[ix+1]
+///
+/// The weights (w00, w10, w01, w11) correspond to:
+///     w00 = (1-fx)(1-fy)    w10 = fx(1-fy)
+///     w01 = (1-fx)fy        w11 = fx·fy
+///
+/// # Safety
+/// Caller must ensure `ix + 1` is a valid offset from both `r0` and `r1`.
+#[inline(always)]
+unsafe fn bilerp_ptr(
+    r0: *const f32, r1: *const f32,
+    ix: usize,
+    w00: f32, w10: f32, w01: f32, w11: f32,
+) -> f32 {
+    w00 * *r0.add(ix) + w10 * *r0.add(ix + 1)
+  + w01 * *r1.add(ix) + w11 * *r1.add(ix + 1)
+}
+
+/// Accumulate the IC right-hand side vector over contiguous buffers.
+///
+///   b0 = Σ gx[i] * (t[i] - w[i])
+///   b1 = Σ gy[i] * (t[i] - w[i])
+///
+/// This is a paired dot-product of (gx, gy) against the error vector
+/// (t - warped). Written as a standalone function on contiguous slices
+/// so it can be replaced with a SIMD version later without touching
+/// the rest of the tracker.
+///
+/// GPU EQUIVALENT: A reduction shader over the patch — exactly what
+/// the wavefront-per-patch cooperative KLT shader does.
+#[inline]
+fn accumulate_ic(t: &[f32], w: &[f32], gx: &[f32], gy: &[f32]) -> (f32, f32) {
+    debug_assert_eq!(t.len(), w.len());
+    debug_assert_eq!(t.len(), gx.len());
+    debug_assert_eq!(t.len(), gy.len());
+
+    let mut b0 = 0.0f32;
+    let mut b1 = 0.0f32;
+
+    // Scalar loop on contiguous data. The compiler can auto-vectorize
+    // this with -C target-feature=+avx2,+fma, but we'll replace it
+    // with explicit SIMD later.
+    for i in 0..t.len() {
+        let e = unsafe { *t.get_unchecked(i) - *w.get_unchecked(i) };
+        b0 += unsafe { *gx.get_unchecked(i) } * e;
+        b1 += unsafe { *gy.get_unchecked(i) } * e;
+    }
+
+    (b0, b1)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
