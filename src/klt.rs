@@ -703,10 +703,10 @@ enum LkResult {
 ///
 /// Given row pointers `r0` (row y0) and `r1` (row y0+1), samples the
 /// 2×2 neighborhood at column `ix`:
-///
+///```text
 ///     r0[ix]   r0[ix+1]
 ///     r1[ix]   r1[ix+1]
-///
+///```
 /// The weights (w00, w10, w01, w11) correspond to:
 ///     w00 = (1-fx)(1-fy)    w10 = fx(1-fy)
 ///     w01 = (1-fx)fy        w11 = fx·fy
