@@ -15,10 +15,28 @@
 //
 // This mirrors vilib's `fast_gpu_cuda_tools.cu`.
 //
-// NEW RUST CONCEPTS:
-// - `struct` with methods via `impl` blocks
-// - `Vec<Feature>` — dynamic collection of results
-// - Const arrays for lookup tables (the Bresenham offsets)
+// OPTIMIZATIONS:
+//
+// - PRECOMPUTED FLAT OFFSETS: Instead of computing (y+dy)*stride+(x+dx)
+//   per circle pixel, precompute 16 flat offsets as dy*stride+dx once.
+//   The inner loop becomes base pointer + indexed reads — eliminates
+//   20 multiplies per pixel candidate (16 full + 4 cardinal).
+//
+// - DIRECT SLICE ACCESS: Work on the raw image slice with flat offsets,
+//   bypassing per-pixel method call overhead.
+//
+// - CARDINAL EARLY REJECT (Rosten's high-speed test): Check 4 cardinal
+//   points {0,4,8,12} first. At least 2 of 4 (3 for FAST-12) must be
+//   brighter or darker. Rejects ~85% of non-corner pixels with 4
+//   comparisons instead of 16.
+//
+// - BITMASK CONTIGUOUS CHECK: Build u16 bright/dark masks, popcount
+//   reject, then AND-shift for N contiguous bits. Branchless, maps
+//   directly to GPU bitwise ops in WGSL.
+//
+// GPU MAPPING: Each pixel maps to one thread. The flat-offset pattern
+// mirrors texture sampling with fixed offsets. The bitmask approach
+// maps to WGSL u32 bitwise ops.
 
 use crate::image::Image;
 
@@ -94,68 +112,131 @@ impl FastDetector {
     pub fn detect_at_level(&self, image: &Image<u8>, level: usize) -> Vec<Feature> {
         let w = image.width();
         let h = image.height();
-        let mut features = Vec::new();
 
         // Skip a 3-pixel border since the Bresenham circle has radius 3.
         if w <= 6 || h <= 6 {
-            return features;
+            return Vec::new();
         }
 
+        let stride = image.stride();
+        let slice = image.as_slice();
+
+        // Precompute flat offsets: circle_off[i] = dy * stride + dx.
+        // Adding this to (y * stride + x) gives the flat index of circle
+        // pixel i. Eliminates a multiply per circle pixel in the inner loop.
+        let circle_off: [isize; 16] = {
+            let mut off = [0isize; 16];
+            for (i, &(dx, dy)) in CIRCLE_OFFSETS.iter().enumerate() {
+                off[i] = dy * stride as isize + dx;
+            }
+            off
+        };
+
+        // Cardinal offsets for the quick-reject test (indices 0, 4, 8, 12).
+        let card = [circle_off[0], circle_off[4], circle_off[8], circle_off[12]];
+
         let thresh = self.threshold as i16;
-        let min_cardinals: u8 = if self.arc_length >= 12 { 3 } else { 2 };
+        let arc_length = self.arc_length;
+        let min_cardinals: u8 = if arc_length >= 12 { 3 } else { 2 };
+
+        let mut features = Vec::new();
 
         for y in 3..(h - 3) {
+            let row_base = y * stride;
+
             for x in 3..(w - 3) {
-                // SAFETY: x in [3, w-3) and y in [3, h-3), and all circle
-                // offsets are at most ±3, so every access is in bounds.
+                let base = row_base + x;
+
+                // SAFETY: x in [3, w-3), y in [3, h-3), all circle offsets
+                // are at most ±3 in each dimension, so base + offset is
+                // always within the image slice.
                 unsafe {
-                let center = image.get_unchecked(x, y) as i16;
+                let center = *slice.get_unchecked(base) as i16;
+                let hi = center + thresh;
+                let lo = center - thresh;
 
                 // --- Quick rejection (Rosten's high-speed test) ---
-                // Check 4 cardinal points (top, right, bottom, left).
-                let p0 = image.get_unchecked(
-                    (x as isize + CIRCLE_OFFSETS[0].0) as usize,
-                    (y as isize + CIRCLE_OFFSETS[0].1) as usize) as i16;
-                let p4 = image.get_unchecked(
-                    (x as isize + CIRCLE_OFFSETS[4].0) as usize,
-                    (y as isize + CIRCLE_OFFSETS[4].1) as usize) as i16;
-                let p8 = image.get_unchecked(
-                    (x as isize + CIRCLE_OFFSETS[8].0) as usize,
-                    (y as isize + CIRCLE_OFFSETS[8].1) as usize) as i16;
-                let p12 = image.get_unchecked(
-                    (x as isize + CIRCLE_OFFSETS[12].0) as usize,
-                    (y as isize + CIRCLE_OFFSETS[12].1) as usize) as i16;
+                // Check 4 cardinal points. At least min_cardinals must be
+                // brighter (or darker) to have any chance of an N-arc.
+                let p0  = *slice.get_unchecked((base as isize + card[0]) as usize) as i16;
+                let p4  = *slice.get_unchecked((base as isize + card[1]) as usize) as i16;
+                let p8  = *slice.get_unchecked((base as isize + card[2]) as usize) as i16;
+                let p12 = *slice.get_unchecked((base as isize + card[3]) as usize) as i16;
 
-                let bright_count = (p0 > center + thresh) as u8
-                    + (p4 > center + thresh) as u8
-                    + (p8 > center + thresh) as u8
-                    + (p12 > center + thresh) as u8;
-                let dark_count = (p0 < center - thresh) as u8
-                    + (p4 < center - thresh) as u8
-                    + (p8 < center - thresh) as u8
-                    + (p12 < center - thresh) as u8;
+                let bright_count = (p0 > hi) as u8
+                    + (p4 > hi) as u8
+                    + (p8 > hi) as u8
+                    + (p12 > hi) as u8;
+                let dark_count = (p0 < lo) as u8
+                    + (p4 < lo) as u8
+                    + (p8 < lo) as u8
+                    + (p12 < lo) as u8;
 
                 if bright_count < min_cardinals && dark_count < min_cardinals {
                     continue;
                 }
 
                 // --- Full 16-point test ---
+                // Build bitmasks and cache circle values in one pass.
+                let mut bright_mask: u16 = 0;
+                let mut dark_mask: u16 = 0;
                 let mut circle_vals = [0i16; 16];
-                for (i, &(dx, dy)) in CIRCLE_OFFSETS.iter().enumerate() {
-                    circle_vals[i] = image.get_unchecked(
-                        (x as isize + dx) as usize,
-                        (y as isize + dy) as usize,
+
+                for i in 0..16 {
+                    let v = *slice.get_unchecked(
+                        (base as isize + circle_off[i]) as usize
                     ) as i16;
+                    circle_vals[i] = v;
+                    if v > hi {
+                        bright_mask |= 1 << i;
+                    } else if v < lo {
+                        dark_mask |= 1 << i;
+                    }
                 }
 
-                let (is_corner, score) =
-                    self.check_contiguous_and_score(center, &circle_vals, thresh);
+                // Quick popcount rejection: need at least N bits set.
+                let bright_has = bright_mask.count_ones() as usize >= arc_length;
+                let dark_has = dark_mask.count_ones() as usize >= arc_length;
+                if !bright_has && !dark_has {
+                    continue;
+                }
 
-                if is_corner {
+                // Check for N contiguous set bits in a circular 16-bit pattern.
+                // Double the mask into u32 to handle wrap-around, then
+                // AND-shift N-1 times. Nonzero result = run of N exists.
+                let mut best_score = -1.0f32;
+
+                if bright_has {
+                    let m32 = (bright_mask as u32) | ((bright_mask as u32) << 16);
+                    let mut acc = m32;
+                    for _ in 1..arc_length {
+                        acc &= acc >> 1;
+                    }
+                    if acc != 0 {
+                        let score = bitmask_best_arc_score(
+                            center, &circle_vals, thresh, bright_mask);
+                        best_score = best_score.max(score);
+                    }
+                }
+
+                if dark_has {
+                    let m32 = (dark_mask as u32) | ((dark_mask as u32) << 16);
+                    let mut acc = m32;
+                    for _ in 1..arc_length {
+                        acc &= acc >> 1;
+                    }
+                    if acc != 0 {
+                        let score = bitmask_best_arc_score(
+                            center, &circle_vals, thresh, dark_mask);
+                        best_score = best_score.max(score);
+                    }
+                }
+
+                if best_score >= 0.0 {
                     features.push(Feature {
                         x: x as f32,
                         y: y as f32,
-                        score,
+                        score: best_score,
                         level,
                         id: 0,
                     });
@@ -166,126 +247,46 @@ impl FastDetector {
 
         features
     }
+}
 
-    /// Check whether N contiguous circle pixels are all brighter or all
-    /// darker than center ± threshold, and compute the corner score.
-    ///
-    /// Uses a bitmask approach instead of a doubled-array scan:
-    ///   1. Build u16 bright_mask / dark_mask from threshold classification.
-    ///   2. Check for N contiguous set bits via repeated AND-shift.
-    ///   3. If corner, find the longest run and score it.
-    ///
-    /// The repeated AND-shift is branchless and maps directly to GPU
-    /// bitwise ops in WGSL (u32 & (u32 >> 1) etc.).
-    ///
-    /// Returns (is_corner, score). Score = sum of (|diff| - threshold)
-    /// for the qualifying pixels on the best arc.
-    fn check_contiguous_and_score(
-        &self,
-        center: i16,
-        circle: &[i16; 16],
-        thresh: i16,
-    ) -> (bool, f32) {
-        let n = self.arc_length;
-
-        // Build bitmasks: bit i set if circle[i] is brighter/darker.
-        let mut bright_mask: u16 = 0;
-        let mut dark_mask: u16 = 0;
-        for i in 0..16 {
-            let diff = circle[i] - center;
-            if diff > thresh {
-                bright_mask |= 1 << i;
-            } else if diff < -thresh {
-                dark_mask |= 1 << i;
-            }
+/// Find the longest contiguous arc in a circular 16-bit mask and
+/// compute its score. Used only for confirmed corners (rare path).
+#[inline]
+fn bitmask_best_arc_score(
+    center: i16,
+    circle: &[i16; 16],
+    thresh: i16,
+    mask: u16,
+) -> f32 {
+    // Find all runs and pick the longest. Use the doubled u32 trick.
+    let m32 = (mask as u32) | ((mask as u32) << 16);
+    let mut best_start = 0usize;
+    let mut best_len = 0usize;
+    let mut i = 0u32;
+    while i < 16 {
+        if m32 & (1 << i) == 0 {
+            i += 1;
+            continue;
         }
-
-        // Quick popcount rejection: need at least N bits set.
-        let bright_has = bright_mask.count_ones() as usize >= n;
-        let dark_has = dark_mask.count_ones() as usize >= n;
-        if !bright_has && !dark_has {
-            return (false, 0.0);
+        let start = i;
+        while i < 32 && (m32 & (1 << i)) != 0 {
+            i += 1;
         }
-
-        // Check for N contiguous set bits in a circular 16-bit pattern.
-        // Method: double the mask into u32 to handle wrap-around, then
-        // AND-shift N-1 times. If result is nonzero, there's a run of N.
-        let mut best_score = -1.0f32;
-
-        if bright_has {
-            let m32 = (bright_mask as u32) | ((bright_mask as u32) << 16);
-            let mut acc = m32;
-            for _ in 1..n {
-                acc &= acc >> 1;
-            }
-            if acc != 0 {
-                // Corner found. Score the longest bright arc.
-                let score = self.bitmask_best_arc_score(
-                    center, circle, thresh, bright_mask);
-                best_score = best_score.max(score);
-            }
-        }
-
-        if dark_has {
-            let m32 = (dark_mask as u32) | ((dark_mask as u32) << 16);
-            let mut acc = m32;
-            for _ in 1..n {
-                acc &= acc >> 1;
-            }
-            if acc != 0 {
-                let score = self.bitmask_best_arc_score(
-                    center, circle, thresh, dark_mask);
-                best_score = best_score.max(score);
-            }
-        }
-
-        if best_score >= 0.0 {
-            (true, best_score)
-        } else {
-            (false, 0.0)
+        let run_len = (i - start) as usize;
+        if run_len > best_len {
+            best_len = run_len;
+            best_start = start as usize;
         }
     }
 
-    /// Find the longest contiguous arc in a circular 16-bit mask and
-    /// compute its score. Used only for confirmed corners (rare path).
-    #[inline]
-    fn bitmask_best_arc_score(
-        &self,
-        center: i16,
-        circle: &[i16; 16],
-        thresh: i16,
-        mask: u16,
-    ) -> f32 {
-        // Find all runs and pick the longest. Use the doubled u32 trick.
-        let m32 = (mask as u32) | ((mask as u32) << 16);
-        let mut best_start = 0usize;
-        let mut best_len = 0usize;
-        let mut i = 0u32;
-        while i < 16 {
-            if m32 & (1 << i) == 0 {
-                i += 1;
-                continue;
-            }
-            let start = i;
-            while i < 32 && (m32 & (1 << i)) != 0 {
-                i += 1;
-            }
-            let run_len = (i - start) as usize;
-            if run_len > best_len {
-                best_len = run_len;
-                best_start = start as usize;
-            }
-        }
-
-        // Score the best arc.
-        let mut score = 0.0f32;
-        for j in best_start..best_start + best_len {
-            let idx = j % 16;
-            let diff = (circle[idx] - center).abs() - thresh;
-            score += diff.max(0) as f32;
-        }
-        score
+    // Score the best arc.
+    let mut score = 0.0f32;
+    for j in best_start..best_start + best_len {
+        let idx = j % 16;
+        let diff = (circle[idx] - center).abs() - thresh;
+        score += diff.max(0) as f32;
     }
+    score
 }
 
 #[cfg(test)]
@@ -298,7 +299,6 @@ mod tests {
         let mut img = Image::from_vec(size, size, vec![center_val; size * size]);
         let cx = size / 2;
         let cy = size / 2;
-        // Set all 16 circle pixels to ring_val.
         for &(dx, dy) in &CIRCLE_OFFSETS {
             let px = (cx as isize + dx) as usize;
             let py = (cy as isize + dy) as usize;
@@ -309,17 +309,10 @@ mod tests {
 
     #[test]
     fn test_bright_corner() {
-        // Center = 50, ring = 200. diff = 150, well above any threshold.
         let img = make_fast_corner_image(20, 50, 200);
         let det = FastDetector::new(30, 9);
         let features = det.detect(&img);
-        // Should detect at least one corner near the center.
-        assert!(
-            !features.is_empty(),
-            "expected at least one bright corner"
-        );
-        // The planted ring creates corners at and around (10,10).
-        // Check that at least one feature is within 4px of the center.
+        assert!(!features.is_empty(), "expected at least one bright corner");
         let near_center = features.iter().any(|f| {
             (f.x - 10.0).abs() <= 4.0 && (f.y - 10.0).abs() <= 4.0
         });
@@ -329,19 +322,14 @@ mod tests {
 
     #[test]
     fn test_dark_corner() {
-        // Center = 200, ring = 20. All circle pixels are darker.
         let img = make_fast_corner_image(20, 200, 20);
         let det = FastDetector::new(30, 9);
         let features = det.detect(&img);
-        assert!(
-            !features.is_empty(),
-            "expected at least one dark corner"
-        );
+        assert!(!features.is_empty(), "expected at least one dark corner");
     }
 
     #[test]
     fn test_no_corner_flat() {
-        // Uniform image — no corners anywhere.
         let img = Image::from_vec(20, 20, vec![128u8; 400]);
         let det = FastDetector::new(20, 9);
         let features = det.detect(&img);
@@ -350,7 +338,6 @@ mod tests {
 
     #[test]
     fn test_threshold_sensitivity() {
-        // With a small intensity difference, a high threshold should reject.
         let img = make_fast_corner_image(20, 100, 115); // diff = 15
         let det_low = FastDetector::new(10, 9);  // threshold 10 → detect
         let det_high = FastDetector::new(20, 9); // threshold 20 → reject
@@ -369,10 +356,7 @@ mod tests {
             let (dx, dy) = CIRCLE_OFFSETS[i];
             img.set((cx as isize + dx) as usize, (cy as isize + dy) as usize, 200);
         }
-        // FAST-9 should detect a corner at (10,10) (10 ≥ 9).
-        // FAST-12 should NOT detect at (10,10) (10 < 12).
-        // Note: the planted ring pixels may themselves trigger corners
-        // elsewhere, so we check specifically for the center pixel.
+
         let det9 = FastDetector::new(20, 9);
         let det12 = FastDetector::new(20, 12);
 
@@ -388,11 +372,7 @@ mod tests {
 
     #[test]
     fn test_border_exclusion() {
-        // Features within 3px of the border should not be detected.
-        // Place a "corner" at (2, 2) — inside the skip zone.
         let mut img = Image::from_vec(20, 20, vec![100u8; 400]);
-        // This would be out of bounds for circle sampling anyway,
-        // so FAST should skip it.
         img.set(2, 2, 200);
         let det = FastDetector::new(10, 9);
         let features = det.detect(&img);
@@ -403,7 +383,6 @@ mod tests {
 
     #[test]
     fn test_image_too_small() {
-        // 6×6 or smaller → no room for the 3-pixel border on both sides.
         let img: Image<u8> = Image::new(6, 6);
         let det = FastDetector::new(20, 9);
         assert!(det.detect(&img).is_empty());
@@ -411,7 +390,6 @@ mod tests {
 
     #[test]
     fn test_score_increases_with_contrast() {
-        // Higher contrast should yield a higher score.
         let img_low = make_fast_corner_image(20, 100, 140);  // diff = 40
         let img_high = make_fast_corner_image(20, 100, 220);  // diff = 120
 
@@ -423,8 +401,7 @@ mod tests {
         assert!(
             f_high[0].score > f_low[0].score,
             "higher contrast should give higher score: {} vs {}",
-            f_high[0].score,
-            f_low[0].score,
+            f_high[0].score, f_low[0].score,
         );
     }
 
