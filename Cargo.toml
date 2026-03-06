@@ -16,6 +16,10 @@ wgpu = "22"
 # Minimal async executor for blocking on wgpu futures in sync context
 pollster = "0.3"
 bytemuck = { version = "1", features = ["derive"] }
+rayon = { version = "1", optional = true }
+
+[features]
+parallel = ["rayon"]
 
 [dev-dependencies]
 criterion = "0.5"

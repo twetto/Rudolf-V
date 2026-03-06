@@ -34,11 +34,19 @@
 //   reject, then AND-shift for N contiguous bits. Branchless, maps
 //   directly to GPU bitwise ops in WGSL.
 //
+// - RAYON ROW PARALLELISM (feature-gated): Each row is independent —
+//   parallel iteration over rows with per-row feature collection.
+//   Gated behind `features = ["parallel"]` to keep the default build
+//   dependency-free.
+//
 // GPU MAPPING: Each pixel maps to one thread. The flat-offset pattern
 // mirrors texture sampling with fixed offsets. The bitmask approach
 // maps to WGSL u32 bitwise ops.
 
 use crate::image::Image;
+
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 /// Bresenham circle of radius 3: 16 (dx, dy) offsets.
 /// Listed clockwise starting from 12 o'clock, matching Rosten's convention.
@@ -139,113 +147,159 @@ impl FastDetector {
         let arc_length = self.arc_length;
         let min_cardinals: u8 = if arc_length >= 12 { 3 } else { 2 };
 
-        let mut features = Vec::new();
+        // ── Parallel path (feature-gated) ───────────────────────────────
+        #[cfg(feature = "parallel")]
+        {
+            return (3..(h - 3))
+                .into_par_iter()
+                .flat_map(|y| {
+                    let mut row_features = Vec::new();
+                    detect_row(
+                        slice, stride, w, y, level,
+                        &circle_off, &card,
+                        thresh, arc_length, min_cardinals,
+                        &mut row_features,
+                    );
+                    row_features
+                })
+                .collect();
+        }
 
-        for y in 3..(h - 3) {
-            let row_base = y * stride;
+        // ── Sequential path ─────────────────────────────────────────────
+        #[cfg(not(feature = "parallel"))]
+        {
+            let mut features = Vec::new();
+            for y in 3..(h - 3) {
+                detect_row(
+                    slice, stride, w, y, level,
+                    &circle_off, &card,
+                    thresh, arc_length, min_cardinals,
+                    &mut features,
+                );
+            }
+            features
+        }
+    }
+}
 
-            for x in 3..(w - 3) {
-                let base = row_base + x;
+/// Process one row of FAST detection.
+///
+/// Extracted as a free function so it can be called from both the
+/// sequential and rayon parallel paths without borrowing `&self`.
+#[inline]
+fn detect_row(
+    slice: &[u8],
+    stride: usize,
+    w: usize,
+    y: usize,
+    level: usize,
+    circle_off: &[isize; 16],
+    cardinal_off: &[isize; 4],
+    thresh: i16,
+    arc_length: usize,
+    min_cardinals: u8,
+    features: &mut Vec<Feature>,
+) {
+    let row_base = y * stride;
 
-                // SAFETY: x in [3, w-3), y in [3, h-3), all circle offsets
-                // are at most ±3 in each dimension, so base + offset is
-                // always within the image slice.
-                unsafe {
-                let center = *slice.get_unchecked(base) as i16;
-                let hi = center + thresh;
-                let lo = center - thresh;
+    for x in 3..(w - 3) {
+        let base = row_base + x;
 
-                // --- Quick rejection (Rosten's high-speed test) ---
-                // Check 4 cardinal points. At least min_cardinals must be
-                // brighter (or darker) to have any chance of an N-arc.
-                let p0  = *slice.get_unchecked((base as isize + card[0]) as usize) as i16;
-                let p4  = *slice.get_unchecked((base as isize + card[1]) as usize) as i16;
-                let p8  = *slice.get_unchecked((base as isize + card[2]) as usize) as i16;
-                let p12 = *slice.get_unchecked((base as isize + card[3]) as usize) as i16;
+        // SAFETY: x in [3, w-3), y in [3, h-3), all circle offsets
+        // are at most ±3 in each dimension, so base + offset is
+        // always within the image slice.
+        unsafe {
+        let center = *slice.get_unchecked(base) as i16;
+        let hi = center + thresh;
+        let lo = center - thresh;
 
-                let bright_count = (p0 > hi) as u8
-                    + (p4 > hi) as u8
-                    + (p8 > hi) as u8
-                    + (p12 > hi) as u8;
-                let dark_count = (p0 < lo) as u8
-                    + (p4 < lo) as u8
-                    + (p8 < lo) as u8
-                    + (p12 < lo) as u8;
+        // --- Quick rejection (Rosten's high-speed test) ---
+        // Check 4 cardinal points. At least min_cardinals must be
+        // brighter (or darker) to have any chance of an N-arc.
+        let p0  = *slice.get_unchecked((base as isize + cardinal_off[0]) as usize) as i16;
+        let p4  = *slice.get_unchecked((base as isize + cardinal_off[1]) as usize) as i16;
+        let p8  = *slice.get_unchecked((base as isize + cardinal_off[2]) as usize) as i16;
+        let p12 = *slice.get_unchecked((base as isize + cardinal_off[3]) as usize) as i16;
 
-                if bright_count < min_cardinals && dark_count < min_cardinals {
-                    continue;
-                }
+        let bright_count = (p0 > hi) as u8
+            + (p4 > hi) as u8
+            + (p8 > hi) as u8
+            + (p12 > hi) as u8;
+        let dark_count = (p0 < lo) as u8
+            + (p4 < lo) as u8
+            + (p8 < lo) as u8
+            + (p12 < lo) as u8;
 
-                // --- Full 16-point test ---
-                // Build bitmasks and cache circle values in one pass.
-                let mut bright_mask: u16 = 0;
-                let mut dark_mask: u16 = 0;
-                let mut circle_vals = [0i16; 16];
+        if bright_count < min_cardinals && dark_count < min_cardinals {
+            continue;
+        }
 
-                for i in 0..16 {
-                    let v = *slice.get_unchecked(
-                        (base as isize + circle_off[i]) as usize
-                    ) as i16;
-                    circle_vals[i] = v;
-                    if v > hi {
-                        bright_mask |= 1 << i;
-                    } else if v < lo {
-                        dark_mask |= 1 << i;
-                    }
-                }
+        // --- Full 16-point test ---
+        // Build bitmasks and cache circle values in one pass.
+        let mut bright_mask: u16 = 0;
+        let mut dark_mask: u16 = 0;
+        let mut circle_vals = [0i16; 16];
 
-                // Quick popcount rejection: need at least N bits set.
-                let bright_has = bright_mask.count_ones() as usize >= arc_length;
-                let dark_has = dark_mask.count_ones() as usize >= arc_length;
-                if !bright_has && !dark_has {
-                    continue;
-                }
-
-                // Check for N contiguous set bits in a circular 16-bit pattern.
-                // Double the mask into u32 to handle wrap-around, then
-                // AND-shift N-1 times. Nonzero result = run of N exists.
-                let mut best_score = -1.0f32;
-
-                if bright_has {
-                    let m32 = (bright_mask as u32) | ((bright_mask as u32) << 16);
-                    let mut acc = m32;
-                    for _ in 1..arc_length {
-                        acc &= acc >> 1;
-                    }
-                    if acc != 0 {
-                        let score = bitmask_best_arc_score(
-                            center, &circle_vals, thresh, bright_mask);
-                        best_score = best_score.max(score);
-                    }
-                }
-
-                if dark_has {
-                    let m32 = (dark_mask as u32) | ((dark_mask as u32) << 16);
-                    let mut acc = m32;
-                    for _ in 1..arc_length {
-                        acc &= acc >> 1;
-                    }
-                    if acc != 0 {
-                        let score = bitmask_best_arc_score(
-                            center, &circle_vals, thresh, dark_mask);
-                        best_score = best_score.max(score);
-                    }
-                }
-
-                if best_score >= 0.0 {
-                    features.push(Feature {
-                        x: x as f32,
-                        y: y as f32,
-                        score: best_score,
-                        level,
-                        id: 0,
-                    });
-                }
-                } // unsafe
+        for i in 0..16 {
+            let v = *slice.get_unchecked(
+                (base as isize + circle_off[i]) as usize
+            ) as i16;
+            circle_vals[i] = v;
+            if v > hi {
+                bright_mask |= 1 << i;
+            } else if v < lo {
+                dark_mask |= 1 << i;
             }
         }
 
-        features
+        // Quick popcount rejection: need at least N bits set.
+        let bright_has = bright_mask.count_ones() as usize >= arc_length;
+        let dark_has = dark_mask.count_ones() as usize >= arc_length;
+        if !bright_has && !dark_has {
+            continue;
+        }
+
+        // Check for N contiguous set bits in a circular 16-bit pattern.
+        // Double the mask into u32 to handle wrap-around, then
+        // AND-shift N-1 times. Nonzero result = run of N exists.
+        let mut best_score = -1.0f32;
+
+        if bright_has {
+            let m32 = (bright_mask as u32) | ((bright_mask as u32) << 16);
+            let mut acc = m32;
+            for _ in 1..arc_length {
+                acc &= acc >> 1;
+            }
+            if acc != 0 {
+                let score = bitmask_best_arc_score(
+                    center, &circle_vals, thresh, bright_mask);
+                best_score = best_score.max(score);
+            }
+        }
+
+        if dark_has {
+            let m32 = (dark_mask as u32) | ((dark_mask as u32) << 16);
+            let mut acc = m32;
+            for _ in 1..arc_length {
+                acc &= acc >> 1;
+            }
+            if acc != 0 {
+                let score = bitmask_best_arc_score(
+                    center, &circle_vals, thresh, dark_mask);
+                best_score = best_score.max(score);
+            }
+        }
+
+        if best_score >= 0.0 {
+            features.push(Feature {
+                x: x as f32,
+                y: y as f32,
+                score: best_score,
+                level,
+                id: 0,
+            });
+        }
+        } // unsafe
     }
 }
 

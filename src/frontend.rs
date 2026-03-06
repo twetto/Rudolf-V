@@ -395,24 +395,18 @@ impl Frontend {
         let slots_available = self.config.max_features.saturating_sub(self.features.len());
 
         if slots_available > 0 {
-            // Convert pyramid level 0 to u8 for detection.
-            let level0 = &self.curr_pyramid.levels[0];
-            let mut u8_img = Image::new(level0.width(), level0.height());
-            for (x, y, v) in level0.pixels() {
-                u8_img.set(x, y, v.clamp(0.0, 255.0).round() as u8);
-            }
-
-            // Generate mask from occupancy grid.
+            // Use the original u8 input directly — level 0 of the pyramid
+            // is just this image converted to f32 (no blur), so converting
+            // back would be pure waste (~1ms of clamp+round+cast).
             let mask = self.grid.unoccupied_mask();
 
-            // Detect and filter by mask.
             let new_features = match self.config.detector {
                 DetectorType::Fast => {
                     let det = FastDetector::new(
                         self.config.fast_threshold,
                         self.config.fast_arc_length,
                     );
-                    det.detect_masked(&u8_img, &mask)
+                    det.detect_masked(input, &mask)
                 }
                 DetectorType::Harris => {
                     let det = HarrisDetector::new(
@@ -420,7 +414,7 @@ impl Frontend {
                         self.config.harris_threshold,
                         self.config.harris_block_size,
                     );
-                    det.detect_masked(&u8_img, &mask)
+                    det.detect_masked(input, &mask)
                 }
             };
 
@@ -443,6 +437,7 @@ impl Frontend {
                 stats.new_detections += 1;
             }
         }
+
         timing.detect = t0.elapsed().as_secs_f64();
 
         // Step 6: Mark that we have a valid previous frame, store feature snapshot.

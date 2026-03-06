@@ -26,6 +26,9 @@ While the original `vilib` is a state-of-the-art, CUDA-only library designed str
 # Run all tests
 cargo test
 
+# Run all tests including GPU tests
+cargo test -- --include-ignored
+
 # Visualize FAST and Harris corner detection
 cargo run --example visualize_fast
 # -> outputs SVG files in vis_output/:
@@ -52,6 +55,7 @@ cargo run --example euroc_frontend --release -- /path/to/MH_01_easy 100
 
 # Live visualization window (requires minifb)
 cargo run --example euroc_live --release -- /path/to/MH_01_easy
+cargo run --example gpu_euroc_live --release -- /path/to/MH_01_easy # GPU version
 # Controls: Space=pause, S=step, Q/Esc=quit, +/-=speed, T=trails, F=flow
 
 # GPU roundtrip example
@@ -61,6 +65,8 @@ cargo run --example gpu_pyramid -- image.png 5 1.5      # 5 levels, sigma=1.5
 
 # Run benchmarks
 cargo bench
+
+# To enable parallel CPU processing, add <--features parallel> to the above commands.
 ```
 
 ## Module Overview
