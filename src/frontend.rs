@@ -138,6 +138,8 @@ pub struct Frontend {
     curr_pyramid: Pyramid,
     /// Scratch buffers for pyramid construction (convolution intermediates).
     pyr_scratch: PyramidScratch,
+    /// Scratch buffer for histogram equalization output (avoids per-frame alloc).
+    histeq_buf: Image<u8>,
     /// Whether we have a valid previous frame.
     has_prev: bool,
     /// Currently tracked features with persistent IDs.
@@ -218,6 +220,7 @@ impl Frontend {
             prev_pyramid: Pyramid { levels: Vec::new() },
             curr_pyramid: Pyramid { levels: Vec::new() },
             pyr_scratch,
+            histeq_buf: Image::new(img_w, img_h),
             has_prev: false,
             features: Vec::new(),
             prev_features: Vec::new(),
@@ -245,10 +248,9 @@ impl Frontend {
 
         // Step 0: Histogram equalization (brightness normalization).
         let t0 = Instant::now();
-        let equalized;
         let input = if self.config.histeq != HistEqMethod::None {
-            equalized = histeq::apply_histeq(image, self.config.histeq);
-            &equalized
+            histeq::apply_histeq_into(image, self.config.histeq, &mut self.histeq_buf);
+            &self.histeq_buf
         } else {
             image
         };
