@@ -75,6 +75,9 @@ impl OccupancyGrid {
     ///
     /// This mask can be passed to the detector to restrict detection
     /// to empty cells.
+    ///
+    /// NOTE: Prefer passing grid data directly to `detect_unoccupied()`
+    /// via the accessors below — avoids allocating a 752×480 mask image.
     pub fn unoccupied_mask(&self) -> Image<u8> {
         let mut mask = Image::new(self.img_w, self.img_h);
         for y in 0..self.img_h {
@@ -87,6 +90,26 @@ impl OccupancyGrid {
             }
         }
         mask
+    }
+
+    // -----------------------------------------------------------------
+    // Accessors for grid-aware detection (avoids mask allocation)
+    // -----------------------------------------------------------------
+
+    /// Raw grid cells. `true` = occupied.
+    /// Layout: row-major, `grid[row * cols + col]`.
+    pub fn grid_cells(&self) -> &[bool] {
+        &self.grid
+    }
+
+    /// Number of grid columns.
+    pub fn grid_cols(&self) -> usize {
+        self.cols
+    }
+
+    /// Cell size in pixels.
+    pub fn cell_size(&self) -> usize {
+        self.cell_size
     }
 
     /// Number of unoccupied cells.
@@ -206,5 +229,16 @@ mod tests {
         // Marking same cell again doesn't change count.
         grid.mark(0.0, 0.0);
         assert_eq!(grid.count_empty(), 7);
+    }
+
+    #[test]
+    fn test_grid_accessors() {
+        let mut grid = OccupancyGrid::new(64, 64, 16);
+        grid.mark(8.0, 8.0); // cell (0, 0)
+
+        assert_eq!(grid.grid_cols(), 4);
+        assert_eq!(grid.cell_size(), 16);
+        assert!(grid.grid_cells()[0]); // cell (0,0) occupied
+        assert!(!grid.grid_cells()[1]); // cell (1,0) empty
     }
 }

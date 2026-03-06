@@ -9,35 +9,24 @@
 //   threshold. A corner exists if ≥ N contiguous circle pixels are all
 //   BRIGHTER or all DARKER.
 //
-// The "contiguous" check must wrap around the circle (index 15 is adjacent
-// to index 0). The standard trick is to duplicate the 16-element classification
-// array into a 32-element array and scan for a run of length N.
-//
-// This mirrors vilib's `fast_gpu_cuda_tools.cu`.
-//
 // OPTIMIZATIONS:
 //
-// - PRECOMPUTED FLAT OFFSETS: Instead of computing (y+dy)*stride+(x+dx)
-//   per circle pixel, precompute 16 flat offsets as dy*stride+dx once.
-//   The inner loop becomes base pointer + indexed reads — eliminates
-//   20 multiplies per pixel candidate (16 full + 4 cardinal).
-//
-// - DIRECT SLICE ACCESS: Work on the raw image slice with flat offsets,
-//   bypassing per-pixel method call overhead.
+// - PRECOMPUTED FLAT OFFSETS: 16 circle offsets as dy*stride+dx.
+//   Inner loop becomes base + indexed reads — eliminates per-pixel
+//   address arithmetic.
 //
 // - CARDINAL EARLY REJECT (Rosten's high-speed test): Check 4 cardinal
-//   points {0,4,8,12} first. At least 2 of 4 (3 for FAST-12) must be
-//   brighter or darker. Rejects ~85% of non-corner pixels with 4
-//   comparisons instead of 16.
+//   points {0,4,8,12} first. Rejects ~85% of non-corner pixels.
 //
-// - BITMASK CONTIGUOUS CHECK: Build u16 bright/dark masks, popcount
-//   reject, then AND-shift for N contiguous bits. Branchless, maps
-//   directly to GPU bitwise ops in WGSL.
+// - BITMASK CONTIGUOUS CHECK: u16 bright/dark masks, popcount reject,
+//   AND-shift for N contiguous bits. Branchless.
 //
-// - RAYON ROW PARALLELISM (feature-gated): Each row is independent —
-//   parallel iteration over rows with per-row feature collection.
-//   Gated behind `features = ["parallel"]` to keep the default build
-//   dependency-free.
+// - INLINE OCCUPANCY SKIP: When an occupancy grid is provided, the x-loop
+//   checks one bool per cell boundary and jumps past occupied cells.
+//   No mask allocation, no Vec of ranges — just a while loop with an
+//   integer division every cell_size pixels.
+//
+// - RAYON ROW PARALLELISM (feature-gated): Each row is independent.
 //
 // GPU MAPPING: Each pixel maps to one thread. The flat-offset pattern
 // mirrors texture sampling with fixed offsets. The bitmask approach
@@ -60,18 +49,10 @@ const CIRCLE_OFFSETS: [(isize, isize); 16] = [
 /// A detected feature point.
 #[derive(Debug, Clone)]
 pub struct Feature {
-    /// Sub-pixel x coordinate (integer cast to f32 for FAST; sub-pixel
-    /// refinement comes later with KLT tracking).
     pub x: f32,
-    /// Sub-pixel y coordinate.
     pub y: f32,
-    /// Corner response score (sum of |circle[i] - center| - threshold
-    /// for qualifying pixels). Higher = stronger corner.
     pub score: f32,
-    /// Pyramid level where this feature was detected (0 = original resolution).
     pub level: usize,
-    /// Unique feature ID. 0 for newly detected features; assigned by the
-    /// tracker when a feature is first tracked across frames.
     pub id: u64,
 }
 
@@ -81,9 +62,7 @@ pub struct Feature {
 /// Common choices: FAST-9 (more features, some noise) or FAST-12 (fewer,
 /// more robust).
 pub struct FastDetector {
-    /// Intensity difference threshold. A circle pixel is classified as
-    /// BRIGHTER/DARKER only if it differs from the center by more than
-    /// this value. Typical: 20–40 for u8 images.
+    /// Intensity difference threshold. Typical: 20–40 for u8 images.
     pub threshold: u8,
     /// Minimum number of contiguous circle pixels required.
     /// Must be in [9, 12]. FAST-9 and FAST-12 are the most common.
@@ -106,48 +85,47 @@ impl FastDetector {
         }
     }
 
-    /// Detect FAST corners in a u8 grayscale image.
+    /// Detect FAST corners in the entire image.
     ///
     /// Features are returned with `level = 0` and `id = 0`.
-    /// Apply NMS afterwards to suppress weak nearby detections.
     pub fn detect(&self, image: &Image<u8>) -> Vec<Feature> {
-        self.detect_at_level(image, 0)
+        // Empty grid → no occupancy skipping, scans everything.
+        self.detect_unoccupied(image, &[], 0, 1)
     }
 
-    /// Detect FAST corners, tagging features with the given pyramid level.
+    /// Detect FAST corners, skipping occupied cells in the occupancy grid.
     ///
-    /// Used internally when running FAST on each pyramid level.
-    pub fn detect_at_level(&self, image: &Image<u8>, level: usize) -> Vec<Feature> {
+    /// At each cell boundary in the x-loop, checks one bool in the grid.
+    /// If occupied, jumps past the entire cell — no mask image needed.
+    ///
+    /// Pass an empty `grid` slice to scan the entire image (same as `detect`).
+    ///
+    /// # Arguments
+    /// * `grid` — flat bool array, row-major, `true` = occupied. Empty = no grid.
+    /// * `grid_cols` — number of grid columns (ignored if grid is empty)
+    /// * `cell_size` — pixel width of each grid cell (ignored if grid is empty)
+    pub fn detect_unoccupied(
+        &self,
+        image: &Image<u8>,
+        grid: &[bool],
+        grid_cols: usize,
+        cell_size: usize,
+    ) -> Vec<Feature> {
         let w = image.width();
         let h = image.height();
 
-        // Skip a 3-pixel border since the Bresenham circle has radius 3.
         if w <= 6 || h <= 6 {
             return Vec::new();
         }
 
         let stride = image.stride();
         let slice = image.as_slice();
-
-        // Precompute flat offsets: circle_off[i] = dy * stride + dx.
-        // Adding this to (y * stride + x) gives the flat index of circle
-        // pixel i. Eliminates a multiply per circle pixel in the inner loop.
-        let circle_off: [isize; 16] = {
-            let mut off = [0isize; 16];
-            for (i, &(dx, dy)) in CIRCLE_OFFSETS.iter().enumerate() {
-                off[i] = dy * stride as isize + dx;
-            }
-            off
-        };
-
-        // Cardinal offsets for the quick-reject test (indices 0, 4, 8, 12).
-        let card = [circle_off[0], circle_off[4], circle_off[8], circle_off[12]];
+        let (circle_off, card) = precompute_offsets(stride);
 
         let thresh = self.threshold as i16;
         let arc_length = self.arc_length;
         let min_cardinals: u8 = if arc_length >= 12 { 3 } else { 2 };
 
-        // ── Parallel path (feature-gated) ───────────────────────────────
         #[cfg(feature = "parallel")]
         {
             return (3..(h - 3))
@@ -155,9 +133,10 @@ impl FastDetector {
                 .flat_map(|y| {
                     let mut row_features = Vec::new();
                     detect_row(
-                        slice, stride, w, y, level,
+                        slice, stride, w, y, 0,
                         &circle_off, &card,
                         thresh, arc_length, min_cardinals,
+                        grid, grid_cols, cell_size,
                         &mut row_features,
                     );
                     row_features
@@ -165,15 +144,15 @@ impl FastDetector {
                 .collect();
         }
 
-        // ── Sequential path ─────────────────────────────────────────────
         #[cfg(not(feature = "parallel"))]
         {
             let mut features = Vec::new();
             for y in 3..(h - 3) {
                 detect_row(
-                    slice, stride, w, y, level,
+                    slice, stride, w, y, 0,
                     &circle_off, &card,
                     thresh, arc_length, min_cardinals,
+                    grid, grid_cols, cell_size,
                     &mut features,
                 );
             }
@@ -182,10 +161,28 @@ impl FastDetector {
     }
 }
 
-/// Process one row of FAST detection.
+// ==========================================================================
+// Internal helpers
+// ==========================================================================
+
+/// Precompute flat circle offsets and cardinal offsets for the given stride.
+#[inline]
+fn precompute_offsets(stride: usize) -> ([isize; 16], [isize; 4]) {
+    let mut circle_off = [0isize; 16];
+    for (i, &(dx, dy)) in CIRCLE_OFFSETS.iter().enumerate() {
+        circle_off[i] = dy * stride as isize + dx;
+    }
+    let card = [circle_off[0], circle_off[4], circle_off[8], circle_off[12]];
+    (circle_off, card)
+}
+
+/// Process one row of FAST detection with inline occupancy skipping.
 ///
-/// Extracted as a free function so it can be called from both the
-/// sequential and rayon parallel paths without borrowing `&self`.
+/// When `grid` is non-empty, checks one bool per cell boundary and jumps
+/// past occupied cells. When `grid` is empty, scans the full row.
+///
+/// Uses a `while` loop so we can jump x forward by an entire cell width
+/// when we hit an occupied cell.
 #[inline]
 fn detect_row(
     slice: &[u8],
@@ -198,11 +195,30 @@ fn detect_row(
     thresh: i16,
     arc_length: usize,
     min_cardinals: u8,
+    grid: &[bool],
+    grid_cols: usize,
+    cell_size: usize,
     features: &mut Vec<Feature>,
 ) {
     let row_base = y * stride;
+    let has_grid = !grid.is_empty();
+    let grid_row_off = if has_grid { (y / cell_size) * grid_cols } else { 0 };
 
-    for x in 3..(w - 3) {
+    let x_min = 3usize;
+    let x_max = w - 3;
+
+    let mut x = x_min;
+    while x < x_max {
+        // ── Occupancy skip: one bool check per cell boundary ──
+        if has_grid {
+            let gc = x / cell_size;
+            if gc < grid_cols && grid[grid_row_off + gc] {
+                // Jump to the start of the next cell.
+                x = (gc + 1) * cell_size;
+                continue;
+            }
+        }
+
         let base = row_base + x;
 
         // SAFETY: x in [3, w-3), y in [3, h-3), all circle offsets
@@ -214,8 +230,6 @@ fn detect_row(
         let lo = center - thresh;
 
         // --- Quick rejection (Rosten's high-speed test) ---
-        // Check 4 cardinal points. At least min_cardinals must be
-        // brighter (or darker) to have any chance of an N-arc.
         let p0  = *slice.get_unchecked((base as isize + cardinal_off[0]) as usize) as i16;
         let p4  = *slice.get_unchecked((base as isize + cardinal_off[1]) as usize) as i16;
         let p8  = *slice.get_unchecked((base as isize + cardinal_off[2]) as usize) as i16;
@@ -231,11 +245,11 @@ fn detect_row(
             + (p12 < lo) as u8;
 
         if bright_count < min_cardinals && dark_count < min_cardinals {
+            x += 1;
             continue;
         }
 
         // --- Full 16-point test ---
-        // Build bitmasks and cache circle values in one pass.
         let mut bright_mask: u16 = 0;
         let mut dark_mask: u16 = 0;
         let mut circle_vals = [0i16; 16];
@@ -252,16 +266,15 @@ fn detect_row(
             }
         }
 
-        // Quick popcount rejection: need at least N bits set.
+        // Quick popcount rejection.
         let bright_has = bright_mask.count_ones() as usize >= arc_length;
         let dark_has = dark_mask.count_ones() as usize >= arc_length;
         if !bright_has && !dark_has {
+            x += 1;
             continue;
         }
 
-        // Check for N contiguous set bits in a circular 16-bit pattern.
-        // Double the mask into u32 to handle wrap-around, then
-        // AND-shift N-1 times. Nonzero result = run of N exists.
+        // Contiguous-arc check + scoring.
         let mut best_score = -1.0f32;
 
         if bright_has {
@@ -300,6 +313,8 @@ fn detect_row(
             });
         }
         } // unsafe
+
+        x += 1;
     }
 }
 
@@ -312,7 +327,6 @@ fn bitmask_best_arc_score(
     thresh: i16,
     mask: u16,
 ) -> f32 {
-    // Find all runs and pick the longest. Use the doubled u32 trick.
     let m32 = (mask as u32) | ((mask as u32) << 16);
     let mut best_start = 0usize;
     let mut best_len = 0usize;
@@ -333,7 +347,6 @@ fn bitmask_best_arc_score(
         }
     }
 
-    // Score the best arc.
     let mut score = 0.0f32;
     for j in best_start..best_start + best_len {
         let idx = j % 16;
@@ -343,12 +356,14 @@ fn bitmask_best_arc_score(
     score
 }
 
+// ==========================================================================
+// Tests
+// ==========================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Create a blank image and plant a bright cross pattern that should
-    /// trigger FAST at the center.
     fn make_fast_corner_image(size: usize, center_val: u8, ring_val: u8) -> Image<u8> {
         let mut img = Image::from_vec(size, size, vec![center_val; size * size]);
         let cx = size / 2;
@@ -392,9 +407,9 @@ mod tests {
 
     #[test]
     fn test_threshold_sensitivity() {
-        let img = make_fast_corner_image(20, 100, 115); // diff = 15
-        let det_low = FastDetector::new(10, 9);  // threshold 10 → detect
-        let det_high = FastDetector::new(20, 9); // threshold 20 → reject
+        let img = make_fast_corner_image(20, 100, 115);
+        let det_low = FastDetector::new(10, 9);
+        let det_high = FastDetector::new(20, 9);
 
         assert!(!det_low.detect(&img).is_empty(), "low threshold should detect");
         assert!(det_high.detect(&img).is_empty(), "high threshold should reject");
@@ -402,7 +417,6 @@ mod tests {
 
     #[test]
     fn test_arc_length_sensitivity() {
-        // Plant only 10 contiguous bright pixels on the circle (not all 16).
         let mut img = Image::from_vec(20, 20, vec![100u8; 400]);
         let cx = 10usize;
         let cy = 10usize;
@@ -444,8 +458,8 @@ mod tests {
 
     #[test]
     fn test_score_increases_with_contrast() {
-        let img_low = make_fast_corner_image(20, 100, 140);  // diff = 40
-        let img_high = make_fast_corner_image(20, 100, 220);  // diff = 120
+        let img_low = make_fast_corner_image(20, 100, 140);
+        let img_high = make_fast_corner_image(20, 100, 220);
 
         let det = FastDetector::new(20, 9);
         let f_low = det.detect(&img_low);
@@ -460,17 +474,75 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_at_level() {
-        let img = make_fast_corner_image(20, 50, 200);
-        let det = FastDetector::new(30, 9);
-        let features = det.detect_at_level(&img, 3);
-        assert!(!features.is_empty());
-        assert_eq!(features[0].level, 3);
-    }
-
-    #[test]
     #[should_panic(expected = "arc_length")]
     fn test_invalid_arc_length() {
         FastDetector::new(20, 7);
+    }
+
+    // ===== Grid-skip tests =====
+
+    #[test]
+    fn test_detect_unoccupied_all_empty() {
+        let img = make_fast_corner_image(40, 50, 200);
+        let det = FastDetector::new(30, 9);
+
+        let cols = (40 + 15) / 16;
+        let rows = (40 + 15) / 16;
+        let grid = vec![false; cols * rows];
+
+        let full = det.detect(&img);
+        let skip = det.detect_unoccupied(&img, &grid, cols, 16);
+
+        assert_eq!(full.len(), skip.len(),
+            "all-empty grid should match full detect");
+    }
+
+    #[test]
+    fn test_detect_unoccupied_all_occupied() {
+        let img = make_fast_corner_image(40, 50, 200);
+        let det = FastDetector::new(30, 9);
+
+        let cols = (40 + 15) / 16;
+        let rows = (40 + 15) / 16;
+        let grid = vec![true; cols * rows];
+
+        let skip = det.detect_unoccupied(&img, &grid, cols, 16);
+        assert!(skip.is_empty(), "all-occupied grid should detect nothing");
+    }
+
+    #[test]
+    fn test_detect_unoccupied_filters_correctly() {
+        let img = make_fast_corner_image(40, 50, 200);
+        let det = FastDetector::new(30, 9);
+
+        let cols = 3;
+        let rows = 3;
+        let mut grid = vec![false; cols * rows];
+        grid[1 * cols + 1] = true; // center cell
+
+        let full = det.detect(&img);
+        let skip = det.detect_unoccupied(&img, &grid, cols, 16);
+
+        assert!(full.iter().any(|f| f.x >= 16.0 && f.x < 32.0 && f.y >= 16.0 && f.y < 32.0),
+            "full detect should find corner in center cell");
+        assert!(!skip.iter().any(|f| f.x >= 16.0 && f.x < 32.0 && f.y >= 16.0 && f.y < 32.0),
+            "grid-skip should not find corner in occupied center cell");
+    }
+
+    #[test]
+    fn test_detect_delegates_to_unoccupied() {
+        // detect() should produce identical results to detect_unoccupied with empty grid.
+        let img = make_fast_corner_image(40, 50, 200);
+        let det = FastDetector::new(30, 9);
+
+        let a = det.detect(&img);
+        let b = det.detect_unoccupied(&img, &[], 0, 1);
+
+        assert_eq!(a.len(), b.len());
+        for (fa, fb) in a.iter().zip(b.iter()) {
+            assert_eq!(fa.x, fb.x);
+            assert_eq!(fa.y, fb.y);
+            assert_eq!(fa.score, fb.score);
+        }
     }
 }

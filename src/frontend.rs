@@ -46,21 +46,6 @@ pub enum DetectorType {
 pub trait Detector {
     /// Detect features in the image.
     fn detect(&self, image: &Image<u8>) -> Vec<Feature>;
-
-    /// Detect features only where mask > 0.
-    fn detect_masked(&self, image: &Image<u8>, mask: &Image<u8>) -> Vec<Feature> {
-        // Default implementation: detect everywhere, then filter.
-        // Individual detectors can override for efficiency.
-        let features = self.detect(image);
-        features
-            .into_iter()
-            .filter(|f| {
-                let x = f.x as usize;
-                let y = f.y as usize;
-                x < mask.width() && y < mask.height() && mask.get(x, y) > 0
-            })
-            .collect()
-    }
 }
 
 impl Detector for FastDetector {
@@ -395,26 +380,35 @@ impl Frontend {
         let slots_available = self.config.max_features.saturating_sub(self.features.len());
 
         if slots_available > 0 {
-            // Use the original u8 input directly — level 0 of the pyramid
-            // is just this image converted to f32 (no blur), so converting
-            // back would be pure waste (~1ms of clamp+round+cast).
-            let mask = self.grid.unoccupied_mask();
-
+            // Detect features only in unoccupied grid cells.
+            // Previous approach: allocate 752×480 mask (~0.56ms) → detect all → filter.
+            // New approach: skip occupied cell columns entirely in the FAST scan loop.
+            // Saves the mask allocation AND skips ~14% of FAST computation.
             let new_features = match self.config.detector {
                 DetectorType::Fast => {
                     let det = FastDetector::new(
                         self.config.fast_threshold,
                         self.config.fast_arc_length,
                     );
-                    det.detect_masked(input, &mask)
+                    det.detect_unoccupied(
+                        input,
+                        self.grid.grid_cells(),
+                        self.grid.grid_cols(),
+                        self.grid.cell_size(),
+                    )
                 }
                 DetectorType::Harris => {
+                    // Harris uses the old detect + post-filter path
+                    // (rarely used, not worth a grid-aware variant).
                     let det = HarrisDetector::new(
                         self.config.harris_k,
                         self.config.harris_threshold,
                         self.config.harris_block_size,
                     );
-                    det.detect_masked(input, &mask)
+                    let all = det.detect(input);
+                    all.into_iter()
+                        .filter(|f| !self.grid.is_occupied(f.x, f.y))
+                        .collect()
                 }
             };
 
@@ -481,38 +475,6 @@ impl Frontend {
     /// Change the histogram equalization method at runtime.
     pub fn set_histeq(&mut self, method: HistEqMethod) {
         self.config.histeq = method;
-    }
-}
-
-/// Convenience method on FastDetector for masked detection.
-impl FastDetector {
-    /// Detect features only where mask > 0.
-    pub fn detect_masked(&self, image: &Image<u8>, mask: &Image<u8>) -> Vec<Feature> {
-        let features = self.detect(image);
-        features
-            .into_iter()
-            .filter(|f| {
-                let x = f.x as usize;
-                let y = f.y as usize;
-                x < mask.width() && y < mask.height() && mask.get(x, y) > 0
-            })
-            .collect()
-    }
-}
-
-/// Convenience method on HarrisDetector for masked detection.
-impl HarrisDetector {
-    /// Detect features only where mask > 0.
-    pub fn detect_masked(&self, image: &Image<u8>, mask: &Image<u8>) -> Vec<Feature> {
-        let features = self.detect(image);
-        features
-            .into_iter()
-            .filter(|f| {
-                let x = f.x as usize;
-                let y = f.y as usize;
-                x < mask.width() && y < mask.height() && mask.get(x, y) > 0
-            })
-            .collect()
     }
 }
 

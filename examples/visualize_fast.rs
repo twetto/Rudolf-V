@@ -454,7 +454,7 @@ fn render_multilevel_fast(pyr: &Pyramid) -> String {
             u8_img.set(x, y, v.clamp(0.0, 255.0).round() as u8);
         }
 
-        let features = det.detect_at_level(&u8_img, lvl);
+        let features = det.detect(&u8_img);
         let color = colors[lvl % colors.len()];
 
         writeln!(svg, "<g transform=\"translate({}, 40)\">", x_off).unwrap();
