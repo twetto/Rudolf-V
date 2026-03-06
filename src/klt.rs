@@ -21,6 +21,9 @@
 // - Two-phase iteration (extract → accumulate over contiguous buffers)
 // - Hoisted scratch buffers (zero per-feature allocation)
 // - AVX2+FMA SIMD for accumulation loops (runtime-detected)
+// - RAYON PARALLELISM: feature loop is embarrassingly parallel —
+//   each feature tracked independently. map_init creates one KltScratch
+//   per worker thread, reused across all features on that thread.
 //
 // SIMD STRATEGY:
 // We use std::arch intrinsics with #[target_feature(enable = "avx2,fma")]
@@ -38,6 +41,9 @@
 use crate::fast::Feature;
 use crate::image::{interpolate_bilinear, interpolate_bilinear_unchecked, Image};
 use crate::pyramid::Pyramid;
+
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -180,15 +186,48 @@ impl KltTracker {
             .min(curr_pyramid.num_levels());
 
         let side = 2 * self.window_size + 1;
-        scratch.ensure_size(side * side);
+        let patch_size = side * side;
 
-        results.clear();
-        results.reserve(features.len());
+        // ── Parallel path (feature-gated) ───────────────────────────────
+        // Each feature is independent. map_init creates one KltScratch per
+        // rayon worker thread (not per feature), reusing it across all
+        // features assigned to that thread. For 200 features on 8 cores,
+        // that's ~25 features per thread at ~5µs each = ~125µs per thread.
+        #[cfg(feature = "parallel")]
+        {
+            results.clear();
+            let par_results: Vec<TrackedFeature> = features
+                .par_iter()
+                .map_init(
+                    || {
+                        let mut s = KltScratch::new(self.window_size);
+                        s.ensure_size(patch_size);
+                        s
+                    },
+                    |thread_scratch, feat| {
+                        self.track_single(
+                            prev_pyramid, curr_pyramid, feat, num_levels, thread_scratch,
+                        )
+                    },
+                )
+                .collect();
+            *results = par_results;
+            return;
+        }
 
-        for feat in features {
-            results.push(self.track_single(
-                prev_pyramid, curr_pyramid, feat, num_levels, scratch,
-            ));
+        // ── Sequential path ─────────────────────────────────────────────
+        #[cfg(not(feature = "parallel"))]
+        {
+            scratch.ensure_size(patch_size);
+
+            results.clear();
+            results.reserve(features.len());
+
+            for feat in features {
+                results.push(self.track_single(
+                    prev_pyramid, curr_pyramid, feat, num_levels, scratch,
+                ));
+            }
         }
     }
 
