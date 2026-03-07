@@ -62,6 +62,11 @@ pub enum TrackStatus {
 pub enum LkMethod {
     ForwardAdditive,
     InverseCompositional,
+    /// Inverse compositional with fixed-point (i16) arithmetic.
+    /// Uses integer bilinear interpolation and i16 buffers, enabling
+    /// _mm256_madd_epi16 (16 elements/cycle) vs _mm256_fmadd_ps (8/cycle).
+    /// Also 2× less memory bandwidth for scratch buffers (i16 vs f32).
+    InverseCompositionalFixed,
 }
 
 /// A feature with its tracking status after a track() call.
@@ -108,6 +113,97 @@ impl KltScratch {
 // ---------------------------------------------------------------------------
 // Tracker
 // ---------------------------------------------------------------------------
+
+/// Pre-allocated scratch buffers for fixed-point KLT tracking.
+///
+/// Same role as KltScratch but with i16 buffers for 2× SIMD throughput.
+///
+/// FIXED-POINT MATH:
+///
+/// The key insight (OpenCV's approach): keep pixel values and gradients in
+/// i16, use _mm256_madd_epi16 to accumulate i16 × i16 → i32 at 16
+/// elements/cycle (vs f32 FMA at 8/cycle). The 2×2 Hessian inversion is
+/// still done in f32 (trivial, once per feature per level).
+///
+/// BILINEAR INTERPOLATION — INTEGER WEIGHTS:
+///
+///   W_BITS = 5, so fractional coordinates are scaled by 1 << W_BITS = 32.
+///   The four bilinear weights are products of two 5-bit fractions:
+///     iw00 = (32 - ifx) * (32 - ify)   // max 32*32 = 1024
+///     iw10 = ifx * (32 - ify)
+///     iw01 = (32 - ifx) * ify
+///     iw11 = ifx * ify
+///   Sum of weights = 1024 always.
+///
+///   Interpolated value:
+///     val = (iw00*p00 + iw10*p10 + iw01*p01 + iw11*p11 + 512) >> 10
+///   where p00..p11 are u8 pixels (0..255).
+///   Max numerator: 255 * 1024 = 261120 → fits u32 (and i32).
+///   After >> 10: 0..255 → store as i16.
+///
+/// GRADIENTS — INTEGER CENTRAL DIFFERENCE:
+///
+///   gx = interpolate(x+1, y) - interpolate(x-1, y)
+///   No 0.5 factor needed — absorbed into the Hessian inverse.
+///   Range: -255..255 → fits i16.
+///
+/// HESSIAN ACCUMULATION:
+///
+///   h00 = Σ gx[i] * gx[i]   (i32 via madd_epi16)
+///   h01 = Σ gx[i] * gy[i]
+///   h11 = Σ gy[i] * gy[i]
+///   Max per element: 255² = 65025. Times 529 elements = 34.4M. Fits i32.
+///   Invert in f32 (2×2 matrix, done once).
+///
+/// IC ITERATION ACCUMULATION:
+///
+///   e[i]  = t[i] - w[i]        (i16, range -255..255)
+///   b0    = Σ gx[i] * e[i]     (i32 via madd_epi16)
+///   b1    = Σ gy[i] * e[i]
+///   Max per element: 255 * 255 = 65025. Times 529 = 34.4M. Fits i32.
+///
+///   delta = H^{-1} * b  (f32, trivial 2×2)
+///
+/// NEON MAPPING (ARM, RPi 4):
+///   madd_epi16 → vmull_s16 + vmlal_s16 (widening multiply-accumulate)
+///   Same throughput benefit: i16 × i16 → i32 at full NEON width.
+pub struct KltScratchFixed {
+    t_buf: Vec<i16>,
+    gx_buf: Vec<i16>,
+    gy_buf: Vec<i16>,
+    warped_buf: Vec<i16>,
+}
+
+impl KltScratchFixed {
+    pub fn new(window_size: usize) -> Self {
+        let patch_size = (2 * window_size + 1) * (2 * window_size + 1);
+        KltScratchFixed {
+            t_buf: vec![0; patch_size],
+            gx_buf: vec![0; patch_size],
+            gy_buf: vec![0; patch_size],
+            warped_buf: vec![0; patch_size],
+        }
+    }
+
+    #[inline]
+    fn ensure_size(&mut self, patch_size: usize) {
+        if self.t_buf.len() < patch_size {
+            self.t_buf.resize(patch_size, 0);
+            self.gx_buf.resize(patch_size, 0);
+            self.gy_buf.resize(patch_size, 0);
+            self.warped_buf.resize(patch_size, 0);
+        }
+    }
+}
+
+/// Fixed-point bilinear interpolation precision.
+const W_BITS: u32 = 5;
+/// Scale factor for fractional coordinates: 1 << W_BITS = 32.
+const W_SCALE: i32 = 1 << W_BITS;          // 32
+/// Total weight for 2D bilinear: W_SCALE² = 1024.
+const W_SCALE_SQ: i32 = W_SCALE * W_SCALE; // 1024
+/// Rounding bias for >> 10: W_SCALE_SQ / 2 = 512.
+const W_ROUND: i32 = W_SCALE_SQ / 2;       // 512
 
 /// Pyramidal KLT optical flow tracker.
 pub struct KltTracker {
@@ -189,10 +285,6 @@ impl KltTracker {
         let patch_size = side * side;
 
         // ── Parallel path (feature-gated) ───────────────────────────────
-        // Each feature is independent. map_init creates one KltScratch per
-        // rayon worker thread (not per feature), reusing it across all
-        // features assigned to that thread. For 200 features on 8 cores,
-        // that's ~25 features per thread at ~5µs each = ~125µs per thread.
         #[cfg(feature = "parallel")]
         {
             results.clear();
@@ -202,11 +294,14 @@ impl KltTracker {
                     || {
                         let mut s = KltScratch::new(self.window_size);
                         s.ensure_size(patch_size);
-                        s
+                        let mut sf = KltScratchFixed::new(self.window_size);
+                        sf.ensure_size(patch_size);
+                        (s, sf)
                     },
-                    |thread_scratch, feat| {
+                    |(thread_scratch, thread_scratch_fixed), feat| {
                         self.track_single(
-                            prev_pyramid, curr_pyramid, feat, num_levels, thread_scratch,
+                            prev_pyramid, curr_pyramid, feat, num_levels,
+                            thread_scratch, thread_scratch_fixed,
                         )
                     },
                 )
@@ -219,13 +314,16 @@ impl KltTracker {
         #[cfg(not(feature = "parallel"))]
         {
             scratch.ensure_size(patch_size);
+            let mut scratch_fixed = KltScratchFixed::new(self.window_size);
+            scratch_fixed.ensure_size(patch_size);
 
             results.clear();
             results.reserve(features.len());
 
             for feat in features {
                 results.push(self.track_single(
-                    prev_pyramid, curr_pyramid, feat, num_levels, scratch,
+                    prev_pyramid, curr_pyramid, feat, num_levels,
+                    scratch, &mut scratch_fixed,
                 ));
             }
         }
@@ -239,6 +337,7 @@ impl KltTracker {
         feature: &Feature,
         num_levels: usize,
         scratch: &mut KltScratch,
+        scratch_fixed: &mut KltScratchFixed,
     ) -> TrackedFeature {
         let mut dx = 0.0f32;
         let mut dy = 0.0f32;
@@ -257,6 +356,9 @@ impl KltTracker {
                 }
                 LkMethod::InverseCompositional => {
                     self.lk_inverse_compositional(prev_img, curr_img, feat_x, feat_y, dx, dy, scratch)
+                }
+                LkMethod::InverseCompositionalFixed => {
+                    self.lk_ic_fixed(prev_img, curr_img, feat_x, feat_y, dx, dy, scratch_fixed)
                 }
             };
 
@@ -621,6 +723,229 @@ impl KltTracker {
 
         LkResult::MaxIter(dx, dy)
     }
+
+    // =====================================================================
+    // Inverse compositional — FIXED-POINT (i16 arithmetic)
+    // =====================================================================
+
+    /// Fixed-point inverse-compositional Lucas-Kanade at a single level.
+    ///
+    /// Same algorithm as lk_inverse_compositional, but all patch data is
+    /// stored as i16 and accumulated via integer multiply-add:
+    ///
+    ///   _mm256_madd_epi16: 16 × (i16 × i16 → i32) per cycle   (AVX2)
+    ///   vmull_s16/vmlal_s16: 4-8 × (i16 × i16 → i32)          (NEON)
+    ///
+    /// vs the f32 path's _mm256_fmadd_ps: 8 × (f32 × f32 → f32).
+    ///
+    /// The 2×2 Hessian inversion is still f32 (done once, trivial cost).
+    ///
+    /// IMPLEMENTATION STATUS: Skeleton with scalar i16 arithmetic.
+    /// SIMD (_mm256_madd_epi16 / NEON vmlal_s16) is a future follow-up.
+    fn lk_ic_fixed(
+        &self,
+        prev_img: &Image<f32>,
+        curr_img: &Image<f32>,
+        feat_x: f32,
+        feat_y: f32,
+        mut dx: f32,
+        mut dy: f32,
+        scratch: &mut KltScratchFixed,
+    ) -> LkResult {
+        let half = self.window_size as isize;
+        let side = (2 * self.window_size + 1) as isize;
+        let patch_size = (side * side) as usize;
+
+        // =================================================================
+        // PRECOMPUTE: integer bilinear weights for template
+        // =================================================================
+
+        // Integer fractional offsets (5-bit precision).
+        let ifx = ((feat_x - feat_x.floor()) * W_SCALE as f32).round() as i32;
+        let ify = ((feat_y - feat_y.floor()) * W_SCALE as f32).round() as i32;
+        let iw00 = (W_SCALE - ifx) * (W_SCALE - ify);  // max 1024
+        let iw10 = ifx * (W_SCALE - ify);
+        let iw01 = (W_SCALE - ifx) * ify;
+        let iw11 = ifx * ify;
+
+        let base_x_i = feat_x.floor() as isize - half;
+        let base_y_i = feat_y.floor() as isize - half;
+
+        // Gradient margin: gx needs columns ±1, gy needs rows ±1.
+        let tmpl_in_bounds = base_x_i >= 1
+            && base_y_i >= 1
+            && base_x_i + side + 2 <= prev_img.width() as isize
+            && base_y_i + side + 2 <= prev_img.height() as isize;
+
+        let t_buf = &mut scratch.t_buf[..patch_size];
+        let gx_buf = &mut scratch.gx_buf[..patch_size];
+        let gy_buf = &mut scratch.gy_buf[..patch_size];
+
+        // =================================================================
+        // Fill template + gradient buffers in i16
+        // =================================================================
+
+        if tmpl_in_bounds {
+            let base_x = base_x_i as usize;
+            let base_y = base_y_i as usize;
+
+            let mut idx = 0;
+            for ly in 0..side as usize {
+                let iy = base_y + ly;
+                unsafe {
+                    // Four rows for template + gradient neighborhoods.
+                    let r_m1 = prev_img.row_ptr(iy - 1);
+                    let r_0  = prev_img.row_ptr(iy);
+                    let r_1  = prev_img.row_ptr(iy + 1);
+                    let r_p2 = prev_img.row_ptr(iy + 2);
+
+                    for lx in 0..side as usize {
+                        let ix = base_x + lx;
+
+                        // Integer bilinear: read f32 pixels, convert to u8-scale i32,
+                        // apply integer weights, round, and store as i16.
+                        let t_val = bilerp_fixed(r_0, r_1, ix, iw00, iw10, iw01, iw11);
+
+                        // Gradient gx: central difference (no 0.5 factor — absorbed
+                        // into the Hessian inverse since it cancels out).
+                        let gx = bilerp_fixed(r_0, r_1, ix + 1, iw00, iw10, iw01, iw11)
+                               - bilerp_fixed(r_0, r_1, ix - 1, iw00, iw10, iw01, iw11);
+
+                        // Gradient gy: central difference in y.
+                        let gy = bilerp_fixed(r_1, r_p2, ix, iw00, iw10, iw01, iw11)
+                               - bilerp_fixed(r_m1, r_0, ix, iw00, iw10, iw01, iw11);
+
+                        t_buf[idx] = t_val;
+                        gx_buf[idx] = gx;
+                        gy_buf[idx] = gy;
+
+                        idx += 1;
+                    }
+                }
+            }
+        } else {
+            // Border fallback: use f32 bilinear, quantize to i16.
+            let mut idx = 0;
+            for py in -half..=half {
+                for px in -half..=half {
+                    let tx = feat_x + px as f32;
+                    let ty = feat_y + py as f32;
+
+                    let t_val = interpolate_bilinear(prev_img, tx, ty).round() as i16;
+                    let gx = (interpolate_bilinear(prev_img, tx + 1.0, ty)
+                            - interpolate_bilinear(prev_img, tx - 1.0, ty)).round() as i16;
+                    let gy = (interpolate_bilinear(prev_img, tx, ty + 1.0)
+                            - interpolate_bilinear(prev_img, tx, ty - 1.0)).round() as i16;
+
+                    t_buf[idx] = t_val;
+                    gx_buf[idx] = gx;
+                    gy_buf[idx] = gy;
+
+                    idx += 1;
+                }
+            }
+        }
+
+        // =================================================================
+        // Hessian: i32 accumulation, f32 inversion
+        // =================================================================
+
+        let (h00, h01, h11) = accumulate_hessian_fixed(gx_buf, gy_buf);
+
+        // Convert to f32 for 2×2 inversion (trivial cost).
+        // The gradient factor of 0.5 was omitted above, so the Hessian
+        // is 4× larger than the f32 path. The inverse absorbs this.
+        let h00f = h00 as f32;
+        let h01f = h01 as f32;
+        let h11f = h11 as f32;
+        let det = h00f * h11f - h01f * h01f;
+        if det.abs() < 1.0 {
+            // Scaled threshold: f32 path uses 1e-6, but our values are
+            // ~4× larger per element. 1.0 is conservative.
+            return LkResult::Singular;
+        }
+        let inv_det = 1.0 / det;
+        let ih00 =  inv_det * h11f;
+        let ih01 = -inv_det * h01f;
+        let ih11 =  inv_det * h00f;
+
+        // =================================================================
+        // ITERATE: extract warped pixels (i16), accumulate b (i32)
+        // =================================================================
+
+        let warped_buf = &mut scratch.warped_buf[..patch_size];
+        let side_u = side as usize;
+
+        for _iter in 0..self.max_iterations {
+            // ── Phase 1: extract warped pixels as i16 ──
+            let wx = feat_x + dx;
+            let wy = feat_y + dy;
+
+            let ifx_w = ((wx - wx.floor()) * W_SCALE as f32).round() as i32;
+            let ify_w = ((wy - wy.floor()) * W_SCALE as f32).round() as i32;
+            let iww00 = (W_SCALE - ifx_w) * (W_SCALE - ify_w);
+            let iww10 = ifx_w * (W_SCALE - ify_w);
+            let iww01 = (W_SCALE - ifx_w) * ify_w;
+            let iww11 = ifx_w * ify_w;
+
+            let bx_i = wx.floor() as isize - half;
+            let by_i = wy.floor() as isize - half;
+
+            let warp_in_bounds = bx_i >= 0
+                && by_i >= 0
+                && bx_i + side + 1 <= curr_img.width() as isize
+                && by_i + side + 1 <= curr_img.height() as isize;
+
+            if warp_in_bounds {
+                let bx = bx_i as usize;
+                let by = by_i as usize;
+
+                let mut idx = 0;
+                for ly in 0..side_u {
+                    unsafe {
+                        let r0 = curr_img.row_ptr(by + ly);
+                        let r1 = curr_img.row_ptr(by + ly + 1);
+
+                        for lx in 0..side_u {
+                            warped_buf[idx] = bilerp_fixed(
+                                r0, r1, bx + lx, iww00, iww10, iww01, iww11,
+                            );
+                            idx += 1;
+                        }
+                    }
+                }
+            } else {
+                let mut idx = 0;
+                for py in -half..=half {
+                    for px in -half..=half {
+                        warped_buf[idx] = interpolate_bilinear(
+                            curr_img, wx + px as f32, wy + py as f32,
+                        ).round() as i16;
+                        idx += 1;
+                    }
+                }
+            }
+
+            // ── Phase 2: accumulate b = J^T * error (i16 × i16 → i32) ──
+            // Ready for _mm256_madd_epi16 / NEON vmlal_s16.
+            let (b0, b1) = accumulate_ic_fixed(t_buf, warped_buf, gx_buf, gy_buf);
+
+            // Solve in f32 (2×2, trivial).
+            let b0f = b0 as f32;
+            let b1f = b1 as f32;
+            let delta_x = ih00 * b0f + ih01 * b1f;
+            let delta_y = ih01 * b0f + ih11 * b1f;
+
+            dx += delta_x;
+            dy += delta_y;
+
+            if delta_x * delta_x + delta_y * delta_y < self.epsilon * self.epsilon {
+                return LkResult::Converged(dx, dy);
+            }
+        }
+
+        LkResult::MaxIter(dx, dy)
+    }
 }
 
 // ==========================================================================
@@ -925,6 +1250,94 @@ unsafe fn extract_warped_row_avx2(
         let ix = bx + lx;
         *out.get_unchecked_mut(lx) = bilerp_ptr(r0, r1, ix, w00, w10, w01, w11);
     }
+}
+
+// ==========================================================================
+// Fixed-point helpers
+// ==========================================================================
+
+/// Integer bilinear interpolation from two f32 row pointers.
+///
+/// Reads f32 pixels, converts to i32 (truncating — OK for u8-range values),
+/// applies integer weights (sum = 1024), rounds, and returns i16.
+///
+/// Result range: 0..255 for pixel values, -255..255 for gradient diffs.
+///
+/// # Safety
+/// Caller must ensure `ix + 1` is a valid offset from both `r0` and `r1`.
+#[inline(always)]
+unsafe fn bilerp_fixed(
+    r0: *const f32, r1: *const f32,
+    ix: usize,
+    iw00: i32, iw10: i32, iw01: i32, iw11: i32,
+) -> i16 {
+    let p00 = *r0.add(ix) as i32;
+    let p10 = *r0.add(ix + 1) as i32;
+    let p01 = *r1.add(ix) as i32;
+    let p11 = *r1.add(ix + 1) as i32;
+
+    ((iw00 * p00 + iw10 * p10 + iw01 * p01 + iw11 * p11 + W_ROUND) >> 10) as i16
+}
+
+/// Fixed-point IC accumulation: b0 = Σ gx·(t-w), b1 = Σ gy·(t-w).
+///
+/// All inputs are i16, accumulates in i32.
+/// Ready for _mm256_madd_epi16 (AVX2) or vmlal_s16 (NEON) replacement.
+#[inline]
+fn accumulate_ic_fixed(t: &[i16], w: &[i16], gx: &[i16], gy: &[i16]) -> (i32, i32) {
+    // TODO: Add AVX2 dispatch with _mm256_madd_epi16 for 16 elements/cycle.
+    // TODO: Add NEON dispatch with vmull_s16/vmlal_s16 for RPi 4.
+    accumulate_ic_fixed_scalar(t, w, gx, gy)
+}
+
+/// Fixed-point Hessian accumulation: h00 = Σ gx², h01 = Σ gx·gy, h11 = Σ gy².
+#[inline]
+fn accumulate_hessian_fixed(gx: &[i16], gy: &[i16]) -> (i32, i32, i32) {
+    // TODO: Add AVX2/NEON dispatch.
+    accumulate_hessian_fixed_scalar(gx, gy)
+}
+
+/// Scalar fixed-point IC accumulation.
+#[inline]
+fn accumulate_ic_fixed_scalar(t: &[i16], w: &[i16], gx: &[i16], gy: &[i16]) -> (i32, i32) {
+    debug_assert_eq!(t.len(), w.len());
+    debug_assert_eq!(t.len(), gx.len());
+    debug_assert_eq!(t.len(), gy.len());
+
+    let mut b0 = 0i32;
+    let mut b1 = 0i32;
+
+    for i in 0..t.len() {
+        unsafe {
+            let e = *t.get_unchecked(i) as i32 - *w.get_unchecked(i) as i32;
+            b0 += *gx.get_unchecked(i) as i32 * e;
+            b1 += *gy.get_unchecked(i) as i32 * e;
+        }
+    }
+
+    (b0, b1)
+}
+
+/// Scalar fixed-point Hessian accumulation.
+#[inline]
+fn accumulate_hessian_fixed_scalar(gx: &[i16], gy: &[i16]) -> (i32, i32, i32) {
+    debug_assert_eq!(gx.len(), gy.len());
+
+    let mut h00 = 0i32;
+    let mut h01 = 0i32;
+    let mut h11 = 0i32;
+
+    for i in 0..gx.len() {
+        unsafe {
+            let gxi = *gx.get_unchecked(i) as i32;
+            let gyi = *gy.get_unchecked(i) as i32;
+            h00 += gxi * gxi;
+            h01 += gxi * gyi;
+            h11 += gyi * gyi;
+        }
+    }
+
+    (h00, h01, h11)
 }
 
 // ==========================================================================
@@ -1329,5 +1742,143 @@ mod tests {
 
         assert!((b0 - expected_b0).abs() < 1e-3, "odd len b0: {b0} vs {expected_b0}");
         assert!((b1 - expected_b1).abs() < 1e-3, "odd len b1: {b1} vs {expected_b1}");
+    }
+
+    // ===== Fixed-point IC tests =====
+
+    fn make_fixed_tracker(window_size: usize, max_levels: usize) -> KltTracker {
+        KltTracker::with_method(window_size, 30, 0.01, max_levels, LkMethod::InverseCompositionalFixed)
+    }
+
+    #[test]
+    fn test_fixed_zero_motion() {
+        let img = make_test_image(120, 120, 40, 40, 30);
+        let pyr = Pyramid::build(&img, 3, 1.0);
+
+        let tracker = make_fixed_tracker(5, 3);
+        let features = vec![Feature {
+            x: 41.0, y: 41.0, score: 100.0, level: 0, id: 1,
+        }];
+
+        let results = tracker.track(&pyr, &pyr, &features);
+        assert_eq!(results[0].status, TrackStatus::Tracked);
+
+        let dx = results[0].feature.x - 41.0;
+        let dy = results[0].feature.y - 41.0;
+        assert!(
+            dx.abs() < 0.5 && dy.abs() < 0.5,
+            "fixed zero motion: ({dx}, {dy}) should be near zero"
+        );
+    }
+
+    #[test]
+    fn test_fixed_horizontal_shift() {
+        let img1 = make_test_image(120, 120, 40, 40, 30);
+        let img2 = make_test_image(120, 120, 43, 40, 30);
+
+        let pyr1 = Pyramid::build(&img1, 3, 1.0);
+        let pyr2 = Pyramid::build(&img2, 3, 1.0);
+
+        let tracker = make_fixed_tracker(7, 3);
+        let features = vec![Feature {
+            x: 41.0, y: 41.0, score: 100.0, level: 0, id: 1,
+        }];
+
+        let results = tracker.track(&pyr1, &pyr2, &features);
+        assert_eq!(results[0].status, TrackStatus::Tracked);
+
+        let dx = results[0].feature.x - 41.0;
+        let dy = results[0].feature.y - 41.0;
+        assert!((dx - 3.0).abs() < 1.5, "fixed horizontal: dx = {dx}, expected ~3.0");
+        assert!(dy.abs() < 1.5, "fixed horizontal: dy = {dy}, expected ~0.0");
+    }
+
+    #[test]
+    fn test_fixed_diagonal_shift() {
+        let img1 = make_test_image(120, 120, 40, 40, 30);
+        let img2 = make_test_image(120, 120, 42, 42, 30);
+
+        let pyr1 = Pyramid::build(&img1, 3, 1.0);
+        let pyr2 = Pyramid::build(&img2, 3, 1.0);
+
+        let tracker = make_fixed_tracker(7, 3);
+        let features = vec![Feature {
+            x: 41.0, y: 41.0, score: 100.0, level: 0, id: 1,
+        }];
+
+        let results = tracker.track(&pyr1, &pyr2, &features);
+        assert_eq!(results[0].status, TrackStatus::Tracked);
+
+        let dx = results[0].feature.x - 41.0;
+        let dy = results[0].feature.y - 41.0;
+        assert!((dx - 2.0).abs() < 1.5, "fixed diagonal: dx = {dx}, expected ~2.0");
+        assert!((dy - 2.0).abs() < 1.5, "fixed diagonal: dy = {dy}, expected ~2.0");
+    }
+
+    #[test]
+    fn test_fixed_flat_region() {
+        let img = Image::from_vec(60, 60, vec![128u8; 3600]);
+        let pyr = Pyramid::build(&img, 3, 1.0);
+
+        let tracker = make_fixed_tracker(5, 3);
+        let features = vec![Feature {
+            x: 30.0, y: 30.0, score: 50.0, level: 0, id: 1,
+        }];
+
+        let results = tracker.track(&pyr, &pyr, &features);
+        assert_eq!(results[0].status, TrackStatus::Lost);
+    }
+
+    #[test]
+    fn test_fixed_and_float_agree() {
+        // Both paths should recover approximately the same displacement.
+        let img1 = make_test_image(120, 120, 40, 40, 30);
+        let img2 = make_test_image(120, 120, 43, 42, 30);
+
+        let pyr1 = Pyramid::build(&img1, 3, 1.0);
+        let pyr2 = Pyramid::build(&img2, 3, 1.0);
+
+        let features = vec![Feature {
+            x: 41.0, y: 41.0, score: 100.0, level: 0, id: 1,
+        }];
+
+        let ic_tracker = make_ic_tracker(7, 3);
+        let fixed_tracker = make_fixed_tracker(7, 3);
+
+        let ic_results = ic_tracker.track(&pyr1, &pyr2, &features);
+        let fixed_results = fixed_tracker.track(&pyr1, &pyr2, &features);
+
+        assert_eq!(ic_results[0].status, TrackStatus::Tracked);
+        assert_eq!(fixed_results[0].status, TrackStatus::Tracked);
+
+        let ic_dx = ic_results[0].feature.x - 41.0;
+        let ic_dy = ic_results[0].feature.y - 41.0;
+        let fx_dx = fixed_results[0].feature.x - 41.0;
+        let fx_dy = fixed_results[0].feature.y - 41.0;
+
+        // Should agree within ~1 pixel (integer rounding differs from f32).
+        assert!(
+            (ic_dx - fx_dx).abs() < 1.5,
+            "IC vs Fixed dx: {ic_dx:.2} vs {fx_dx:.2}"
+        );
+        assert!(
+            (ic_dy - fx_dy).abs() < 1.5,
+            "IC vs Fixed dy: {ic_dy:.2} vs {fx_dy:.2}"
+        );
+    }
+
+    #[test]
+    fn test_fixed_accumulate_matches_scalar() {
+        let n = 529;
+        let t: Vec<i16> = (0..n).map(|i| (i % 256) as i16).collect();
+        let w: Vec<i16> = (0..n).map(|i| ((i + 1) % 256) as i16).collect();
+        let gx: Vec<i16> = (0..n).map(|i| ((i * 7) as f32).sin() as i16).collect();
+        let gy: Vec<i16> = (0..n).map(|i| ((i * 13) as f32).cos() as i16).collect();
+
+        let (b0, b1) = accumulate_ic_fixed_scalar(&t, &w, &gx, &gy);
+        let (d_b0, d_b1) = accumulate_ic_fixed(&t, &w, &gx, &gy);
+
+        assert_eq!(b0, d_b0, "fixed accumulate b0 mismatch");
+        assert_eq!(b1, d_b1, "fixed accumulate b1 mismatch");
     }
 }
