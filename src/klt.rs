@@ -358,7 +358,16 @@ impl KltTracker {
                     self.lk_inverse_compositional(prev_img, curr_img, feat_x, feat_y, dx, dy, scratch)
                 }
                 LkMethod::InverseCompositionalFixed => {
-                    self.lk_ic_fixed(prev_img, curr_img, feat_x, feat_y, dx, dy, scratch_fixed)
+                    // Use direct u8 path when pyramid has u8 levels (build_reuse).
+                    if prev_pyr.has_u8_levels() && curr_pyr.has_u8_levels() {
+                        self.lk_ic_fixed_u8(
+                            prev_pyr.u8_level(level),
+                            curr_pyr.u8_level(level),
+                            feat_x, feat_y, dx, dy, scratch_fixed,
+                        )
+                    } else {
+                        self.lk_ic_fixed(prev_img, curr_img, feat_x, feat_y, dx, dy, scratch_fixed)
+                    }
                 }
             };
 
@@ -946,6 +955,191 @@ impl KltTracker {
 
         LkResult::MaxIter(dx, dy)
     }
+
+    // =====================================================================
+    // Inverse compositional — FIXED-POINT with direct u8 pyramid access
+    // =====================================================================
+
+    /// Fixed-point IC Lucas-Kanade reading directly from u8 pyramid images.
+    ///
+    /// Same algorithm as `lk_ic_fixed`, but reads u8 pixels via `row_ptr()`:
+    /// - Bilinear reads: 1 byte/sample vs 4 bytes/sample (4× less bandwidth)
+    /// - u8→i32 widening: pure integer ALU (no f32→i32 FPU cvttss2si)
+    /// - Combined with i16 SIMD accumulators: the full fixed-point pipeline
+    ///   avoids floating point entirely until the final 2×2 Hessian inversion.
+    fn lk_ic_fixed_u8(
+        &self,
+        prev_img: &Image<u8>,
+        curr_img: &Image<u8>,
+        feat_x: f32,
+        feat_y: f32,
+        mut dx: f32,
+        mut dy: f32,
+        scratch: &mut KltScratchFixed,
+    ) -> LkResult {
+        let half = self.window_size as isize;
+        let side = (2 * self.window_size + 1) as isize;
+        let patch_size = (side * side) as usize;
+
+        // Integer fractional offsets (5-bit precision).
+        let ifx = ((feat_x - feat_x.floor()) * W_SCALE as f32).round() as i32;
+        let ify = ((feat_y - feat_y.floor()) * W_SCALE as f32).round() as i32;
+        let iw00 = (W_SCALE - ifx) * (W_SCALE - ify);
+        let iw10 = ifx * (W_SCALE - ify);
+        let iw01 = (W_SCALE - ifx) * ify;
+        let iw11 = ifx * ify;
+
+        let base_x_i = feat_x.floor() as isize - half;
+        let base_y_i = feat_y.floor() as isize - half;
+
+        let tmpl_in_bounds = base_x_i >= 1
+            && base_y_i >= 1
+            && base_x_i + side + 2 <= prev_img.width() as isize
+            && base_y_i + side + 2 <= prev_img.height() as isize;
+
+        let t_buf = &mut scratch.t_buf[..patch_size];
+        let gx_buf = &mut scratch.gx_buf[..patch_size];
+        let gy_buf = &mut scratch.gy_buf[..patch_size];
+
+        if tmpl_in_bounds {
+            let base_x = base_x_i as usize;
+            let base_y = base_y_i as usize;
+
+            let mut idx = 0;
+            for ly in 0..side as usize {
+                let iy = base_y + ly;
+                unsafe {
+                    // row_ptr() gives us *const u8 — same pattern as the f32 path.
+                    let r_m1 = prev_img.row_ptr(iy - 1);
+                    let r_0  = prev_img.row_ptr(iy);
+                    let r_1  = prev_img.row_ptr(iy + 1);
+                    let r_p2 = prev_img.row_ptr(iy + 2);
+
+                    for lx in 0..side as usize {
+                        let ix = base_x + lx;
+
+                        let t_val = bilerp_fixed_u8(r_0, r_1, ix, iw00, iw10, iw01, iw11);
+                        let gx = bilerp_fixed_u8(r_0, r_1, ix + 1, iw00, iw10, iw01, iw11)
+                               - bilerp_fixed_u8(r_0, r_1, ix - 1, iw00, iw10, iw01, iw11);
+                        let gy = bilerp_fixed_u8(r_1, r_p2, ix, iw00, iw10, iw01, iw11)
+                               - bilerp_fixed_u8(r_m1, r_0, ix, iw00, iw10, iw01, iw11);
+
+                        t_buf[idx] = t_val;
+                        gx_buf[idx] = gx;
+                        gy_buf[idx] = gy;
+                        idx += 1;
+                    }
+                }
+            }
+        } else {
+            // Border fallback: clamped bilinear from u8 Image.
+            let mut idx = 0;
+            for py in -half..=half {
+                for px in -half..=half {
+                    let tx = feat_x + px as f32;
+                    let ty = feat_y + py as f32;
+
+                    let t_val = bilerp_clamped_u8(prev_img, tx, ty);
+                    let gx = bilerp_clamped_u8(prev_img, tx + 1.0, ty)
+                           - bilerp_clamped_u8(prev_img, tx - 1.0, ty);
+                    let gy = bilerp_clamped_u8(prev_img, tx, ty + 1.0)
+                           - bilerp_clamped_u8(prev_img, tx, ty - 1.0);
+
+                    t_buf[idx] = t_val;
+                    gx_buf[idx] = gx;
+                    gy_buf[idx] = gy;
+                    idx += 1;
+                }
+            }
+        }
+
+        // Hessian (i32 via SIMD madd_epi16 / vmlal_s16).
+        let (h00, h01, h11) = accumulate_hessian_fixed(gx_buf, gy_buf);
+
+        let h00f = h00 as f32;
+        let h01f = h01 as f32;
+        let h11f = h11 as f32;
+        let det = h00f * h11f - h01f * h01f;
+        if det.abs() < 1.0 {
+            return LkResult::Singular;
+        }
+        let inv_det = 1.0 / det;
+        let ih00 =  inv_det * h11f;
+        let ih01 = -inv_det * h01f;
+        let ih11 =  inv_det * h00f;
+
+        // Iterate.
+        let warped_buf = &mut scratch.warped_buf[..patch_size];
+        let side_u = side as usize;
+
+        for _iter in 0..self.max_iterations {
+            let wx = feat_x + dx;
+            let wy = feat_y + dy;
+
+            let ifx_w = ((wx - wx.floor()) * W_SCALE as f32).round() as i32;
+            let ify_w = ((wy - wy.floor()) * W_SCALE as f32).round() as i32;
+            let iww00 = (W_SCALE - ifx_w) * (W_SCALE - ify_w);
+            let iww10 = ifx_w * (W_SCALE - ify_w);
+            let iww01 = (W_SCALE - ifx_w) * ify_w;
+            let iww11 = ifx_w * ify_w;
+
+            let bx_i = wx.floor() as isize - half;
+            let by_i = wy.floor() as isize - half;
+
+            let warp_in_bounds = bx_i >= 0
+                && by_i >= 0
+                && bx_i + side + 1 <= curr_img.width() as isize
+                && by_i + side + 1 <= curr_img.height() as isize;
+
+            if warp_in_bounds {
+                let bx = bx_i as usize;
+                let by = by_i as usize;
+
+                let mut idx = 0;
+                for ly in 0..side_u {
+                    unsafe {
+                        let r0 = curr_img.row_ptr(by + ly);
+                        let r1 = curr_img.row_ptr(by + ly + 1);
+
+                        extract_warped_row_fixed_u8(
+                            r0, r1, bx, side_u,
+                            iww00, iww10, iww01, iww11,
+                            &mut warped_buf[idx..idx + side_u],
+                        );
+                    }
+                    idx += side_u;
+                }
+            } else {
+                let mut idx = 0;
+                for py in -half..=half {
+                    for px in -half..=half {
+                        warped_buf[idx] = bilerp_clamped_u8(
+                            curr_img,
+                            wx + px as f32, wy + py as f32,
+                        );
+                        idx += 1;
+                    }
+                }
+            }
+
+            // Accumulate b = J^T * error (i16 × i16 → i32, SIMD).
+            let (b0, b1) = accumulate_ic_fixed(t_buf, warped_buf, gx_buf, gy_buf);
+
+            let b0f = b0 as f32;
+            let b1f = b1 as f32;
+            let delta_x = ih00 * b0f + ih01 * b1f;
+            let delta_y = ih01 * b0f + ih11 * b1f;
+
+            dx += delta_x;
+            dy += delta_y;
+
+            if delta_x * delta_x + delta_y * delta_y < self.epsilon * self.epsilon {
+                return LkResult::Converged(dx, dy);
+            }
+        }
+
+        LkResult::MaxIter(dx, dy)
+    }
 }
 
 // ==========================================================================
@@ -1282,18 +1476,38 @@ unsafe fn bilerp_fixed(
 /// Fixed-point IC accumulation: b0 = Σ gx·(t-w), b1 = Σ gy·(t-w).
 ///
 /// All inputs are i16, accumulates in i32.
-/// Ready for _mm256_madd_epi16 (AVX2) or vmlal_s16 (NEON) replacement.
+/// AVX2: _mm256_madd_epi16 processes 16 i16 elements → 8 i32 per cycle.
+/// NEON: vmull_s16/vaddq_s32 processes 4 i16 → 4 i32 per instruction.
 #[inline]
 fn accumulate_ic_fixed(t: &[i16], w: &[i16], gx: &[i16], gy: &[i16]) -> (i32, i32) {
-    // TODO: Add AVX2 dispatch with _mm256_madd_epi16 for 16 elements/cycle.
-    // TODO: Add NEON dispatch with vmull_s16/vmlal_s16 for RPi 4.
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { accumulate_ic_fixed_avx2(t, w, gx, gy) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { accumulate_ic_fixed_neon(t, w, gx, gy) };
+    }
+    #[allow(unreachable_code)]
     accumulate_ic_fixed_scalar(t, w, gx, gy)
 }
 
 /// Fixed-point Hessian accumulation: h00 = Σ gx², h01 = Σ gx·gy, h11 = Σ gy².
 #[inline]
 fn accumulate_hessian_fixed(gx: &[i16], gy: &[i16]) -> (i32, i32, i32) {
-    // TODO: Add AVX2/NEON dispatch.
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { accumulate_hessian_fixed_avx2(gx, gy) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { accumulate_hessian_fixed_neon(gx, gy) };
+    }
+    #[allow(unreachable_code)]
     accumulate_hessian_fixed_scalar(gx, gy)
 }
 
@@ -1338,6 +1552,320 @@ fn accumulate_hessian_fixed_scalar(gx: &[i16], gy: &[i16]) -> (i32, i32, i32) {
     }
 
     (h00, h01, h11)
+}
+
+// ==========================================================================
+// AVX2 fixed-point implementations (_mm256_madd_epi16)
+//
+// _mm256_madd_epi16 multiplies 16 pairs of i16 values, producing 8 i32
+// sums of adjacent pairs:
+//   result[k] = a[2k]*b[2k] + a[2k+1]*b[2k+1]
+//
+// This gives 16 multiplies + 8 horizontal adds in a single instruction,
+// vs _mm256_fmadd_ps which does 8 multiplies + 8 adds.
+// Effective throughput: 2× the f32 FMA path for dot products.
+// ==========================================================================
+
+/// AVX2 fixed-point IC accumulation.
+///
+/// For 529 elements (23×23 patch): 33 full iterations (16 elements each)
+/// + 1-element scalar tail. Each iteration: 1 sub + 2 madd + 2 add = 5 ops.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn accumulate_ic_fixed_avx2(t: &[i16], w: &[i16], gx: &[i16], gy: &[i16]) -> (i32, i32) {
+    use std::arch::x86_64::*;
+
+    let n = t.len();
+    let chunks = n / 16;
+
+    let mut sum_b0 = _mm256_setzero_si256();
+    let mut sum_b1 = _mm256_setzero_si256();
+
+    let t_ptr = t.as_ptr();
+    let w_ptr = w.as_ptr();
+    let gx_ptr = gx.as_ptr();
+    let gy_ptr = gy.as_ptr();
+
+    for i in 0..chunks {
+        let off = i * 16;
+        // Load 16 i16 values each.
+        let vt = _mm256_loadu_si256(t_ptr.add(off) as *const __m256i);
+        let vw = _mm256_loadu_si256(w_ptr.add(off) as *const __m256i);
+        let ve = _mm256_sub_epi16(vt, vw);  // e = t - w (i16)
+
+        let vgx = _mm256_loadu_si256(gx_ptr.add(off) as *const __m256i);
+        let vgy = _mm256_loadu_si256(gy_ptr.add(off) as *const __m256i);
+
+        // madd: pairs of i16 × i16 → i32, then adjacent pairs summed.
+        // result[k] = gx[2k]*e[2k] + gx[2k+1]*e[2k+1]
+        sum_b0 = _mm256_add_epi32(sum_b0, _mm256_madd_epi16(vgx, ve));
+        sum_b1 = _mm256_add_epi32(sum_b1, _mm256_madd_epi16(vgy, ve));
+    }
+
+    // Horizontal sum of 8 i32 lanes.
+    let mut b0 = hsum256_epi32(sum_b0);
+    let mut b1 = hsum256_epi32(sum_b1);
+
+    // Scalar tail.
+    for i in (chunks * 16)..n {
+        let e = *t_ptr.add(i) as i32 - *w_ptr.add(i) as i32;
+        b0 += *gx_ptr.add(i) as i32 * e;
+        b1 += *gy_ptr.add(i) as i32 * e;
+    }
+
+    (b0, b1)
+}
+
+/// AVX2 fixed-point Hessian accumulation.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn accumulate_hessian_fixed_avx2(gx: &[i16], gy: &[i16]) -> (i32, i32, i32) {
+    use std::arch::x86_64::*;
+
+    let n = gx.len();
+    let chunks = n / 16;
+
+    let mut sum_h00 = _mm256_setzero_si256();
+    let mut sum_h01 = _mm256_setzero_si256();
+    let mut sum_h11 = _mm256_setzero_si256();
+
+    let gx_ptr = gx.as_ptr();
+    let gy_ptr = gy.as_ptr();
+
+    for i in 0..chunks {
+        let off = i * 16;
+        let vgx = _mm256_loadu_si256(gx_ptr.add(off) as *const __m256i);
+        let vgy = _mm256_loadu_si256(gy_ptr.add(off) as *const __m256i);
+
+        sum_h00 = _mm256_add_epi32(sum_h00, _mm256_madd_epi16(vgx, vgx));
+        sum_h01 = _mm256_add_epi32(sum_h01, _mm256_madd_epi16(vgx, vgy));
+        sum_h11 = _mm256_add_epi32(sum_h11, _mm256_madd_epi16(vgy, vgy));
+    }
+
+    let mut h00 = hsum256_epi32(sum_h00);
+    let mut h01 = hsum256_epi32(sum_h01);
+    let mut h11 = hsum256_epi32(sum_h11);
+
+    for i in (chunks * 16)..n {
+        let gxi = *gx_ptr.add(i) as i32;
+        let gyi = *gy_ptr.add(i) as i32;
+        h00 += gxi * gxi;
+        h01 += gxi * gyi;
+        h11 += gyi * gyi;
+    }
+
+    (h00, h01, h11)
+}
+
+/// Horizontal sum of 8 i32 lanes in a __m256i → single i32.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn hsum256_epi32(v: std::arch::x86_64::__m256i) -> i32 {
+    use std::arch::x86_64::*;
+    let hi128 = _mm256_extracti128_si256(v, 1);
+    let lo128 = _mm256_castsi256_si128(v);
+    let sum128 = _mm_add_epi32(lo128, hi128);
+    // Shuffle: [s2, s3, s0, s1]
+    let shuf = _mm_shuffle_epi32(sum128, 0b_01_00_11_10);
+    let sum64 = _mm_add_epi32(sum128, shuf);
+    // Shuffle: [s1, s0, s3, s2]
+    let shuf2 = _mm_shuffle_epi32(sum64, 0b_10_11_00_01);
+    let sum32 = _mm_add_epi32(sum64, shuf2);
+    _mm_cvtsi128_si32(sum32)
+}
+
+// ==========================================================================
+// NEON fixed-point implementations (aarch64 — RPi 4, Apple Silicon)
+//
+// vmull_s16: 4 × (i16 × i16 → i32) — widening multiply.
+// vmlal_s16: fused multiply-accumulate long — same but adds to accumulator.
+// vaddq_s32: 4 × i32 add.
+//
+// NEON is 128-bit, so processes 8 i16 per load but only 4 per multiply
+// (widening from 64→128 bits). Use high/low halves explicitly.
+// ==========================================================================
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn accumulate_ic_fixed_neon(t: &[i16], w: &[i16], gx: &[i16], gy: &[i16]) -> (i32, i32) {
+    use std::arch::aarch64::*;
+
+    let n = t.len();
+    let chunks = n / 8;  // Process 8 i16 per iteration (two vmull/vmlal pairs).
+
+    let mut sum_b0 = vdupq_n_s32(0);
+    let mut sum_b1 = vdupq_n_s32(0);
+
+    let t_ptr = t.as_ptr();
+    let w_ptr = w.as_ptr();
+    let gx_ptr = gx.as_ptr();
+    let gy_ptr = gy.as_ptr();
+
+    for i in 0..chunks {
+        let off = i * 8;
+
+        // Load 8 i16 values.
+        let vt = vld1q_s16(t_ptr.add(off));
+        let vw = vld1q_s16(w_ptr.add(off));
+        let ve = vsubq_s16(vt, vw);  // e = t - w (i16)
+
+        let vgx = vld1q_s16(gx_ptr.add(off));
+        let vgy = vld1q_s16(gy_ptr.add(off));
+
+        // Low 4 elements: widening multiply-accumulate.
+        let e_lo = vget_low_s16(ve);
+        let e_hi = vget_high_s16(ve);
+        let gx_lo = vget_low_s16(vgx);
+        let gx_hi = vget_high_s16(vgx);
+        let gy_lo = vget_low_s16(vgy);
+        let gy_hi = vget_high_s16(vgy);
+
+        sum_b0 = vmlal_s16(sum_b0, gx_lo, e_lo);   // b0 += gx[0..4] * e[0..4]
+        sum_b0 = vmlal_s16(sum_b0, gx_hi, e_hi);   // b0 += gx[4..8] * e[4..8]
+        sum_b1 = vmlal_s16(sum_b1, gy_lo, e_lo);
+        sum_b1 = vmlal_s16(sum_b1, gy_hi, e_hi);
+    }
+
+    let mut b0 = vaddvq_s32(sum_b0);
+    let mut b1 = vaddvq_s32(sum_b1);
+
+    for i in (chunks * 8)..n {
+        let e = *t_ptr.add(i) as i32 - *w_ptr.add(i) as i32;
+        b0 += *gx_ptr.add(i) as i32 * e;
+        b1 += *gy_ptr.add(i) as i32 * e;
+    }
+
+    (b0, b1)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn accumulate_hessian_fixed_neon(gx: &[i16], gy: &[i16]) -> (i32, i32, i32) {
+    use std::arch::aarch64::*;
+
+    let n = gx.len();
+    let chunks = n / 8;
+
+    let mut sum_h00 = vdupq_n_s32(0);
+    let mut sum_h01 = vdupq_n_s32(0);
+    let mut sum_h11 = vdupq_n_s32(0);
+
+    let gx_ptr = gx.as_ptr();
+    let gy_ptr = gy.as_ptr();
+
+    for i in 0..chunks {
+        let off = i * 8;
+        let vgx = vld1q_s16(gx_ptr.add(off));
+        let vgy = vld1q_s16(gy_ptr.add(off));
+
+        let gx_lo = vget_low_s16(vgx);
+        let gx_hi = vget_high_s16(vgx);
+        let gy_lo = vget_low_s16(vgy);
+        let gy_hi = vget_high_s16(vgy);
+
+        sum_h00 = vmlal_s16(sum_h00, gx_lo, gx_lo);
+        sum_h00 = vmlal_s16(sum_h00, gx_hi, gx_hi);
+        sum_h01 = vmlal_s16(sum_h01, gx_lo, gy_lo);
+        sum_h01 = vmlal_s16(sum_h01, gx_hi, gy_hi);
+        sum_h11 = vmlal_s16(sum_h11, gy_lo, gy_lo);
+        sum_h11 = vmlal_s16(sum_h11, gy_hi, gy_hi);
+    }
+
+    let mut h00 = vaddvq_s32(sum_h00);
+    let mut h01 = vaddvq_s32(sum_h01);
+    let mut h11 = vaddvq_s32(sum_h11);
+
+    for i in (chunks * 8)..n {
+        let gxi = *gx_ptr.add(i) as i32;
+        let gyi = *gy_ptr.add(i) as i32;
+        h00 += gxi * gxi;
+        h01 += gxi * gyi;
+        h11 += gyi * gyi;
+    }
+
+    (h00, h01, h11)
+}
+
+// ==========================================================================
+// Direct u8 bilinear interpolation (for fixed-point path)
+//
+// When the pyramid provides u8 levels, we read u8 directly:
+//   u8 → i32 widening is a single zero-extend + sign-extend, no FPU.
+//   4× less memory bandwidth per bilinear sample (1 byte vs 4 byte reads).
+// ==========================================================================
+
+/// Integer bilinear interpolation from two u8 row pointers.
+///
+/// Same arithmetic as `bilerp_fixed` but reads u8 directly, avoiding
+/// the f32→i32 truncation cast (which goes through the FPU on x86).
+///
+/// # Safety
+/// Caller must ensure `ix + 1` is a valid offset from both `r0` and `r1`.
+#[inline(always)]
+unsafe fn bilerp_fixed_u8(
+    r0: *const u8, r1: *const u8,
+    ix: usize,
+    iw00: i32, iw10: i32, iw01: i32, iw11: i32,
+) -> i16 {
+    let p00 = *r0.add(ix) as i32;
+    let p10 = *r0.add(ix + 1) as i32;
+    let p01 = *r1.add(ix) as i32;
+    let p11 = *r1.add(ix + 1) as i32;
+
+    ((iw00 * p00 + iw10 * p10 + iw01 * p01 + iw11 * p11 + W_ROUND) >> 10) as i16
+}
+
+/// Clamped bilinear interpolation from an Image<u8> (border fallback).
+///
+/// Used when the patch extends beyond image bounds. Clamps coordinates
+/// to valid range before reading via `get_unchecked`.
+#[inline]
+fn bilerp_clamped_u8(img: &Image<u8>, x: f32, y: f32) -> i16 {
+    let w = img.width();
+    let h = img.height();
+    let x0 = (x.floor() as isize).clamp(0, w as isize - 2) as usize;
+    let y0 = (y.floor() as isize).clamp(0, h as isize - 2) as usize;
+
+    let fx = x - x.floor();
+    let fy = y - y.floor();
+    let ifx = (fx * W_SCALE as f32).round() as i32;
+    let ify = (fy * W_SCALE as f32).round() as i32;
+    let iw00 = (W_SCALE - ifx) * (W_SCALE - ify);
+    let iw10 = ifx * (W_SCALE - ify);
+    let iw01 = (W_SCALE - ifx) * ify;
+    let iw11 = ifx * ify;
+
+    unsafe {
+        let p00 = img.get_unchecked(x0, y0) as i32;
+        let p10 = img.get_unchecked(x0 + 1, y0) as i32;
+        let p01 = img.get_unchecked(x0, y0 + 1) as i32;
+        let p11 = img.get_unchecked(x0 + 1, y0 + 1) as i32;
+
+        ((iw00 * p00 + iw10 * p10 + iw01 * p01 + iw11 * p11 + W_ROUND) >> 10) as i16
+    }
+}
+
+/// Extract one row of warped pixels via fixed-point bilinear from u8 data.
+///
+/// Dispatches to SIMD when available. Fills `out` with i16 interpolated values.
+///
+/// # Safety
+/// Caller must ensure r0, r1 have at least `bx + count + 1` valid elements.
+#[inline]
+unsafe fn extract_warped_row_fixed_u8(
+    r0: *const u8, r1: *const u8,
+    bx: usize, count: usize,
+    iw00: i32, iw10: i32, iw01: i32, iw11: i32,
+    out: &mut [i16],
+) {
+    // Scalar extraction (SIMD for u8 bilinear is complex due to weight
+    // widths; the accumulation SIMD is where the big win is).
+    for lx in 0..count {
+        *out.get_unchecked_mut(lx) = bilerp_fixed_u8(
+            r0, r1, bx + lx, iw00, iw10, iw01, iw11,
+        );
+    }
 }
 
 // ==========================================================================
@@ -1880,5 +2408,65 @@ mod tests {
 
         assert_eq!(b0, d_b0, "fixed accumulate b0 mismatch");
         assert_eq!(b1, d_b1, "fixed accumulate b1 mismatch");
+    }
+
+    #[test]
+    fn test_fixed_hessian_simd_matches_scalar() {
+        let n = 529;
+        let gx: Vec<i16> = (0..n).map(|i| ((i * 7) as f32).sin() as i16).collect();
+        let gy: Vec<i16> = (0..n).map(|i| ((i * 13) as f32).cos() as i16).collect();
+
+        let (s_h00, s_h01, s_h11) = accumulate_hessian_fixed_scalar(&gx, &gy);
+        let (d_h00, d_h01, d_h11) = accumulate_hessian_fixed(&gx, &gy);
+
+        assert_eq!(s_h00, d_h00, "fixed hessian h00 mismatch");
+        assert_eq!(s_h01, d_h01, "fixed hessian h01 mismatch");
+        assert_eq!(s_h11, d_h11, "fixed hessian h11 mismatch");
+    }
+
+    #[test]
+    fn test_fixed_accumulate_odd_length() {
+        // Non-multiple-of-16 length to test tail handling.
+        let n = 37; // 37 = 2 chunks of 16 + 5 tail
+        let t: Vec<i16> = (0..n).map(|i| (i % 128) as i16).collect();
+        let w: Vec<i16> = (0..n).map(|i| ((i + 3) % 128) as i16).collect();
+        let gx: Vec<i16> = (0..n).map(|i| (i * 2 - 37) as i16).collect();
+        let gy: Vec<i16> = (0..n).map(|i| (i * 3 - 50) as i16).collect();
+
+        let (s_b0, s_b1) = accumulate_ic_fixed_scalar(&t, &w, &gx, &gy);
+        let (d_b0, d_b1) = accumulate_ic_fixed(&t, &w, &gx, &gy);
+
+        assert_eq!(s_b0, d_b0, "fixed odd len b0 mismatch");
+        assert_eq!(s_b1, d_b1, "fixed odd len b1 mismatch");
+    }
+
+    // ===== u8 bilinear path tests =====
+
+    #[test]
+    fn test_bilerp_fixed_u8_matches_f32_path() {
+        // Verify that bilerp_fixed_u8 produces the same result as
+        // bilerp_fixed reading from f32 data (for u8-range values).
+        let row0: Vec<u8> = vec![10, 20, 30, 40, 50];
+        let row1: Vec<u8> = vec![15, 25, 35, 45, 55];
+
+        let row0_f32: Vec<f32> = row0.iter().map(|&v| v as f32).collect();
+        let row1_f32: Vec<f32> = row1.iter().map(|&v| v as f32).collect();
+
+        let iw00: i32 = 20 * 24; // 480
+        let iw10: i32 = 12 * 24; // 288
+        let iw01: i32 = 20 * 8;  // 160
+        let iw11: i32 = 12 * 8;  // 96
+        // Sum = 1024 ✓
+
+        for ix in 0..4 {
+            let val_u8 = unsafe {
+                bilerp_fixed_u8(row0.as_ptr(), row1.as_ptr(), ix, iw00, iw10, iw01, iw11)
+            };
+            let val_f32 = unsafe {
+                bilerp_fixed(row0_f32.as_ptr(), row1_f32.as_ptr(), ix, iw00, iw10, iw01, iw11)
+            };
+            assert_eq!(val_u8, val_f32,
+                "bilerp_fixed_u8 vs bilerp_fixed at ix={ix}: {val_u8} vs {val_f32}");
+        }
     }
 }

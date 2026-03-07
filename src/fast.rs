@@ -159,6 +159,15 @@ impl FastDetector {
             features
         }
     }
+
+    /// Simple helper for coarser levels
+    pub fn detect_at_level(&self, image: &Image<u8>, level: usize) -> Vec<Feature> {
+        let mut features = self.detect(image);
+        for f in &mut features {
+            f.level = level;
+        }
+        features
+    }
 }
 
 // ==========================================================================

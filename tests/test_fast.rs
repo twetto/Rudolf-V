@@ -167,7 +167,7 @@ fn fast_on_pyramid_levels() {
             u8_img.set(x, y, v.clamp(0.0, 255.0).round() as u8);
         }
 
-        let features = det.detect(&u8_img);
+        let features = det.detect_at_level(&u8_img, lvl);
         for f in &features {
             assert_eq!(f.level, lvl, "feature level tag mismatch");
         }

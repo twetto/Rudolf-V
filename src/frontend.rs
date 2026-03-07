@@ -217,8 +217,8 @@ impl Frontend {
         let klt_scratch = KltScratch::new(config.klt_window);
         Frontend {
             config,
-            prev_pyramid: Pyramid { levels: Vec::new() },
-            curr_pyramid: Pyramid { levels: Vec::new() },
+            prev_pyramid: Pyramid { levels: Vec::new(), u8_levels: Vec::new() },
+            curr_pyramid: Pyramid { levels: Vec::new(), u8_levels: Vec::new() },
             pyr_scratch,
             histeq_buf: Image::new(img_w, img_h),
             has_prev: false,

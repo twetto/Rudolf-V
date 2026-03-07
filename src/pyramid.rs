@@ -39,6 +39,17 @@ use crate::convolution::{gaussian_kernel_1d, ConvolveScratch};
 pub struct Pyramid {
     /// Pyramid levels, from finest (index 0) to coarsest.
     pub levels: Vec<Image<f32>>,
+    /// Optional u8 levels for fixed-point KLT (zero-copy from pyrdown_int).
+    ///
+    /// When built via `build_reuse`, these contain the u8 pyrdown outputs
+    /// that are already computed as part of the integer pipeline. The
+    /// fixed-point KLT reads these directly via `row_ptr()`, avoiding
+    /// f32→i32 casts and getting 4× less memory bandwidth per bilinear read.
+    ///
+    /// Level 0 is a copy of the input u8 image.
+    /// Levels 1+ are the u8 outputs from `pyrdown_int`.
+    /// Empty when built via `build()` (f32 path).
+    pub u8_levels: Vec<Image<u8>>,
 }
 
 /// Pre-allocated scratch buffers for pyramid construction.
@@ -96,7 +107,7 @@ impl Pyramid {
             levels.push(down);
         }
 
-        Pyramid { levels }
+        Pyramid { levels, u8_levels: Vec::new() }
     }
 
     /// Build a Gaussian pyramid from a u8 image, reusing buffers.
@@ -104,6 +115,8 @@ impl Pyramid {
     /// Uses integer arithmetic (u8→u16→u32) for 4× less memory bandwidth
     /// than the f32 path. Each level's u8 result feeds the next level via
     /// ping-pong buffers, with the f32 output written to self.levels.
+    ///
+    /// Also populates `u8_levels` for direct fixed-point KLT access.
     pub fn build_reuse(
         &mut self,
         src: &Image<u8>,
@@ -118,6 +131,32 @@ impl Pyramid {
         }
         self.levels.truncate(num_levels);
 
+        // ── u8 level storage for fixed-point KLT ──
+        while self.u8_levels.len() < num_levels {
+            self.u8_levels.push(Image::new(1, 1));
+        }
+        self.u8_levels.truncate(num_levels);
+
+        // Level 0 u8: copy of original image (contiguous, stride == width).
+        {
+            let sw = src.width();
+            let sh = src.height();
+            self.u8_levels[0].clear_resize(sw, sh);
+            let src_stride = src.stride();
+            let dst_slice = self.u8_levels[0].as_mut_slice();
+            let src_slice = src.as_slice();
+            if src_stride == sw {
+                dst_slice.copy_from_slice(&src_slice[..sw * sh]);
+            } else {
+                for y in 0..sh {
+                    let dst_off = y * sw;
+                    let src_off = y * src_stride;
+                    dst_slice[dst_off..dst_off + sw]
+                        .copy_from_slice(&src_slice[src_off..src_off + sw]);
+                }
+            }
+        }
+
         // Level 0: u8 → f32 (no blur).
         to_f32_image_u8_into(src, &mut self.levels[0]);
 
@@ -128,10 +167,6 @@ impl Pyramid {
         // Destructure scratch for independent borrows.
         let PyramidScratch { ref mut h_buf, ref mut u8_ping, ref mut u8_pong } = *scratch;
 
-        // Pre-extract raw pointers for ping-pong to avoid borrow conflicts
-        // in the loop. Safety: we alternate read/write — when i is odd we
-        // write ping and read pong (or src), when i is even vice versa.
-        // They never alias within a single pyrdown_int call.
         let ping_ptr = u8_ping.as_mut_ptr();
         let pong_ptr = u8_pong.as_mut_ptr();
         let ping_cap = u8_ping.len();
@@ -144,8 +179,6 @@ impl Pyramid {
             let dw = prev_w / 2;
             let dh = prev_h / 2;
 
-            // Select read source: level 1 reads from original image,
-            // subsequent levels read from the previous pyrdown's u8 output.
             let (read_ptr, read_len, read_stride) = if i == 1 {
                 (src.as_slice().as_ptr(), src.as_slice().len(), src.stride())
             } else if i % 2 == 0 {
@@ -154,7 +187,6 @@ impl Pyramid {
                 (pong_ptr as *const u8, prev_w * prev_h, prev_w)
             };
 
-            // Select write destination: alternate ping/pong.
             let (write_ptr, write_cap) = if i % 2 == 1 {
                 (ping_ptr, ping_cap)
             } else {
@@ -165,9 +197,6 @@ impl Pyramid {
             debug_assert!(write_len <= write_cap,
                 "u8 buffer too small: need {write_len}, have {write_cap}");
 
-            // SAFETY: read and write slices point to different buffers
-            // (or to the original src which is immutably borrowed).
-            // h_buf is used only within pyrdown_int and doesn't alias either.
             unsafe {
                 let read_slice = std::slice::from_raw_parts(read_ptr, read_len);
                 let write_slice = std::slice::from_raw_parts_mut(write_ptr, write_len);
@@ -178,6 +207,10 @@ impl Pyramid {
                     write_slice,
                     h_buf,
                 );
+
+                // Copy u8 output into Image<u8> for fixed-point KLT.
+                self.u8_levels[i].clear_resize(dw, dh);
+                self.u8_levels[i].as_mut_slice().copy_from_slice(&write_slice[..write_len]);
             }
 
             prev_w = dw;
@@ -193,6 +226,18 @@ impl Pyramid {
     /// Get a reference to a specific level.
     pub fn level(&self, level: usize) -> &Image<f32> {
         &self.levels[level]
+    }
+
+    /// Whether u8 levels are available (built via `build_reuse`).
+    pub fn has_u8_levels(&self) -> bool {
+        !self.u8_levels.is_empty()
+    }
+
+    /// Get the u8 image for a pyramid level.
+    ///
+    /// Only available when built via `build_reuse`.
+    pub fn u8_level(&self, level: usize) -> &Image<u8> {
+        &self.u8_levels[level]
     }
 }
 
@@ -792,7 +837,7 @@ mod tests {
     fn test_build_reuse_constant() {
         // Constant image: build_reuse should preserve value at all levels.
         let img = Image::from_vec(64, 64, vec![128u8; 64 * 64]);
-        let mut pyr = Pyramid { levels: Vec::new() };
+        let mut pyr = Pyramid { levels: Vec::new(), u8_levels: Vec::new() };
         let mut scratch = PyramidScratch::new(64, 64, 1.0);
         pyr.build_reuse(&img, 4, &mut scratch);
 
@@ -809,7 +854,7 @@ mod tests {
     #[test]
     fn test_build_reuse_dimensions() {
         let img: Image<u8> = Image::new(640, 480);
-        let mut pyr = Pyramid { levels: Vec::new() };
+        let mut pyr = Pyramid { levels: Vec::new(), u8_levels: Vec::new() };
         let mut scratch = PyramidScratch::new(640, 480, 1.0);
         pyr.build_reuse(&img, 5, &mut scratch);
 
@@ -833,7 +878,7 @@ mod tests {
 
         let pyr_f32 = Pyramid::build(&img, 4, 1.0);
 
-        let mut pyr_int = Pyramid { levels: Vec::new() };
+        let mut pyr_int = Pyramid { levels: Vec::new(), u8_levels: Vec::new() };
         let mut scratch = PyramidScratch::new(640, 480, 1.0);
         pyr_int.build_reuse(&img, 4, &mut scratch);
 
@@ -865,7 +910,7 @@ mod tests {
         }
         let img = Image::from_vec(128, 128, data);
 
-        let mut pyr = Pyramid { levels: Vec::new() };
+        let mut pyr = Pyramid { levels: Vec::new(), u8_levels: Vec::new() };
         let mut scratch = PyramidScratch::new(128, 128, 1.0);
         pyr.build_reuse(&img, 5, &mut scratch);
 
