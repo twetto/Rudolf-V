@@ -177,6 +177,7 @@ pub struct GpuFrontend {
     features:      Vec<Feature>,
     prev_features: Vec<Feature>,
     next_id:       u64,
+    histeq_buf:    Image<u8>,
     has_prev:      bool,
 
     img_w: usize,
@@ -208,6 +209,7 @@ impl GpuFrontend {
             config,
             pyr_pipeline, fast, klt, grid,
             prev_pyramid:  None,
+            histeq_buf:    Image::new(img_w, img_h),
             features:      Vec::new(),
             prev_features: Vec::new(),
             next_id:       1,
@@ -234,10 +236,9 @@ impl GpuFrontend {
 
         // ── Step 0: Histogram equalization (CPU, before GPU upload) ──────────
         let t0 = Instant::now();
-        let equalized;
         let input: &Image<u8> = if self.config.histeq != HistEqMethod::None {
-            equalized = histeq::apply_histeq(image, self.config.histeq);
-            &equalized
+            histeq::apply_histeq_into(image, self.config.histeq, &mut self.histeq_buf);
+            &self.histeq_buf
         } else {
             image
         };
