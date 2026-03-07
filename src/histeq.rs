@@ -23,6 +23,8 @@
 // - Direct slice access (no per-pixel method call overhead)
 // - equalize_histogram_into() avoids allocation by writing into caller's buffer
 // - Scratch buffer for histeq output can be held in Frontend (reused per frame)
+// - RAYON PARALLELISM (feature-gated): histogram via fold/reduce with per-thread
+//   local histograms (no atomics), remap via parallel row iteration.
 //
 // GPU NOTES:
 // - Global histEq: atomic histogram in shared memory, prefix sum for CDF,
@@ -30,6 +32,9 @@
 // - CLAHE: one workgroup per tile, then per-pixel interpolation pass.
 
 use crate::image::Image;
+
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 /// Histogram equalization method.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -60,6 +65,9 @@ pub fn equalize_histogram(image: &Image<u8>) -> Image<u8> {
 ///
 /// Avoids per-frame allocation when called repeatedly (e.g., from Frontend).
 /// Uses direct slice access for both histogram and remap passes.
+/// When the `parallel` feature is enabled, both passes use rayon:
+/// - Histogram: fold/reduce with per-thread local histograms (no atomics).
+/// - Remap: parallel row iteration with LUT lookup.
 pub fn equalize_histogram_into(image: &Image<u8>, out: &mut Image<u8>) {
     let w = image.width();
     let h = image.height();
@@ -74,35 +82,96 @@ pub fn equalize_histogram_into(image: &Image<u8>, out: &mut Image<u8>) {
     let src = image.as_slice();
     let src_stride = image.stride();
 
-    // Step 1: Histogram (direct slice access, no get() overhead).
-    let mut hist = [0u32; 256];
-    for y in 0..h {
-        let row = y * src_stride;
-        unsafe {
-            for x in 0..w {
-                let v = *src.get_unchecked(row + x) as usize;
-                *hist.get_unchecked_mut(v) += 1;
+    // Step 1: Histogram.
+    #[cfg(feature = "parallel")]
+    let hist = {
+        // Each thread builds a local [u32; 256], then we reduce by summing.
+        // No atomics, no contention on the 256 bins.
+        (0..h).into_par_iter()
+            .fold(
+                || [0u32; 256],
+                |mut local_hist, y| {
+                    let row = y * src_stride;
+                    unsafe {
+                        for x in 0..w {
+                            let v = *src.get_unchecked(row + x) as usize;
+                            *local_hist.get_unchecked_mut(v) += 1;
+                        }
+                    }
+                    local_hist
+                },
+            )
+            .reduce(
+                || [0u32; 256],
+                |mut a, b| {
+                    for i in 0..256 { a[i] += b[i]; }
+                    a
+                },
+            )
+    };
+
+    #[cfg(not(feature = "parallel"))]
+    let hist = {
+        let mut hist = [0u32; 256];
+        for y in 0..h {
+            let row = y * src_stride;
+            unsafe {
+                for x in 0..w {
+                    let v = *src.get_unchecked(row + x) as usize;
+                    *hist.get_unchecked_mut(v) += 1;
+                }
             }
         }
-    }
+        hist
+    };
 
-    // Step 2: CDF → LUT.
+    // Step 2: CDF → LUT (256 elements, trivially fast, always sequential).
     let lut = build_lut(&hist, n);
 
-    // Step 3: Remap (direct slice access).
+    // Step 3: Remap.
     let dst_stride = out.stride();
     let dst = out.as_mut_slice();
-    for y in 0..h {
-        let src_off = y * src_stride;
-        let dst_off = y * dst_stride;
-        unsafe {
-            for x in 0..w {
-                let v = *src.get_unchecked(src_off + x) as usize;
-                *dst.get_unchecked_mut(dst_off + x) = *lut.get_unchecked(v);
+
+    #[cfg(feature = "parallel")]
+    {
+        let dst_base = dst.as_mut_ptr() as usize;
+        (0..h).into_par_iter().for_each(|y| {
+            let src_off = y * src_stride;
+            let dst_off = y * dst_stride;
+            unsafe {
+                let dp = dst_base as *mut u8;
+                for x in 0..w {
+                    let v = *src.get_unchecked(src_off + x) as usize;
+                    *dp.add(dst_off + x) = *lut.get_unchecked(v);
+                }
+            }
+        });
+    }
+
+    #[cfg(not(feature = "parallel"))]
+    {
+        for y in 0..h {
+            let src_off = y * src_stride;
+            let dst_off = y * dst_stride;
+            unsafe {
+                for x in 0..w {
+                    let v = *src.get_unchecked(src_off + x) as usize;
+                    *dst.get_unchecked_mut(dst_off + x) = *lut.get_unchecked(v);
+                }
             }
         }
     }
 }
+
+/// Wrapper to send a raw pointer across threads.
+/// SAFETY: The caller must guarantee non-overlapping writes.
+#[cfg(feature = "parallel")]
+#[derive(Clone, Copy)]
+struct SendPtr(*mut u8);
+#[cfg(feature = "parallel")]
+unsafe impl Send for SendPtr {}
+#[cfg(feature = "parallel")]
+unsafe impl Sync for SendPtr {}
 
 /// Build a 256-entry lookup table from a histogram and total pixel count.
 fn build_lut(hist: &[u32; 256], total: usize) -> [u8; 256] {
