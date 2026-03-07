@@ -25,6 +25,7 @@ use rudolf_v::camera::CameraIntrinsics;
 use rudolf_v::essential::RansacConfig;
 use rudolf_v::gpu::device::GpuDevice;
 use rudolf_v::gpu::frontend::{GpuFrontend, GpuFrontendConfig, SubmitStrategy};
+use rudolf_v::gpu::fast::NmsStrategy;
 use rudolf_v::histeq::HistEqMethod;
 use rudolf_v::image::Image;
 
@@ -108,6 +109,7 @@ fn main() {
 
     let config = GpuFrontendConfig {
         submit_strategy: SubmitStrategy::Fused,
+        nms_strategy: NmsStrategy::Gpu,
         max_features,
         cell_size,
         pyramid_levels,
