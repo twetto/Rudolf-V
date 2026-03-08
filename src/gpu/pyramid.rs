@@ -373,10 +373,9 @@ impl GpuPyramidPipeline {
     ) -> GpuPyramid {
         assert!(num_levels >= 1, "pyramid must have at least 1 level");
 
-        // Compute Gaussian kernel — same formula as pyramid.rs so GPU and
-        // CPU results agree. We reproduce the kernel computation here to
-        // avoid a dependency on the convolution module.
-        let kernel = gaussian_kernel_1d_for_gpu(sigma);
+        // Hardcoded [1,4,6,4,1]/16, half_size=2, 25 textureLoads per pixel
+        // Matches the CPU build_reuse path exactly (pyrdown_int uses this kernel).
+        let kernel = vec![1.0/16.0, 4.0/16.0, 6.0/16.0, 4.0/16.0, 1.0/16.0];
 
         let mut levels = Vec::with_capacity(num_levels);
 
