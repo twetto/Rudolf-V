@@ -2,12 +2,13 @@
 
 **Ru**st **D**evice **O**ptimized **L**ibrary for **F**rontend **V**ision
 
-> **Status: Phase 2 — GPU Acceleration (Complete)**
+> **Status: Phase 3 — CPU SIMD Optimization (Active)**
 >
 > The full GPU frontend pipeline is implemented and validated against the CPU reference.
-> Pyramid construction, FAST detection, KLT tracking, and NMS all run as WGSL compute
-> shaders via wgpu. `GpuFrontend::process()` is API-compatible with the CPU `Frontend`.
-> Ready for Phase 3: async readback and double-buffering.
+> Phase 3 investigation revealed that at EuRoC resolution (752×480), wgpu dispatch
+> overhead dominates GPU kernel compute — the CPU pipeline is faster on all tested
+> hardware. Focus has shifted to SIMD optimization of the CPU pipeline, starting with
+> pyramid construction on ARM (NEON) for the Raspberry Pi 4 target.
 
 ## About
 
@@ -154,13 +155,28 @@ grid update) acts as a natural gap that keeps the GPU fed without explicit fusio
 
 `NmsStrategy::Cpu` reads back the full score buffer (~1.4 MB for 752×480) and
 runs cell-max NMS on the CPU. `NmsStrategy::Gpu` adds a compute pass and reads
-back only per-cell winners (~17 KB), which was designed to save PCIe bandwidth
-on discrete hardware.
+back only per-cell winners (~17 KB), saving PCIe bandwidth on discrete hardware.
 
-In practice, benchmarks on both an AMD 780M iGPU and an RTX 3060 show
-`Separate+Cpu` fastest on all tested hardware. The knobs are retained for
-experimentation and for platforms not yet measured (e.g. high-latency PCIe
-configurations, Apple Silicon, RPi 4/5).
+**Benchmark results (EuRoC MH_01, 752×480):**
+
+| Platform | CPU Total | GPU Best | GPU Config | Winner |
+|---|---|---|---|---|
+| i5-12400F + RTX 3060 | 1.39ms | 1.95ms | Fused+Gpu | CPU |
+| AMD Radeon 780M (iGPU) | 1.00ms | 1.82ms | Fused+Gpu | CPU |
+| Raspberry Pi 4 | ~50ms | ~141ms | — | CPU (2.6×) |
+
+**Why GPU is slower at this resolution:** At 752×480, individual GPU kernels
+complete in <0.1ms — well below wgpu's fixed per-dispatch overhead (~50–100μs
+for command recording, bind group creation, validation, and submit). The CPU
+processes the same work serially with zero dispatch overhead. Analysis of the
+reference CUDA implementation (vilib) confirmed that its GPU advantage comes
+from CUDA-specific features unavailable in wgpu: mapped pinned memory
+(`cudaHostAllocMapped`), ~5μs kernel launch latency, and persistent device
+pointers that eliminate bind group creation entirely.
+
+The GPU pipeline becomes advantageous at higher resolutions (1080p+) where
+compute dominates dispatch overhead, or on hardware with lower CPU performance
+relative to GPU capability.
 
 **Milestones:**
 
@@ -174,14 +190,46 @@ configurations, Apple Silicon, RPi 4/5).
 * [x] `GpuFrontend::process()` integration (API-compatible with CPU `Frontend`)
 * [ ] Harris corner response kernel
 
-### Phase 3: Zero-Copy Optimization
+### Phase 3: Optimization (Active)
 
-**Goal:** Optimize memory throughput for high-frequency odometry.
+**Goal:** Close the gap to OpenCV performance through platform-specific optimization.
 
-**Purpose:** Minimize CPU-GPU synchronization overhead on platforms where it matters.
+**Purpose:** Make the CPU pipeline production-viable on embedded targets (RPi 4).
 
-* [ ] Async readback with double-buffering (overlap GPU frame N+1 with CPU frame N)
-* [ ] Unified memory path for platforms that support it (Apple Silicon, RPi)
+**Phase 3a — GPU overhead investigation (complete):**
+
+Systematic comparison against vilib's CUDA implementation revealed that wgpu's
+GPU advantage at EuRoC resolution is blocked by fixed overhead, not kernel
+compute. Optimizations attempted and their outcomes:
+
+| Optimization | Target | Result |
+|---|---|---|
+| Occupancy grid skip in FAST shader | Reduce GPU FAST work | No effect — dispatch overhead dominates, not compute |
+| 5-tap kernel (match CPU) in pyramid shader | Reduce GPU pyramid work | No effect — same reason |
+| `MAPPABLE_PRIMARY_BUFFERS` (STORAGE\|MAP_READ) | Eliminate readback copy on iGPU | No effect — copy was already free on unified memory |
+| Comparison with vilib CUDA architecture | Identify fundamental gaps | Confirmed: mapped pinned memory, ~5μs launch, no bind groups |
+
+Conclusion: at 752×480, the CPU pipeline wins on all current targets. GPU
+pipeline is retained for future higher-resolution use cases.
+
+**Phase 3b — CPU SIMD optimization (active):**
+
+The CPU pipeline at 1.39ms (12400F) is already competitive, but the RPi 4 at
+~50ms needs significant optimization. Current CPU bottleneck profile (RPi 4):
+
+| Stage | Current | Target | Approach |
+|---|---|---|---|
+| Pyramid construction | ~24ms | ~3–4ms | Separable NEON convolution |
+| KLT tracking | ~15ms | ~5ms | NEON Hessian accumulation |
+| FAST detection | ~8ms | ~3ms | NEON ring comparisons |
+
+* [x] KLT inverse-compositional restructuring (1.7× speedup)
+* [x] Row-pointer memory access, constant weight precomputation
+* [x] `KltScratch` allocation reuse
+* [ ] Separable NEON convolution for pyramid construction (highest priority)
+* [ ] NEON Hessian accumulation for KLT
+* [ ] NEON ring comparisons for FAST
+* [ ] Platform-specific CPU/GPU dispatch strategy
 
 ## Scientific Basis
 
