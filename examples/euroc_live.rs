@@ -281,10 +281,9 @@ fn main() {
 
             // Draw feature points on top.
             for f in &features {
-                let color = tracks
-                    .get(&f.id)
-                    .map(|t| t.color)
-                    .unwrap_or(0x00FF00);
+                let track_len = tracks.get(&f.id).map(|t| t.positions.len()).unwrap_or(0);
+                let color = survival_color(track_len, TRAIL_LENGTH);
+                
                 draw_circle(
                     &mut fb, win_w, win_h,
                     (f.x * scale as f32) as i32,
@@ -483,4 +482,13 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
         _ => (c, 0.0, x),
     };
     (((r + m) * 255.0) as u8, ((g + m) * 255.0) as u8, ((b + m) * 255.0) as u8)
+}
+
+/// Compute a color based on track length (Red for short, Green for long).
+fn survival_color(len: usize, max_len: usize) -> u32 {
+    let t = (len as f32 / max_len as f32).min(1.0);
+    // Red (0, 1.0, 1.0) -> Green (120, 1.0, 1.0) in HSV.
+    let hue = t * 120.0;
+    let (r, g, b) = hsv_to_rgb(hue, 1.0, 1.0);
+    ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }

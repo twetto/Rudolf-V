@@ -95,6 +95,7 @@ mod tests {
             score,
             level: 0,
             id: 0,
+            descriptor: 0,
         }
     }
 

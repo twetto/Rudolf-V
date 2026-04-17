@@ -92,6 +92,10 @@ pub struct FrontendConfig {
     pub klt_epsilon: f32,
     /// KLT algorithm variant.
     pub klt_method: LkMethod,
+    /// LBP descriptor verification (occlusion/drift detection).
+    pub lbp_verification_enabled: bool,
+    /// Hamming distance threshold for LBP verification (max bits allowed).
+    pub lbp_threshold: u32,
     /// Histogram equalization preprocessing.
     /// Stabilizes brightness across frames when auto-exposure is active.
     pub histeq: HistEqMethod,
@@ -120,6 +124,8 @@ impl Default for FrontendConfig {
             klt_max_iter: 30,
             klt_epsilon: 0.01,
             klt_method: LkMethod::ForwardAdditive,
+            lbp_verification_enabled: true,
+            lbp_threshold: 4,
             histeq: HistEqMethod::None,
             camera: None,
             ransac: RansacConfig::default(),
@@ -301,9 +307,23 @@ impl Frontend {
                 // Filter features in-place: keep only successfully tracked.
                 // Avoids allocating a second Vec.
                 let mut write = 0;
+                let curr_img = &self.curr_pyramid.levels[0];
+
                 for i in 0..self.track_results.len() {
                     if self.track_results[i].status == TrackStatus::Tracked {
-                        self.features[write] = self.track_results[i].feature.clone();
+                        let feat = &self.track_results[i].feature;
+
+                        // LBP verification (occlusion/drift detection).
+                        if self.config.lbp_verification_enabled {
+                            let new_desc = compute_lbp_at(curr_img, feat.x, feat.y);
+                            let dist = (new_desc ^ feat.descriptor).count_ones();
+                            if dist > self.config.lbp_threshold {
+                                stats.rejected += 1;
+                                continue;
+                            }
+                        }
+
+                        self.features[write] = feat.clone();
                         write += 1;
                         stats.tracked += 1;
                     } else {
@@ -426,6 +446,7 @@ impl Frontend {
                     score: f.score,
                     level: f.level,
                     id: self.next_id,
+                    descriptor: f.descriptor,
                 };
                 self.next_id += 1;
                 self.features.push(new_feat);
@@ -743,4 +764,46 @@ mod tests {
         let (_, stats) = frontend.process(&img2);
         assert!(stats.tracked > 0, "CLAHE frontend should track features");
     }
+}
+
+// ---------------------------------------------------------------------------
+// LBP Helpers
+// ---------------------------------------------------------------------------
+
+const CIRCLE_OFFSETS_F: [(f32, f32); 16] = [
+    ( 0.0, -3.0), ( 1.0, -3.0), ( 2.0, -2.0), ( 3.0, -1.0),
+    ( 3.0,  0.0), ( 3.0,  1.0), ( 2.0,  2.0), ( 1.0,  3.0),
+    ( 0.0,  3.0), (-1.0,  3.0), (-2.0,  2.0), (-3.0,  1.0),
+    (-3.0,  0.0), (-3.0, -1.0), (-2.0, -2.0), (-1.0, -3.0),
+];
+
+/// Compute the rotation-invariant LBP at a fractional position.
+fn compute_lbp_at(img: &Image<f32>, x: f32, y: f32) -> u16 {
+    use crate::image::interpolate_bilinear;
+    
+    let center = interpolate_bilinear(img, x, y);
+    let mut lbp: u16 = 0;
+    
+    for (i, &(dx, dy)) in CIRCLE_OFFSETS_F.iter().enumerate() {
+        let val = interpolate_bilinear(img, x + dx, y + dy);
+        if val >= center {
+            lbp |= 1 << i;
+        }
+    }
+    
+    compute_min_rotation(lbp)
+}
+
+/// Compute the rotation-invariant LBP by finding the minimum value
+/// among all 16 cyclic shifts.
+#[inline]
+fn compute_min_rotation(mut v: u16) -> u16 {
+    let mut min_v = v;
+    for _ in 0..15 {
+        v = v.rotate_right(1);
+        if v < min_v {
+            min_v = v;
+        }
+    }
+    min_v
 }

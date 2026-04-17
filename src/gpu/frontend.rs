@@ -414,6 +414,7 @@ impl GpuFrontend {
                 if x < mask.width() && y < mask.height() && mask.get(x, y) > 0 {
                     self.features.push(Feature {
                         x: f.x, y: f.y, score: f.score, level: f.level, id: self.next_id,
+                        descriptor: 0,
                     });
                     self.next_id += 1;
                     self.grid.mark(f.x, f.y);

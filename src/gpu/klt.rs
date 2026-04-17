@@ -604,7 +604,7 @@ impl GpuKltTracker {
                     _ => TrackStatus::OutOfBounds,
                 };
                 TrackedFeature {
-                    feature: Feature { x: r.x, y: r.y, score: f.score, level: f.level, id: f.id },
+                    feature: Feature { x: r.x, y: r.y, score: f.score, level: f.level, id: f.id, descriptor: f.descriptor },
                     status,
                 }
             })
@@ -680,7 +680,7 @@ mod tests {
 
     /// Make a feature at (x, y) for use in track() calls.
     fn feat(x: f32, y: f32) -> Feature {
-        Feature { x, y, score: 100.0, level: 0, id: 1 }
+        Feature { x, y, score: 100.0, level: 0, id: 1, descriptor: 0 }
     }
 
     // ---- inner GPU tests (subprocess-isolated) ----------------------------

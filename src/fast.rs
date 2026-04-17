@@ -54,6 +54,7 @@ pub struct Feature {
     pub score: f32,
     pub level: usize,
     pub id: u64,
+    pub descriptor: u16,
 }
 
 /// FAST-N corner detector.
@@ -313,18 +314,42 @@ fn detect_row(
         }
 
         if best_score >= 0.0 {
+            // Compute RI-LBP descriptor (native radius 3).
+            let mut lbp: u16 = 0;
+            for i in 0..16 {
+                if circle_vals[i] >= center {
+                    lbp |= 1 << i;
+                }
+            }
+            let descriptor = compute_min_rotation(lbp);
+
             features.push(Feature {
                 x: x as f32,
                 y: y as f32,
                 score: best_score,
                 level,
                 id: 0,
+                descriptor,
             });
         }
         } // unsafe
 
         x += 1;
     }
+}
+
+/// Compute the rotation-invariant LBP by finding the minimum value
+/// among all 16 cyclic shifts.
+#[inline]
+fn compute_min_rotation(mut v: u16) -> u16 {
+    let mut min_v = v;
+    for _ in 0..15 {
+        v = v.rotate_right(1);
+        if v < min_v {
+            min_v = v;
+        }
+    }
+    min_v
 }
 
 /// Find the longest contiguous arc in a circular 16-bit mask and
@@ -396,6 +421,26 @@ mod tests {
         });
         assert!(near_center, "expected a feature near (10, 10)");
         assert!(features[0].score > 0.0);
+    }
+
+    #[test]
+    fn test_ri_lbp_stability() {
+        // Create an image with a clear corner.
+        let img = make_fast_corner_image(20, 100, 200);
+        let det = FastDetector::new(50, 9);
+        let f1 = det.detect(&img);
+        assert!(!f1.is_empty());
+
+        // "Rotate" the circle by shifting pixel values.
+        // Since make_fast_corner_image uses CIRCLE_OFFSETS, we can't easily
+        // rotate the whole image, but we can verify that compute_min_rotation
+        // works on shifted masks.
+        let mut v: u16 = 0b1111111110000000;
+        let d_ref = compute_min_rotation(v);
+        for _ in 0..16 {
+            v = v.rotate_right(1);
+            assert_eq!(compute_min_rotation(v), d_ref, "RI-LBP should be invariant to rotation");
+        }
     }
 
     #[test]

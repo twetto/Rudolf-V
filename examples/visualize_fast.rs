@@ -141,7 +141,7 @@ fn main() {
     let blob_pyr2 = Pyramid::build(&blob2, 3, 1.0);
 
     let blob_features = vec![rudolf_v::fast::Feature {
-        x: 50.0, y: 50.0, score: 100.0, level: 0, id: 1,
+        x: 50.0, y: 50.0, score: 100.0, level: 0, id: 1, descriptor: 0,
     }];
     let blob_results = tracker.track(&blob_pyr1, &blob_pyr2, &blob_features);
     if let Some(r) = blob_results.first() {

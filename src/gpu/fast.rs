@@ -496,6 +496,7 @@ impl GpuFastDetector {
                             features.push(Feature {
                                 x: best_x as f32, y: best_y as f32,
                                 score: best_score, level: pyramid_level, id: 0,
+                                descriptor: 0,
                             });
                         }
                     }
@@ -513,7 +514,7 @@ impl GpuFastDetector {
                 let winners: &[CellWinner] = bytemuck::cast_slice(&mapped);
                 let features = winners.iter()
                     .filter(|w| w.score > 0.0)
-                    .map(|w| Feature { x: w.x, y: w.y, score: w.score, level: pyramid_level, id: 0 })
+                    .map(|w| Feature { x: w.x, y: w.y, score: w.score, level: pyramid_level, id: 0, descriptor: 0 })
                     .collect();
                 drop(mapped);
                 s.rb_buf.unmap();

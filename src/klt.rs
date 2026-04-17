@@ -384,6 +384,7 @@ impl KltTracker {
                             score: feature.score,
                             level: feature.level,
                             id: feature.id,
+                            descriptor: feature.descriptor,
                         },
                         status: TrackStatus::Lost,
                     };
@@ -414,6 +415,7 @@ impl KltTracker {
                 score: feature.score,
                 level: feature.level,
                 id: feature.id,
+                descriptor: feature.descriptor,
             },
             status,
         }
@@ -1893,7 +1895,7 @@ mod tests {
 
         let tracker = KltTracker::new(5, 30, 0.01, 3);
         let features = vec![Feature {
-            x: 41.0, y: 41.0, score: 100.0, level: 0, id: 1,
+            x: 41.0, y: 41.0, score: 100.0, level: 0, id: 1, descriptor: 0,
         }];
 
         let results = tracker.track(&pyr, &pyr, &features);
@@ -1918,7 +1920,7 @@ mod tests {
 
         let tracker = KltTracker::new(7, 30, 0.01, 3);
         let features = vec![Feature {
-            x: 41.0, y: 41.0, score: 100.0, level: 0, id: 1,
+            x: 41.0, y: 41.0, score: 100.0, level: 0, id: 1, descriptor: 0,
         }];
 
         let results = tracker.track(&pyr1, &pyr2, &features);
@@ -1940,7 +1942,7 @@ mod tests {
 
         let tracker = KltTracker::new(7, 30, 0.01, 3);
         let features = vec![Feature {
-            x: 41.0, y: 41.0, score: 100.0, level: 0, id: 1,
+            x: 41.0, y: 41.0, score: 100.0, level: 0, id: 1, descriptor: 0,
         }];
 
         let results = tracker.track(&pyr1, &pyr2, &features);
@@ -1962,9 +1964,9 @@ mod tests {
 
         let tracker = KltTracker::new(5, 30, 0.01, 3);
         let features = vec![
-            Feature { x: 41.0, y: 50.0, score: 100.0, level: 0, id: 1 },
-            Feature { x: 55.0, y: 41.0, score: 90.0, level: 0, id: 2 },
-            Feature { x: 69.0, y: 55.0, score: 80.0, level: 0, id: 3 },
+            Feature { x: 41.0, y: 50.0, score: 100.0, level: 0, id: 1, descriptor: 0 },
+            Feature { x: 55.0, y: 41.0, score: 90.0, level: 0, id: 2, descriptor: 0 },
+            Feature { x: 69.0, y: 55.0, score: 80.0, level: 0, id: 3, descriptor: 0 },
         ];
 
         let results = tracker.track(&pyr1, &pyr2, &features);
@@ -1981,7 +1983,7 @@ mod tests {
 
         let tracker = KltTracker::new(7, 30, 0.01, 3);
         let features = vec![Feature {
-            x: 3.0, y: 3.0, score: 50.0, level: 0, id: 1,
+            x: 3.0, y: 3.0, score: 50.0, level: 0, id: 1, descriptor: 0,
         }];
 
         let results = tracker.track(&pyr, &pyr, &features);
@@ -1999,7 +2001,7 @@ mod tests {
 
         let tracker = KltTracker::new(5, 30, 0.01, 3);
         let features = vec![Feature {
-            x: 30.0, y: 30.0, score: 50.0, level: 0, id: 1,
+            x: 30.0, y: 30.0, score: 50.0, level: 0, id: 1, descriptor: 0,
         }];
 
         let results = tracker.track(&pyr, &pyr, &features);
@@ -2017,8 +2019,8 @@ mod tests {
 
         let tracker = KltTracker::new(5, 30, 0.01, 3);
         let features = vec![
-            Feature { x: 41.0, y: 41.0, score: 100.0, level: 0, id: 42 },
-            Feature { x: 69.0, y: 69.0, score: 80.0, level: 0, id: 99 },
+            Feature { x: 41.0, y: 41.0, score: 100.0, level: 0, id: 42, descriptor: 0 },
+            Feature { x: 69.0, y: 69.0, score: 80.0, level: 0, id: 99, descriptor: 0 },
         ];
 
         let results = tracker.track(&pyr, &pyr, &features);
@@ -2052,7 +2054,7 @@ mod tests {
 
         let tracker = KltTracker::new(7, 30, 0.01, 3);
         let features = vec![Feature {
-            x: 40.0, y: 40.0, score: 100.0, level: 0, id: 1,
+            x: 40.0, y: 40.0, score: 100.0, level: 0, id: 1, descriptor: 0,
         }];
 
         let results = tracker.track(&pyr1, &pyr2, &features);
@@ -2077,7 +2079,7 @@ mod tests {
 
         let tracker = make_ic_tracker(5, 3);
         let features = vec![Feature {
-            x: 41.0, y: 41.0, score: 100.0, level: 0, id: 1,
+            x: 41.0, y: 41.0, score: 100.0, level: 0, id: 1, descriptor: 0,
         }];
 
         let results = tracker.track(&pyr, &pyr, &features);
@@ -2101,7 +2103,7 @@ mod tests {
 
         let tracker = make_ic_tracker(7, 3);
         let features = vec![Feature {
-            x: 41.0, y: 41.0, score: 100.0, level: 0, id: 1,
+            x: 41.0, y: 41.0, score: 100.0, level: 0, id: 1, descriptor: 0,
         }];
 
         let results = tracker.track(&pyr1, &pyr2, &features);
@@ -2123,7 +2125,7 @@ mod tests {
 
         let tracker = make_ic_tracker(7, 3);
         let features = vec![Feature {
-            x: 41.0, y: 41.0, score: 100.0, level: 0, id: 1,
+            x: 41.0, y: 41.0, score: 100.0, level: 0, id: 1, descriptor: 0,
         }];
 
         let results = tracker.track(&pyr1, &pyr2, &features);
@@ -2159,7 +2161,7 @@ mod tests {
 
         let tracker = make_ic_tracker(7, 3);
         let features = vec![Feature {
-            x: 40.0, y: 40.0, score: 100.0, level: 0, id: 1,
+            x: 40.0, y: 40.0, score: 100.0, level: 0, id: 1, descriptor: 0,
         }];
 
         let results = tracker.track(&pyr1, &pyr2, &features);
@@ -2178,7 +2180,7 @@ mod tests {
 
         let tracker = make_ic_tracker(5, 3);
         let features = vec![Feature {
-            x: 30.0, y: 30.0, score: 50.0, level: 0, id: 1,
+            x: 30.0, y: 30.0, score: 50.0, level: 0, id: 1, descriptor: 0,
         }];
 
         let results = tracker.track(&pyr, &pyr, &features);
@@ -2194,7 +2196,7 @@ mod tests {
         let pyr2 = Pyramid::build(&img2, 3, 1.0);
 
         let features = vec![Feature {
-            x: 41.0, y: 41.0, score: 100.0, level: 0, id: 1,
+            x: 41.0, y: 41.0, score: 100.0, level: 0, id: 1, descriptor: 0,
         }];
 
         let fa_tracker = KltTracker::new(7, 30, 0.01, 3);
@@ -2285,7 +2287,7 @@ mod tests {
 
         let tracker = make_fixed_tracker(5, 3);
         let features = vec![Feature {
-            x: 41.0, y: 41.0, score: 100.0, level: 0, id: 1,
+            x: 41.0, y: 41.0, score: 100.0, level: 0, id: 1, descriptor: 0,
         }];
 
         let results = tracker.track(&pyr, &pyr, &features);
@@ -2309,7 +2311,7 @@ mod tests {
 
         let tracker = make_fixed_tracker(7, 3);
         let features = vec![Feature {
-            x: 41.0, y: 41.0, score: 100.0, level: 0, id: 1,
+            x: 41.0, y: 41.0, score: 100.0, level: 0, id: 1, descriptor: 0,
         }];
 
         let results = tracker.track(&pyr1, &pyr2, &features);
@@ -2331,7 +2333,7 @@ mod tests {
 
         let tracker = make_fixed_tracker(7, 3);
         let features = vec![Feature {
-            x: 41.0, y: 41.0, score: 100.0, level: 0, id: 1,
+            x: 41.0, y: 41.0, score: 100.0, level: 0, id: 1, descriptor: 0,
         }];
 
         let results = tracker.track(&pyr1, &pyr2, &features);
@@ -2350,7 +2352,7 @@ mod tests {
 
         let tracker = make_fixed_tracker(5, 3);
         let features = vec![Feature {
-            x: 30.0, y: 30.0, score: 50.0, level: 0, id: 1,
+            x: 30.0, y: 30.0, score: 50.0, level: 0, id: 1, descriptor: 0,
         }];
 
         let results = tracker.track(&pyr, &pyr, &features);
@@ -2367,7 +2369,7 @@ mod tests {
         let pyr2 = Pyramid::build(&img2, 3, 1.0);
 
         let features = vec![Feature {
-            x: 41.0, y: 41.0, score: 100.0, level: 0, id: 1,
+            x: 41.0, y: 41.0, score: 100.0, level: 0, id: 1, descriptor: 0,
         }];
 
         let ic_tracker = make_ic_tracker(7, 3);
