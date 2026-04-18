@@ -86,7 +86,7 @@ cargo bench
 | `occupancy` | Occupancy grid for spatial feature distribution | `detector_base_gpu_cuda_tools.cu` |
 | `histeq` | Histogram equalization (global + CLAHE) for brightness normalization | -- |
 | `camera` | Pinhole camera model, EuRoC YAML parser, undistortion | -- |
-| `essential` | 8-point essential matrix + RANSAC outlier rejection (uses lalir) | -- |
+| `essential` | 8-point essential matrix + RANSAC outlier rejection (uses nalgebra) | -- |
 | `frontend` | Complete detect-track-replenish pipeline with geometric verification | `vilib_ros.cpp` |
 | `gpu::device` | `GpuDevice` abstraction (device/queue/adapter selection) | -- |
 | `gpu::pyramid` | WGSL Gaussian pyramid kernel | `pyramid_gpu.cu` |

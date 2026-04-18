@@ -14,11 +14,9 @@
 //
 // RANSAC wrapper for robust estimation with outlier rejection.
 //
-// Uses lalir for all linear algebra (stack-allocated, const-generic).
+// Uses nalgebra for all linear algebra (stack-allocated, fixed-size).
 
-use lalir::matrix::Matrix as LMatrix;
-use lalir::svd_gk::svd_golub_kahan;
-use lalir::svd::reconstruct;
+use nalgebra::{SMatrix, SVector};
 
 /// A pair of normalized correspondences: (x, y) in frame 1, (x', y') in frame 2.
 #[derive(Debug, Clone, Copy)]
@@ -93,52 +91,48 @@ pub fn eight_point(correspondences: &[Correspondence]) -> Option<[[f64; 3]; 3]> 
     // Each correspondence contributes one row a_i to the constraint matrix A,
     // where a_i = [x2*x1, x2*y1, x2, y2*x1, y2*y1, y2, x1, y1, 1].
     // Instead of storing the full Nx9 matrix A, we accumulate M = sum(a_i * a_i^T).
-    let mut m = LMatrix::<9, 9>::zeros();
+    let mut m = SMatrix::<f64, 9, 9>::zeros();
 
     for c in correspondences {
         // Apply Hartley normalization.
         let (x1, y1) = apply_transform(&t1, c.x1, c.y1);
         let (x2, y2) = apply_transform(&t2, c.x2, c.y2);
 
-        let a = [
+        let a = SVector::<f64, 9>::from_column_slice(&[
             x2 * x1, x2 * y1, x2,
             y2 * x1, y2 * y1, y2,
             x1,      y1,      1.0,
-        ];
+        ]);
 
         // Accumulate outer product: M += a * a^T
-        for i in 0..9 {
-            for j in 0..9 {
-                m[(i, j)] += a[i] * a[j];
-            }
-        }
+        m += a * a.transpose();
     }
 
     // SVD of M. The solution is the right singular vector corresponding
-    // to the smallest singular value (last column of V after sorting).
-    let svd = svd_golub_kahan(&m);
+    // to the smallest singular value.
+    // Since M is symmetric positive semi-definite (A^T A), we could use
+    // eigen decomposition, but SVD is fine.
+    let svd = m.svd(false, true);
+    let v_t = svd.v_t.unwrap();
 
-    // Last column of V (index 8 = smallest singular value after descending sort).
+    // Smallest singular value corresponds to the last row of V^T.
     let mut e_vec = [0.0f64; 9];
     for i in 0..9 {
-        e_vec[i] = svd.v[(i, 8)];
+        e_vec[i] = v_t[(8, i)];
     }
 
-    // Reshape to 3x3.
-    let mut e = LMatrix::<3, 3>::from_slice(&e_vec);
+    // Reshape to 3x3. nalgebra's from_row_slice matches the order of e_vec.
+    let mut e = SMatrix::<f64, 3, 3>::from_row_slice(&e_vec);
 
     // Enforce rank-2 constraint: SVD of E, set smallest singular value to 0.
-    let svd_e = svd_golub_kahan(&e);
-    let mut s = svd_e.s;
+    let svd_e = e.svd(true, true);
+    let u = svd_e.u.unwrap();
+    let mut s = svd_e.singular_values;
+    let v_t = svd_e.v_t.unwrap();
     s[2] = 0.0; // Force rank 2.
 
     // Reconstruct E = U * diag(s) * V^T.
-    let e_svd = lalir::svd::SVD {
-        u: svd_e.u,
-        s,
-        v: svd_e.v,
-    };
-    e = reconstruct(&e_svd);
+    e = u * SMatrix::<f64, 3, 3>::from_diagonal(&s) * v_t;
 
     // Undo Hartley normalization: E_orig = T2^T * E_norm * T1.
     let t1_mat = transform_to_matrix(&t1);
@@ -146,11 +140,11 @@ pub fn eight_point(correspondences: &[Correspondence]) -> Option<[[f64; 3]; 3]> 
     e = t2_mat.transpose() * e * t1_mat;
 
     // Normalize E so that ||E||_F = 1 (convention).
-    let norm = e.norm_fro();
+    let norm = e.norm();
     if norm < 1e-15 {
         return None;
     }
-    e = e.scale(1.0 / norm);
+    e /= norm;
 
     let mut result = [[0.0f64; 3]; 3];
     for i in 0..3 {
@@ -359,11 +353,11 @@ fn apply_transform(t: &NormTransform, x: f64, y: f64) -> (f64, f64) {
     ((x - t.tx) * t.scale, (y - t.ty) * t.scale)
 }
 
-fn transform_to_matrix(t: &NormTransform) -> LMatrix<3, 3> {
+fn transform_to_matrix(t: &NormTransform) -> SMatrix<f64, 3, 3> {
     // T = [s  0  -s*tx]
     //     [0  s  -s*ty]
     //     [0  0   1   ]
-    let mut m = LMatrix::<3, 3>::zeros();
+    let mut m = SMatrix::<f64, 3, 3>::zeros();
     m[(0, 0)] = t.scale;
     m[(1, 1)] = t.scale;
     m[(0, 2)] = -t.scale * t.tx;
@@ -373,7 +367,7 @@ fn transform_to_matrix(t: &NormTransform) -> LMatrix<3, 3> {
 }
 
 // ============================================================
-// Tiny math helpers (avoid lalir overhead for 3-vectors)
+// Tiny math helpers (avoid nalgebra overhead for 3-vectors where simple)
 // ============================================================
 
 fn mat3_vec3(m: &[[f64; 3]; 3], v: &[f64; 3]) -> [f64; 3] {

@@ -439,14 +439,23 @@ impl Frontend {
             let suppressed = nms.suppress(&new_features, self.img_w, self.img_h);
 
             // Step 5: Add new features with unique IDs.
+            let curr_img = &self.curr_pyramid.levels[0];
             for f in suppressed.iter().take(slots_available) {
+                // Ensure every feature has a valid LBP descriptor for later verification.
+                // FAST already provides this, but Harris/others might leave it as 0.
+                let descriptor = if f.descriptor == 0 {
+                    compute_lbp_at(curr_img, f.x, f.y)
+                } else {
+                    f.descriptor
+                };
+
                 let new_feat = Feature {
                     x: f.x,
                     y: f.y,
                     score: f.score,
                     level: f.level,
                     id: self.next_id,
-                    descriptor: f.descriptor,
+                    descriptor,
                 };
                 self.next_id += 1;
                 self.features.push(new_feat);

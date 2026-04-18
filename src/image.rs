@@ -1,14 +1,14 @@
 // image.rs — Runtime-sized image container, generic over pixel type.
 //
-// KEY DIFFERENCES FROM lalir::Matrix<M, N>:
+// KEY DIFFERENCES FROM nalgebra::SMatrix<T, M, N>:
 // ┌──────────────────────────┬───────────────────────────────────────┐
-// │  lalir::Matrix<M, N>     │  Image<T>                             │
+// │  nalgebra::SMatrix<T,M,N>│  Image<T>                             │
 // ├──────────────────────────┼───────────────────────────────────────┤
 // │  Dimensions at compile   │  Dimensions at runtime                │
 // │  time (const generics)   │  (stored as usize fields)             │
 // ├──────────────────────────┼───────────────────────────────────────┤
 // │  Stack-allocated array   │  Heap-allocated Vec<T>                │
-// │  [T; M * N]              │  (size known only at runtime)         │
+// │  (usually)               │  (size known only at runtime)         │
 // ├──────────────────────────┼───────────────────────────────────────┤
 // │  Fixed-size → no stride  │  Stride may differ from width         │
 // │  concerns                │  (alignment padding for GPU later)    │

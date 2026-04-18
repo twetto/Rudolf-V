@@ -9,8 +9,8 @@ description = "RUst Device-Optimized Library for Frontend Vision"
 image = "0.25"
 # Live visualization window (minimal framebuffer)
 minifb = "0.27"
-# Linear algebra (const-generic, stack-allocated) -- for geometric verification
-lalir = { git = "https://github.com/twetto/lalir" }
+# Linear algebra (geometric verification, SVD)
+nalgebra = "0.33"
 # GPU compute (Vulkan/Metal/DX12/WebGPU backends)
 wgpu = "22"
 # Minimal async executor for blocking on wgpu futures in sync context

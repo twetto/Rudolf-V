@@ -140,7 +140,7 @@ impl HarrisDetector {
                         x: x as f32,
                         y: y as f32,
                         score: r,
-                        level: 0,
+                        level,
                         id: 0,
                         descriptor: 0,
                     });
