@@ -90,7 +90,9 @@ pub struct KltScratch {
 
 impl KltScratch {
     pub fn new(window_size: usize) -> Self {
-        let patch_size = (2 * window_size + 1) * (2 * window_size + 1);
+        let side = 2 * window_size + 1;
+        let stride = (side + 7) & !7;
+        let patch_size = stride * side;
         KltScratch {
             t_buf: vec![0.0; patch_size],
             gx_buf: vec![0.0; patch_size],
@@ -176,7 +178,9 @@ pub struct KltScratchFixed {
 
 impl KltScratchFixed {
     pub fn new(window_size: usize) -> Self {
-        let patch_size = (2 * window_size + 1) * (2 * window_size + 1);
+        let side = 2 * window_size + 1;
+        let stride = (side + 7) & !7;
+        let patch_size = stride * side;
         KltScratchFixed {
             t_buf: vec![0; patch_size],
             gx_buf: vec![0; patch_size],
@@ -282,7 +286,8 @@ impl KltTracker {
             .min(curr_pyramid.num_levels());
 
         let side = 2 * self.window_size + 1;
-        let patch_size = side * side;
+        let stride = (side + 7) & !7;
+        let patch_size = stride * side;
 
         // ── Parallel path (feature-gated) ───────────────────────────────
         #[cfg(feature = "parallel")]
@@ -535,10 +540,9 @@ impl KltTracker {
     /// - CONSTANT BILINEAR WEIGHTS: frac(feat_x + px) = frac(feat_x)
     ///   for integer px. Weights computed once, not per pixel.
     /// - ROW-POINTER ACCESS: eliminates y * stride from inner loop.
-    /// - TWO-PHASE ITERATION: extract warped → SIMD accumulate.
-    /// - AVX2+FMA SIMD: accumulate_ic processes 8 floats per cycle.
-    ///   accumulate_hessian does the same for the precompute.
-    ///   extract_warped_row_simd vectorizes the bilinear extraction.
+    /// - FUSED ITERATION: sample warped pixels and accumulate b0, b1 in one pass.
+    /// - AVX2+FMA SIMD: warp_and_accumulate processes 8 floats per cycle.
+    /// - extract_template_gradients vectorizes the precompute pass.
     /// - HOISTED SCRATCH: zero per-feature allocation.
     fn lk_inverse_compositional(
         &self,
@@ -552,7 +556,9 @@ impl KltTracker {
     ) -> LkResult {
         let half = self.window_size as isize;
         let side = (2 * self.window_size + 1) as isize;
-        let patch_size = (side * side) as usize;
+        let side_u = side as usize;
+        let stride = (side_u + 7) & !7;
+        let patch_size = stride * side_u;
 
         // =================================================================
         // PRECOMPUTE: template values, gradients, Hessian
@@ -579,15 +585,17 @@ impl KltTracker {
         let gx_buf = &mut scratch.gx_buf[..patch_size];
         let gy_buf = &mut scratch.gy_buf[..patch_size];
 
+        let mut h00 = 0.0f32;
+        let mut h01 = 0.0f32;
+        let mut h11 = 0.0f32;
+
         // Fill buffers (template values + gradients).
-        // Hessian is accumulated separately via SIMD after filling.
         if tmpl_in_bounds {
             // ── Fast path: row-pointer + constant-weight bilinear ──
             let base_x = base_x_i as usize;
             let base_y = base_y_i as usize;
 
-            let mut idx = 0;
-            for ly in 0..side as usize {
+            for ly in 0..side_u {
                 let iy = base_y + ly;
                 unsafe {
                     let r_m1 = prev_img.row_ptr(iy - 1);
@@ -595,34 +603,32 @@ impl KltTracker {
                     let r_1  = prev_img.row_ptr(iy + 1);
                     let r_p2 = prev_img.row_ptr(iy + 2);
 
-                    for lx in 0..side as usize {
-                        let ix = base_x + lx;
-
-                        let t_val = bilerp_ptr(r_0, r_1, ix, w00, w10, w01, w11);
-
-                        let gx = 0.5 * (
-                            bilerp_ptr(r_0, r_1, ix + 1, w00, w10, w01, w11)
-                          - bilerp_ptr(r_0, r_1, ix - 1, w00, w10, w01, w11)
-                        );
-
-                        let gy = 0.5 * (
-                            bilerp_ptr(r_1, r_p2, ix, w00, w10, w01, w11)
-                          - bilerp_ptr(r_m1, r_0, ix, w00, w10, w01, w11)
-                        );
-
-                        t_buf[idx] = t_val;
-                        gx_buf[idx] = gx;
-                        gy_buf[idx] = gy;
-
-                        idx += 1;
-                    }
+                    let (rh00, rh01, rh11) = extract_template_gradients(
+                        r_m1, r_0, r_1, r_p2,
+                        base_x, side_u,
+                        w00, w10, w01, w11,
+                        &mut t_buf[ly * stride .. ly * stride + side_u],
+                        &mut gx_buf[ly * stride .. ly * stride + side_u],
+                        &mut gy_buf[ly * stride .. ly * stride + side_u],
+                    );
+                    h00 += rh00;
+                    h01 += rh01;
+                    h11 += rh11;
+                }
+                // Zero-fill stride padding so SIMD iteration reads zeros.
+                for lx in side_u..stride {
+                    t_buf[ly * stride + lx] = 0.0;
+                    gx_buf[ly * stride + lx] = 0.0;
+                    gy_buf[ly * stride + lx] = 0.0;
                 }
             }
         } else {
             // ── Border fallback: clamped bilinear ──
-            let mut idx = 0;
             for py in -half..=half {
+                let ly = (py + half) as usize;
                 for px in -half..=half {
+                    let lx = (px + half) as usize;
+                    let idx = ly * stride + lx;
                     let tx = feat_x + px as f32;
                     let ty = feat_y + py as f32;
 
@@ -640,13 +646,18 @@ impl KltTracker {
                     gx_buf[idx] = gx;
                     gy_buf[idx] = gy;
 
-                    idx += 1;
+                    h00 += gx * gx;
+                    h01 += gx * gy;
+                    h11 += gy * gy;
+                }
+                // Zero-fill stride padding.
+                for lx in side_u..stride {
+                    t_buf[ly * stride + lx] = 0.0;
+                    gx_buf[ly * stride + lx] = 0.0;
+                    gy_buf[ly * stride + lx] = 0.0;
                 }
             }
         }
-
-        // Hessian: SIMD-accelerated triple accumulation over filled buffers.
-        let (h00, h01, h11) = accumulate_hessian(gx_buf, gy_buf);
 
         // Precompute H^{-1} (constant across all iterations).
         let det = h00 * h11 - h01 * h01;
@@ -659,15 +670,10 @@ impl KltTracker {
         let ih11 =  inv_det * h00;
 
         // =================================================================
-        // ITERATE: two-phase extraction + accumulation
+        // ITERATE: fused extraction + accumulation
         // =================================================================
 
-        let warped_buf = &mut scratch.warped_buf[..patch_size];
-        let side_u = side as usize;
-
         for _iter in 0..self.max_iterations {
-            // ── Phase 1: extract warped pixels into contiguous buffer ──
-
             let wx = feat_x + dx;
             let wy = feat_y + dy;
             let fx_w = wx - wx.floor();
@@ -680,46 +686,84 @@ impl KltTracker {
             let bx_i = wx.floor() as isize - half;
             let by_i = wy.floor() as isize - half;
 
+            // Stride-aligned bounds: need bx + stride + 1 columns for
+            // bilinear at padding positions (gx/gy are zero there, so the
+            // image value doesn't affect the result, but the read must be valid).
             let warp_in_bounds = bx_i >= 0
                 && by_i >= 0
-                && bx_i + side + 1 <= curr_img.width() as isize
+                && bx_i + stride as isize + 1 <= curr_img.width() as isize
                 && by_i + side + 1 <= curr_img.height() as isize;
+
+            let mut b0 = 0.0f32;
+            let mut b1 = 0.0f32;
 
             if warp_in_bounds {
                 let bx = bx_i as usize;
                 let by = by_i as usize;
 
-                let mut idx = 0;
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                        let (db0, db1) = ic_iterate_patch_avx2(
+                            curr_img.as_slice().as_ptr(),
+                            curr_img.stride(),
+                            bx, by,
+                            side_u, stride, stride,
+                            ww00, ww10, ww01, ww11,
+                            t_buf.as_ptr(),
+                            gx_buf.as_ptr(),
+                            gy_buf.as_ptr(),
+                        );
+                        b0 += db0;
+                        b1 += db1;
+                    } else {
+                        for ly in 0..side_u {
+                            let r0 = curr_img.row_ptr(by + ly);
+                            let r1 = curr_img.row_ptr(by + ly + 1);
+                            warp_and_accumulate_scalar(
+                                r0, r1, bx, side_u,
+                                ww00, ww10, ww01, ww11,
+                                t_buf[ly * stride..].as_ptr(),
+                                gx_buf[ly * stride..].as_ptr(),
+                                gy_buf[ly * stride..].as_ptr(),
+                                &mut b0, &mut b1,
+                            );
+                        }
+                    }
+                }
+
+                #[cfg(not(target_arch = "x86_64"))]
                 for ly in 0..side_u {
                     unsafe {
                         let r0 = curr_img.row_ptr(by + ly);
                         let r1 = curr_img.row_ptr(by + ly + 1);
-
-                        // SIMD extraction: process 8 pixels at a time.
-                        extract_warped_row(
+                        warp_and_accumulate_scalar(
                             r0, r1, bx, side_u,
                             ww00, ww10, ww01, ww11,
-                            &mut warped_buf[idx..idx + side_u],
+                            t_buf[ly * stride..].as_ptr(),
+                            gx_buf[ly * stride..].as_ptr(),
+                            gy_buf[ly * stride..].as_ptr(),
+                            &mut b0, &mut b1,
                         );
                     }
-                    idx += side_u;
                 }
             } else {
-                let mut idx = 0;
                 for py in -half..=half {
+                    let ly = (py + half) as usize;
                     for px in -half..=half {
-                        warped_buf[idx] = interpolate_bilinear(
+                        let lx = (px + half) as usize;
+                        let idx = ly * stride + lx;
+                        let w_val = interpolate_bilinear(
                             curr_img,
                             wx + px as f32,
                             wy + py as f32,
                         );
-                        idx += 1;
+                        let e = t_buf[idx] - w_val;
+                        b0 += gx_buf[idx] * e;
+                        b1 += gy_buf[idx] * e;
                     }
                 }
             }
-
-            // ── Phase 2: SIMD-accelerated accumulate b = J^T * error ──
-            let (b0, b1) = accumulate_ic(t_buf, warped_buf, gx_buf, gy_buf);
 
             let delta_x = ih00 * b0 + ih01 * b1;
             let delta_y = ih01 * b0 + ih11 * b1;
@@ -796,12 +840,16 @@ impl KltTracker {
         // Fill template + gradient buffers in i16
         // =================================================================
 
+        let mut h00 = 0i32;
+        let mut h01 = 0i32;
+        let mut h11 = 0i32;
+
         if tmpl_in_bounds {
             let base_x = base_x_i as usize;
             let base_y = base_y_i as usize;
+            let side_u = side as usize;
 
-            let mut idx = 0;
-            for ly in 0..side as usize {
+            for ly in 0..side_u {
                 let iy = base_y + ly;
                 unsafe {
                     // Four rows for template + gradient neighborhoods.
@@ -810,28 +858,17 @@ impl KltTracker {
                     let r_1  = prev_img.row_ptr(iy + 1);
                     let r_p2 = prev_img.row_ptr(iy + 2);
 
-                    for lx in 0..side as usize {
-                        let ix = base_x + lx;
-
-                        // Integer bilinear: read f32 pixels, convert to u8-scale i32,
-                        // apply integer weights, round, and store as i16.
-                        let t_val = bilerp_fixed(r_0, r_1, ix, iw00, iw10, iw01, iw11);
-
-                        // Gradient gx: central difference (no 0.5 factor — absorbed
-                        // into the Hessian inverse since it cancels out).
-                        let gx = bilerp_fixed(r_0, r_1, ix + 1, iw00, iw10, iw01, iw11)
-                               - bilerp_fixed(r_0, r_1, ix - 1, iw00, iw10, iw01, iw11);
-
-                        // Gradient gy: central difference in y.
-                        let gy = bilerp_fixed(r_1, r_p2, ix, iw00, iw10, iw01, iw11)
-                               - bilerp_fixed(r_m1, r_0, ix, iw00, iw10, iw01, iw11);
-
-                        t_buf[idx] = t_val;
-                        gx_buf[idx] = gx;
-                        gy_buf[idx] = gy;
-
-                        idx += 1;
-                    }
+                    let (rh00, rh01, rh11) = extract_template_gradients_fixed(
+                        r_m1, r_0, r_1, r_p2,
+                        base_x, side_u,
+                        iw00, iw10, iw01, iw11,
+                        &mut t_buf[ly * side_u .. (ly + 1) * side_u],
+                        &mut gx_buf[ly * side_u .. (ly + 1) * side_u],
+                        &mut gy_buf[ly * side_u .. (ly + 1) * side_u],
+                    );
+                    h00 += rh00;
+                    h01 += rh01;
+                    h11 += rh11;
                 }
             }
         } else {
@@ -852,6 +889,10 @@ impl KltTracker {
                     gx_buf[idx] = gx;
                     gy_buf[idx] = gy;
 
+                    h00 += gx as i32 * gx as i32;
+                    h01 += gx as i32 * gy as i32;
+                    h11 += gy as i32 * gy as i32;
+
                     idx += 1;
                 }
             }
@@ -860,8 +901,6 @@ impl KltTracker {
         // =================================================================
         // Hessian: i32 accumulation, f32 inversion
         // =================================================================
-
-        let (h00, h01, h11) = accumulate_hessian_fixed(gx_buf, gy_buf);
 
         // Convert to f32 for 2×2 inversion (trivial cost).
         // The gradient factor of 0.5 was omitted above, so the Hessian
@@ -881,10 +920,9 @@ impl KltTracker {
         let ih11 =  inv_det * h00f;
 
         // =================================================================
-        // ITERATE: extract warped pixels (i16), accumulate b (i32)
+        // ITERATE: fused extraction + accumulation
         // =================================================================
 
-        let warped_buf = &mut scratch.warped_buf[..patch_size];
         let side_u = side as usize;
 
         for _iter in 0..self.max_iterations {
@@ -907,39 +945,43 @@ impl KltTracker {
                 && bx_i + side + 1 <= curr_img.width() as isize
                 && by_i + side + 1 <= curr_img.height() as isize;
 
+            let mut b0 = 0i32;
+            let mut b1 = 0i32;
+
             if warp_in_bounds {
                 let bx = bx_i as usize;
                 let by = by_i as usize;
 
-                let mut idx = 0;
                 for ly in 0..side_u {
                     unsafe {
                         let r0 = curr_img.row_ptr(by + ly);
                         let r1 = curr_img.row_ptr(by + ly + 1);
 
-                        for lx in 0..side_u {
-                            warped_buf[idx] = bilerp_fixed(
-                                r0, r1, bx + lx, iww00, iww10, iww01, iww11,
-                            );
-                            idx += 1;
-                        }
+                        // Fused: sample and accumulate in one pass.
+                        warp_and_accumulate_fixed(
+                            r0, r1, bx, side_u,
+                            iww00, iww10, iww01, iww11,
+                            t_buf[ly * side_u..].as_ptr(),
+                            gx_buf[ly * side_u..].as_ptr(),
+                            gy_buf[ly * side_u..].as_ptr(),
+                            &mut b0, &mut b1,
+                        );
                     }
                 }
             } else {
                 let mut idx = 0;
                 for py in -half..=half {
                     for px in -half..=half {
-                        warped_buf[idx] = interpolate_bilinear(
+                        let w_val = interpolate_bilinear(
                             curr_img, wx + px as f32, wy + py as f32,
                         ).round() as i16;
+                        let e = t_buf[idx] as i32 - w_val as i32;
+                        b0 += gx_buf[idx] as i32 * e;
+                        b1 += gy_buf[idx] as i32 * e;
                         idx += 1;
                     }
                 }
             }
-
-            // ── Phase 2: accumulate b = J^T * error (i16 × i16 → i32) ──
-            // Ready for _mm256_madd_epi16 / NEON vmlal_s16.
-            let (b0, b1) = accumulate_ic_fixed(t_buf, warped_buf, gx_buf, gy_buf);
 
             // Solve in f32 (2×2, trivial).
             let b0f = b0 as f32;
@@ -981,7 +1023,9 @@ impl KltTracker {
     ) -> LkResult {
         let half = self.window_size as isize;
         let side = (2 * self.window_size + 1) as isize;
-        let patch_size = (side * side) as usize;
+        let side_u = side as usize;
+        let stride = (side_u + 7) & !7;
+        let patch_size = stride * side_u;
 
         // Integer fractional offsets (5-bit precision).
         let ifx = ((feat_x - feat_x.floor()) * W_SCALE as f32).round() as i32;
@@ -1003,41 +1047,48 @@ impl KltTracker {
         let gx_buf = &mut scratch.gx_buf[..patch_size];
         let gy_buf = &mut scratch.gy_buf[..patch_size];
 
+        let mut h00 = 0i32;
+        let mut h01 = 0i32;
+        let mut h11 = 0i32;
+
         if tmpl_in_bounds {
             let base_x = base_x_i as usize;
             let base_y = base_y_i as usize;
 
-            let mut idx = 0;
-            for ly in 0..side as usize {
+            for ly in 0..side_u {
                 let iy = base_y + ly;
                 unsafe {
-                    // row_ptr() gives us *const u8 — same pattern as the f32 path.
                     let r_m1 = prev_img.row_ptr(iy - 1);
                     let r_0  = prev_img.row_ptr(iy);
                     let r_1  = prev_img.row_ptr(iy + 1);
                     let r_p2 = prev_img.row_ptr(iy + 2);
 
-                    for lx in 0..side as usize {
-                        let ix = base_x + lx;
-
-                        let t_val = bilerp_fixed_u8(r_0, r_1, ix, iw00, iw10, iw01, iw11);
-                        let gx = bilerp_fixed_u8(r_0, r_1, ix + 1, iw00, iw10, iw01, iw11)
-                               - bilerp_fixed_u8(r_0, r_1, ix - 1, iw00, iw10, iw01, iw11);
-                        let gy = bilerp_fixed_u8(r_1, r_p2, ix, iw00, iw10, iw01, iw11)
-                               - bilerp_fixed_u8(r_m1, r_0, ix, iw00, iw10, iw01, iw11);
-
-                        t_buf[idx] = t_val;
-                        gx_buf[idx] = gx;
-                        gy_buf[idx] = gy;
-                        idx += 1;
-                    }
+                    let (rh00, rh01, rh11) = extract_template_gradients_fixed_u8(
+                        r_m1, r_0, r_1, r_p2,
+                        base_x, side_u,
+                        iw00, iw10, iw01, iw11,
+                        &mut t_buf[ly * stride .. ly * stride + side_u],
+                        &mut gx_buf[ly * stride .. ly * stride + side_u],
+                        &mut gy_buf[ly * stride .. ly * stride + side_u],
+                    );
+                    h00 += rh00;
+                    h01 += rh01;
+                    h11 += rh11;
+                }
+                // Zero-fill stride padding.
+                for lx in side_u..stride {
+                    t_buf[ly * stride + lx] = 0;
+                    gx_buf[ly * stride + lx] = 0;
+                    gy_buf[ly * stride + lx] = 0;
                 }
             }
         } else {
             // Border fallback: clamped bilinear from u8 Image.
-            let mut idx = 0;
             for py in -half..=half {
+                let ly = (py + half) as usize;
                 for px in -half..=half {
+                    let lx = (px + half) as usize;
+                    let idx = ly * stride + lx;
                     let tx = feat_x + px as f32;
                     let ty = feat_y + py as f32;
 
@@ -1050,13 +1101,19 @@ impl KltTracker {
                     t_buf[idx] = t_val;
                     gx_buf[idx] = gx;
                     gy_buf[idx] = gy;
-                    idx += 1;
+
+                    h00 += gx as i32 * gx as i32;
+                    h01 += gx as i32 * gy as i32;
+                    h11 += gy as i32 * gy as i32;
+                }
+                // Zero-fill stride padding.
+                for lx in side_u..stride {
+                    t_buf[ly * stride + lx] = 0;
+                    gx_buf[ly * stride + lx] = 0;
+                    gy_buf[ly * stride + lx] = 0;
                 }
             }
         }
-
-        // Hessian (i32 via SIMD madd_epi16 / vmlal_s16).
-        let (h00, h01, h11) = accumulate_hessian_fixed(gx_buf, gy_buf);
 
         let h00f = h00 as f32;
         let h01f = h01 as f32;
@@ -1071,9 +1128,6 @@ impl KltTracker {
         let ih11 =  inv_det * h00f;
 
         // Iterate.
-        let warped_buf = &mut scratch.warped_buf[..patch_size];
-        let side_u = side as usize;
-
         for _iter in 0..self.max_iterations {
             let wx = feat_x + dx;
             let wy = feat_y + dy;
@@ -1090,42 +1144,86 @@ impl KltTracker {
 
             let warp_in_bounds = bx_i >= 0
                 && by_i >= 0
-                && bx_i + side + 1 <= curr_img.width() as isize
+                && bx_i + stride as isize + 1 <= curr_img.width() as isize
                 && by_i + side + 1 <= curr_img.height() as isize;
+
+            let mut b0 = 0i32;
+            let mut b1 = 0i32;
 
             if warp_in_bounds {
                 let bx = bx_i as usize;
                 let by = by_i as usize;
 
-                let mut idx = 0;
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    if is_x86_feature_detected!("avx2") {
+                        use std::arch::x86_64::*;
+                        let mut v_b0 = _mm256_setzero_si256();
+                        let mut v_b1 = _mm256_setzero_si256();
+
+                        for ly in 0..side_u {
+                            let r0 = curr_img.row_ptr(by + ly);
+                            let r1 = curr_img.row_ptr(by + ly + 1);
+
+                            // Stride-aligned: no scalar tail.
+                            warp_and_accumulate_fixed_u8_avx2(
+                                r0, r1, bx, stride,
+                                iww00, iww10, iww01, iww11,
+                                t_buf[ly * stride..].as_ptr(),
+                                gx_buf[ly * stride..].as_ptr(),
+                                gy_buf[ly * stride..].as_ptr(),
+                                &mut v_b0, &mut v_b1,
+                            );
+                        }
+                        b0 += hsum256_epi32(v_b0);
+                        b1 += hsum256_epi32(v_b1);
+                    } else {
+                        for ly in 0..side_u {
+                            let r0 = curr_img.row_ptr(by + ly);
+                            let r1 = curr_img.row_ptr(by + ly + 1);
+                            warp_and_accumulate_fixed_u8_scalar(
+                                r0, r1, bx, side_u,
+                                iww00, iww10, iww01, iww11,
+                                t_buf[ly * stride..].as_ptr(),
+                                gx_buf[ly * stride..].as_ptr(),
+                                gy_buf[ly * stride..].as_ptr(),
+                                &mut b0, &mut b1,
+                            );
+                        }
+                    }
+                }
+
+                #[cfg(not(target_arch = "x86_64"))]
                 for ly in 0..side_u {
                     unsafe {
                         let r0 = curr_img.row_ptr(by + ly);
                         let r1 = curr_img.row_ptr(by + ly + 1);
-
-                        extract_warped_row_fixed_u8(
+                        warp_and_accumulate_fixed_u8_scalar(
                             r0, r1, bx, side_u,
                             iww00, iww10, iww01, iww11,
-                            &mut warped_buf[idx..idx + side_u],
+                            t_buf[ly * stride..].as_ptr(),
+                            gx_buf[ly * stride..].as_ptr(),
+                            gy_buf[ly * stride..].as_ptr(),
+                            &mut b0, &mut b1,
                         );
                     }
-                    idx += side_u;
                 }
             } else {
-                let mut idx = 0;
                 for py in -half..=half {
+                    let ly = (py + half) as usize;
                     for px in -half..=half {
-                        warped_buf[idx] = bilerp_clamped_u8(
+                        let lx = (px + half) as usize;
+                        let idx = ly * stride + lx;
+                        let w_val = bilerp_clamped_u8(
                             curr_img,
                             wx + px as f32, wy + py as f32,
                         );
-                        idx += 1;
+                        let e = t_buf[idx] as i32 - w_val as i32;
+                        b0 += gx_buf[idx] as i32 * e;
+                        b1 += gy_buf[idx] as i32 * e;
                     }
                 }
             }
-
-            // Accumulate b = J^T * error (i16 × i16 → i32, SIMD).
-            let (b0, b1) = accumulate_ic_fixed(t_buf, warped_buf, gx_buf, gy_buf);
 
             let b0f = b0 as f32;
             let b1f = b1 as f32;
@@ -1175,108 +1273,109 @@ unsafe fn bilerp_ptr(
 // then dispatches to the SIMD or scalar implementation.
 // ==========================================================================
 
-/// Accumulate the IC right-hand side: b0 = Σ gx·(t-w), b1 = Σ gy·(t-w).
+/// Extract template values and gradients for one row, accumulating row-wise Hessian.
 ///
-/// This runs every IC iteration × every feature × every level — it's the
-/// single hottest loop in the entire frontend pipeline.
-#[inline]
-fn accumulate_ic(t: &[f32], w: &[f32], gx: &[f32], gy: &[f32]) -> (f32, f32) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return unsafe { accumulate_ic_avx2(t, w, gx, gy) };
-        }
-    }
-    accumulate_ic_scalar(t, w, gx, gy)
-}
-
-/// Accumulate the Hessian: h00 = Σ gx², h01 = Σ gx·gy, h11 = Σ gy².
-///
-/// Runs once per feature per level during IC precompute.
-#[inline]
-fn accumulate_hessian(gx: &[f32], gy: &[f32]) -> (f32, f32, f32) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return unsafe { accumulate_hessian_avx2(gx, gy) };
-        }
-    }
-    accumulate_hessian_scalar(gx, gy)
-}
-
-/// Extract one row of warped pixels via bilinear interpolation.
+/// This replaces the scalar loop in `lk_inverse_compositional` with an AVX2-optimized
+/// version that computes I, Ix, Iy and Hessian sums in a single pass.
 ///
 /// # Safety
-/// Caller must ensure r0, r1 have at least `bx + count + 1` valid elements.
+/// Caller must ensure r_m1, r_0, r_1, r_p2 have at least `bx + count + 1` valid elements,
+/// and `bx >= 1`.
 #[inline]
-unsafe fn extract_warped_row(
-    r0: *const f32, r1: *const f32,
+unsafe fn extract_template_gradients(
+    r_m1: *const f32, r_0: *const f32, r_1: *const f32, r_p2: *const f32,
     bx: usize, count: usize,
     w00: f32, w10: f32, w01: f32, w11: f32,
-    out: &mut [f32],
-) {
+    t_out: &mut [f32],
+    gx_out: &mut [f32],
+    gy_out: &mut [f32],
+) -> (f32, f32, f32) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            extract_warped_row_avx2(r0, r1, bx, count, w00, w10, w01, w11, out);
-            return;
+            return extract_template_gradients_avx2(
+                r_m1, r_0, r_1, r_p2,
+                bx, count,
+                w00, w10, w01, w11,
+                t_out, gx_out, gy_out,
+            );
         }
     }
-    extract_warped_row_scalar(r0, r1, bx, count, w00, w10, w01, w11, out);
-}
-
-// ==========================================================================
-// Scalar implementations (fallback for non-x86 or missing AVX2)
-// ==========================================================================
-
-#[inline]
-fn accumulate_ic_scalar(t: &[f32], w: &[f32], gx: &[f32], gy: &[f32]) -> (f32, f32) {
-    debug_assert_eq!(t.len(), w.len());
-    debug_assert_eq!(t.len(), gx.len());
-    debug_assert_eq!(t.len(), gy.len());
-
-    let mut b0 = 0.0f32;
-    let mut b1 = 0.0f32;
-
-    for i in 0..t.len() {
-        let e = unsafe { *t.get_unchecked(i) - *w.get_unchecked(i) };
-        b0 += unsafe { *gx.get_unchecked(i) } * e;
-        b1 += unsafe { *gy.get_unchecked(i) } * e;
-    }
-
-    (b0, b1)
+    extract_template_gradients_scalar(
+        r_m1, r_0, r_1, r_p2,
+        bx, count,
+        w00, w10, w01, w11,
+        t_out, gx_out, gy_out,
+    )
 }
 
 #[inline]
-fn accumulate_hessian_scalar(gx: &[f32], gy: &[f32]) -> (f32, f32, f32) {
-    debug_assert_eq!(gx.len(), gy.len());
-
+unsafe fn extract_template_gradients_scalar(
+    r_m1: *const f32, r_0: *const f32, r_1: *const f32, r_p2: *const f32,
+    bx: usize, count: usize,
+    w00: f32, w10: f32, w01: f32, w11: f32,
+    t_out: &mut [f32],
+    gx_out: &mut [f32],
+    gy_out: &mut [f32],
+) -> (f32, f32, f32) {
     let mut h00 = 0.0f32;
     let mut h01 = 0.0f32;
     let mut h11 = 0.0f32;
 
-    for i in 0..gx.len() {
-        let gxi = unsafe { *gx.get_unchecked(i) };
-        let gyi = unsafe { *gy.get_unchecked(i) };
-        h00 += gxi * gxi;
-        h01 += gxi * gyi;
-        h11 += gyi * gyi;
-    }
+    for lx in 0..count {
+        let ix = bx + lx;
+        let t_val = bilerp_ptr(r_0, r_1, ix, w00, w10, w01, w11);
+        let gx = 0.5 * (
+            bilerp_ptr(r_0, r_1, ix + 1, w00, w10, w01, w11)
+          - bilerp_ptr(r_0, r_1, ix - 1, w00, w10, w01, w11)
+        );
+        let gy = 0.5 * (
+            bilerp_ptr(r_1, r_p2, ix, w00, w10, w01, w11)
+          - bilerp_ptr(r_m1, r_0, ix, w00, w10, w01, w11)
+        );
 
+        *t_out.get_unchecked_mut(lx) = t_val;
+        *gx_out.get_unchecked_mut(lx) = gx;
+        *gy_out.get_unchecked_mut(lx) = gy;
+
+        h00 += gx * gx;
+        h01 += gx * gy;
+        h11 += gy * gy;
+    }
     (h00, h01, h11)
 }
 
+/// Fixed-point template and gradient extraction for one row (f32 image).
 #[inline]
-unsafe fn extract_warped_row_scalar(
-    r0: *const f32, r1: *const f32,
+unsafe fn extract_template_gradients_fixed(
+    r_m1: *const f32, r_0: *const f32, r_1: *const f32, r_p2: *const f32,
     bx: usize, count: usize,
-    w00: f32, w10: f32, w01: f32, w11: f32,
-    out: &mut [f32],
-) {
+    iw00: i32, iw10: i32, iw01: i32, iw11: i32,
+    t_out: &mut [i16],
+    gx_out: &mut [i16],
+    gy_out: &mut [i16],
+) -> (i32, i32, i32) {
+    let mut h00 = 0i32;
+    let mut h01 = 0i32;
+    let mut h11 = 0i32;
+
     for lx in 0..count {
         let ix = bx + lx;
-        *out.get_unchecked_mut(lx) = bilerp_ptr(r0, r1, ix, w00, w10, w01, w11);
+        let t_val = bilerp_fixed(r_0, r_1, ix, iw00, iw10, iw01, iw11);
+        let gx = bilerp_fixed(r_0, r_1, ix + 1, iw00, iw10, iw01, iw11)
+               - bilerp_fixed(r_0, r_1, ix - 1, iw00, iw10, iw01, iw11);
+        let gy = bilerp_fixed(r_1, r_p2, ix, iw00, iw10, iw01, iw11)
+               - bilerp_fixed(r_m1, r_0, ix, iw00, iw10, iw01, iw11);
+
+        *t_out.get_unchecked_mut(lx) = t_val;
+        *gx_out.get_unchecked_mut(lx) = gx;
+        *gy_out.get_unchecked_mut(lx) = gy;
+
+        h00 += gx as i32 * gx as i32;
+        h01 += gx as i32 * gy as i32;
+        h11 += gy as i32 * gy as i32;
     }
+    (h00, h01, h11)
 }
 
 // ==========================================================================
@@ -1303,149 +1402,122 @@ mod simd_avx2 {
     }
 }
 
-/// AVX2+FMA paired dot-product for IC accumulation.
-///
-/// Processes 8 f32s per iteration. For 529 elements (23×23 patch):
-/// 66 full AVX2 iterations + 1-element scalar tail.
-/// Each iteration: 1 sub + 2 FMA = 3 AVX2 instructions on 8 lanes.
-///
-/// vs scalar: 529 iterations × (1 sub + 2 mul + 2 add) = 2645 ops.
-/// Theoretical speedup: ~8× (limited by FMA throughput, not latency,
-/// since the accumulator dependency chain is broken by out-of-order exec).
+/// AVX2+FMA vectorized template and gradient extraction for one row.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn accumulate_ic_avx2(t: &[f32], w: &[f32], gx: &[f32], gy: &[f32]) -> (f32, f32) {
+unsafe fn extract_template_gradients_avx2(
+    r_m1: *const f32, r_0: *const f32, r_1: *const f32, r_p2: *const f32,
+    bx: usize, count: usize,
+    w00: f32, w10: f32, w01: f32, w11: f32,
+    t_out: &mut [f32],
+    gx_out: &mut [f32],
+    gy_out: &mut [f32],
+) -> (f32, f32, f32) {
     use std::arch::x86_64::*;
 
-    let n = t.len();
-    let chunks = n / 8;
-
-    let mut sum_b0 = _mm256_setzero_ps();
-    let mut sum_b1 = _mm256_setzero_ps();
-
-    let t_ptr = t.as_ptr();
-    let w_ptr = w.as_ptr();
-    let gx_ptr = gx.as_ptr();
-    let gy_ptr = gy.as_ptr();
-
-    for i in 0..chunks {
-        let off = i * 8;
-        let vt  = _mm256_loadu_ps(t_ptr.add(off));
-        let vw  = _mm256_loadu_ps(w_ptr.add(off));
-        let ve  = _mm256_sub_ps(vt, vw);          // e = t - w
-
-        let vgx = _mm256_loadu_ps(gx_ptr.add(off));
-        let vgy = _mm256_loadu_ps(gy_ptr.add(off));
-
-        sum_b0 = _mm256_fmadd_ps(vgx, ve, sum_b0); // b0 += gx * e
-        sum_b1 = _mm256_fmadd_ps(vgy, ve, sum_b1); // b1 += gy * e
-    }
-
-    let mut b0 = simd_avx2::hsum256(sum_b0);
-    let mut b1 = simd_avx2::hsum256(sum_b1);
-
-    // Scalar tail (0–7 elements).
-    for i in (chunks * 8)..n {
-        let e = *t_ptr.add(i) - *w_ptr.add(i);
-        b0 += *gx_ptr.add(i) * e;
-        b1 += *gy_ptr.add(i) * e;
-    }
-
-    (b0, b1)
-}
-
-/// AVX2+FMA triple accumulation for Hessian precompute.
-///
-/// h00 = Σ gx², h01 = Σ gx·gy, h11 = Σ gy²
-/// 3 FMAs per 8-element chunk.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn accumulate_hessian_avx2(gx: &[f32], gy: &[f32]) -> (f32, f32, f32) {
-    use std::arch::x86_64::*;
-
-    let n = gx.len();
-    let chunks = n / 8;
+    let chunks = count / 8;
+    let vw00 = _mm256_set1_ps(w00);
+    let vw10 = _mm256_set1_ps(w10);
+    let vw01 = _mm256_set1_ps(w01);
+    let vw11 = _mm256_set1_ps(w11);
+    let v05  = _mm256_set1_ps(0.5);
 
     let mut sum_h00 = _mm256_setzero_ps();
     let mut sum_h01 = _mm256_setzero_ps();
     let mut sum_h11 = _mm256_setzero_ps();
 
-    let gx_ptr = gx.as_ptr();
-    let gy_ptr = gy.as_ptr();
-
     for i in 0..chunks {
         let off = i * 8;
-        let vgx = _mm256_loadu_ps(gx_ptr.add(off));
-        let vgy = _mm256_loadu_ps(gy_ptr.add(off));
+        let ix = bx + off;
 
-        sum_h00 = _mm256_fmadd_ps(vgx, vgx, sum_h00); // h00 += gx * gx
-        sum_h01 = _mm256_fmadd_ps(vgx, vgy, sum_h01); // h01 += gx * gy
-        sum_h11 = _mm256_fmadd_ps(vgy, vgy, sum_h11); // h11 += gy * gy
+        // Load 4 rows needed for bilinear gradients.
+        // Row 0 and Row 1 are needed for t and gx.
+        // Row -1, 0, 1, 2 are needed for gy.
+        
+        let v_r0_m1 = _mm256_loadu_ps(r_0.add(ix - 1));
+        let v_r0_0  = _mm256_loadu_ps(r_0.add(ix));
+        let v_r0_p1 = _mm256_loadu_ps(r_0.add(ix + 1));
+        let v_r0_p2 = _mm256_loadu_ps(r_0.add(ix + 2));
+
+        let v_r1_m1 = _mm256_loadu_ps(r_1.add(ix - 1));
+        let v_r1_0  = _mm256_loadu_ps(r_1.add(ix));
+        let v_r1_p1 = _mm256_loadu_ps(r_1.add(ix + 1));
+        let v_r1_p2 = _mm256_loadu_ps(r_1.add(ix + 2));
+
+        let v_rm1_0 = _mm256_loadu_ps(r_m1.add(ix));
+        let v_rm1_1 = _mm256_loadu_ps(r_m1.add(ix + 1));
+        let v_rp2_0 = _mm256_loadu_ps(r_p2.add(ix));
+        let v_rp2_1 = _mm256_loadu_ps(r_p2.add(ix + 1));
+
+        // bilerp(r0, r1, ix)
+        let mut vb0 = _mm256_mul_ps(vw00, v_r0_0);
+        vb0 = _mm256_fmadd_ps(vw10, v_r0_p1, vb0);
+        vb0 = _mm256_fmadd_ps(vw01, v_r1_0, vb0);
+        vb0 = _mm256_fmadd_ps(vw11, v_r1_p1, vb0);
+
+        // bilerp(r0, r1, ix-1)
+        let mut vb0_m = _mm256_mul_ps(vw00, v_r0_m1);
+        vb0_m = _mm256_fmadd_ps(vw10, v_r0_0, vb0_m);
+        vb0_m = _mm256_fmadd_ps(vw01, v_r1_m1, vb0_m);
+        vb0_m = _mm256_fmadd_ps(vw11, v_r1_0, vb0_m);
+
+        // bilerp(r0, r1, ix+1)
+        let mut vb0_p = _mm256_mul_ps(vw00, v_r0_p1);
+        vb0_p = _mm256_fmadd_ps(vw10, v_r0_p2, vb0_p);
+        vb0_p = _mm256_fmadd_ps(vw01, v_r1_p1, vb0_p);
+        vb0_p = _mm256_fmadd_ps(vw11, v_r1_p2, vb0_p);
+
+        // bilerp(r_m1, r_0, ix)
+        let mut vbm = _mm256_mul_ps(vw00, v_rm1_0);
+        vbm = _mm256_fmadd_ps(vw10, v_rm1_1, vbm);
+        vbm = _mm256_fmadd_ps(vw01, v_r0_0, vbm);
+        vbm = _mm256_fmadd_ps(vw11, v_r0_p1, vbm);
+
+        // bilerp(r_1, r_p2, ix)
+        let mut vbp = _mm256_mul_ps(vw00, v_r1_0);
+        vbp = _mm256_fmadd_ps(vw10, v_r1_p1, vbp);
+        vbp = _mm256_fmadd_ps(vw01, v_rp2_0, vbp);
+        vbp = _mm256_fmadd_ps(vw11, v_rp2_1, vbp);
+
+        let vgx = _mm256_mul_ps(v05, _mm256_sub_ps(vb0_p, vb0_m));
+        let vgy = _mm256_mul_ps(v05, _mm256_sub_ps(vbp, vbm));
+
+        _mm256_storeu_ps(t_out.as_mut_ptr().add(off), vb0);
+        _mm256_storeu_ps(gx_out.as_mut_ptr().add(off), vgx);
+        _mm256_storeu_ps(gy_out.as_mut_ptr().add(off), vgy);
+
+        sum_h00 = _mm256_fmadd_ps(vgx, vgx, sum_h00);
+        sum_h01 = _mm256_fmadd_ps(vgx, vgy, sum_h01);
+        sum_h11 = _mm256_fmadd_ps(vgy, vgy, sum_h11);
     }
 
     let mut h00 = simd_avx2::hsum256(sum_h00);
     let mut h01 = simd_avx2::hsum256(sum_h01);
     let mut h11 = simd_avx2::hsum256(sum_h11);
 
-    for i in (chunks * 8)..n {
-        let gxi = *gx_ptr.add(i);
-        let gyi = *gy_ptr.add(i);
-        h00 += gxi * gxi;
-        h01 += gxi * gyi;
-        h11 += gyi * gyi;
-    }
-
-    (h00, h01, h11)
-}
-
-/// AVX2+FMA vectorized bilinear extraction for one patch row.
-///
-/// For 8 consecutive pixels at column offsets [ix, ix+1, ..., ix+7]:
-///   out[k] = w00*r0[ix+k] + w10*r0[ix+k+1] + w01*r1[ix+k] + w11*r1[ix+k+1]
-///
-/// Each 8-pixel chunk: 4 loads + 1 mul + 3 FMAs.
-/// For a 23-wide patch: 2 full chunks + 7 scalar tail per row.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn extract_warped_row_avx2(
-    r0: *const f32, r1: *const f32,
-    bx: usize, count: usize,
-    w00: f32, w10: f32, w01: f32, w11: f32,
-    out: &mut [f32],
-) {
-    use std::arch::x86_64::*;
-
-    let chunks = count / 8;
-    let r0b = r0.add(bx);
-    let r1b = r1.add(bx);
-
-    let vw00 = _mm256_set1_ps(w00);
-    let vw10 = _mm256_set1_ps(w10);
-    let vw01 = _mm256_set1_ps(w01);
-    let vw11 = _mm256_set1_ps(w11);
-
-    for i in 0..chunks {
-        let off = i * 8;
-        // r0[ix..ix+8], r0[ix+1..ix+9] (shifted by 1)
-        let v_r0   = _mm256_loadu_ps(r0b.add(off));
-        let v_r0_1 = _mm256_loadu_ps(r0b.add(off + 1));
-        let v_r1   = _mm256_loadu_ps(r1b.add(off));
-        let v_r1_1 = _mm256_loadu_ps(r1b.add(off + 1));
-
-        // w00 * r0[ix] + w10 * r0[ix+1] + w01 * r1[ix] + w11 * r1[ix+1]
-        let mut acc = _mm256_mul_ps(vw00, v_r0);
-        acc = _mm256_fmadd_ps(vw10, v_r0_1, acc);
-        acc = _mm256_fmadd_ps(vw01, v_r1, acc);
-        acc = _mm256_fmadd_ps(vw11, v_r1_1, acc);
-
-        _mm256_storeu_ps(out.as_mut_ptr().add(off), acc);
-    }
-
     // Scalar tail.
     for lx in (chunks * 8)..count {
         let ix = bx + lx;
-        *out.get_unchecked_mut(lx) = bilerp_ptr(r0, r1, ix, w00, w10, w01, w11);
+        let t_val = bilerp_ptr(r_0, r_1, ix, w00, w10, w01, w11);
+        let gx = 0.5 * (
+            bilerp_ptr(r_0, r_1, ix + 1, w00, w10, w01, w11)
+          - bilerp_ptr(r_0, r_1, ix - 1, w00, w10, w01, w11)
+        );
+        let gy = 0.5 * (
+            bilerp_ptr(r_1, r_p2, ix, w00, w10, w01, w11)
+          - bilerp_ptr(r_m1, r_0, ix, w00, w10, w01, w11)
+        );
+
+        *t_out.get_unchecked_mut(lx) = t_val;
+        *gx_out.get_unchecked_mut(lx) = gx;
+        *gy_out.get_unchecked_mut(lx) = gy;
+
+        h00 += gx * gx;
+        h01 += gx * gy;
+        h11 += gy * gy;
     }
+
+    (h00, h01, h11)
 }
 
 // ==========================================================================
@@ -1475,6 +1547,28 @@ unsafe fn bilerp_fixed(
     ((iw00 * p00 + iw10 * p10 + iw01 * p01 + iw11 * p11 + W_ROUND) >> 10) as i16
 }
 
+/// Fused warp and accumulation for the IC iteration loop (fixed-point f32 image).
+#[inline]
+unsafe fn warp_and_accumulate_fixed(
+    r0: *const f32, r1: *const f32,
+    bx: usize, count: usize,
+    iw00: i32, iw10: i32, iw01: i32, iw11: i32,
+    t_ptr: *const i16,
+    gx_ptr: *const i16,
+    gy_ptr: *const i16,
+    b0: &mut i32,
+    b1: &mut i32,
+) {
+    // Scalar fallback for f32 image path (rarely used, build_reuse provides u8).
+    for lx in 0..count {
+        let ix = bx + lx;
+        let w_val = bilerp_fixed(r0, r1, ix, iw00, iw10, iw01, iw11);
+        let e = *t_ptr.add(lx) as i32 - w_val as i32;
+        *b0 += *gx_ptr.add(lx) as i32 * e;
+        *b1 += *gy_ptr.add(lx) as i32 * e;
+    }
+}
+
 /// Fixed-point IC accumulation: b0 = Σ gx·(t-w), b1 = Σ gy·(t-w).
 ///
 /// All inputs are i16, accumulates in i32.
@@ -1496,22 +1590,6 @@ fn accumulate_ic_fixed(t: &[i16], w: &[i16], gx: &[i16], gy: &[i16]) -> (i32, i3
     accumulate_ic_fixed_scalar(t, w, gx, gy)
 }
 
-/// Fixed-point Hessian accumulation: h00 = Σ gx², h01 = Σ gx·gy, h11 = Σ gy².
-#[inline]
-fn accumulate_hessian_fixed(gx: &[i16], gy: &[i16]) -> (i32, i32, i32) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx2") {
-            return unsafe { accumulate_hessian_fixed_avx2(gx, gy) };
-        }
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        return unsafe { accumulate_hessian_fixed_neon(gx, gy) };
-    }
-    #[allow(unreachable_code)]
-    accumulate_hessian_fixed_scalar(gx, gy)
-}
 
 /// Scalar fixed-point IC accumulation.
 #[inline]
@@ -1534,27 +1612,6 @@ fn accumulate_ic_fixed_scalar(t: &[i16], w: &[i16], gx: &[i16], gy: &[i16]) -> (
     (b0, b1)
 }
 
-/// Scalar fixed-point Hessian accumulation.
-#[inline]
-fn accumulate_hessian_fixed_scalar(gx: &[i16], gy: &[i16]) -> (i32, i32, i32) {
-    debug_assert_eq!(gx.len(), gy.len());
-
-    let mut h00 = 0i32;
-    let mut h01 = 0i32;
-    let mut h11 = 0i32;
-
-    for i in 0..gx.len() {
-        unsafe {
-            let gxi = *gx.get_unchecked(i) as i32;
-            let gyi = *gy.get_unchecked(i) as i32;
-            h00 += gxi * gxi;
-            h01 += gxi * gyi;
-            h11 += gyi * gyi;
-        }
-    }
-
-    (h00, h01, h11)
-}
 
 // ==========================================================================
 // AVX2 fixed-point implementations (_mm256_madd_epi16)
@@ -1567,6 +1624,286 @@ fn accumulate_hessian_fixed_scalar(gx: &[i16], gy: &[i16]) -> (i32, i32, i32) {
 // vs _mm256_fmadd_ps which does 8 multiplies + 8 adds.
 // Effective throughput: 2× the f32 FMA path for dot products.
 // ==========================================================================
+
+#[inline]
+unsafe fn extract_template_gradients_fixed_u8(
+    r_m1: *const u8, r_0: *const u8, r_1: *const u8, r_p2: *const u8,
+    bx: usize, count: usize,
+    iw00: i32, iw10: i32, iw01: i32, iw11: i32,
+    t_out: &mut [i16],
+    gx_out: &mut [i16],
+    gy_out: &mut [i16],
+) -> (i32, i32, i32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return extract_template_gradients_fixed_u8_avx2(
+                r_m1, r_0, r_1, r_p2,
+                bx, count,
+                iw00, iw10, iw01, iw11,
+                t_out, gx_out, gy_out,
+            );
+        }
+    }
+    extract_template_gradients_fixed_u8_scalar(
+        r_m1, r_0, r_1, r_p2,
+        bx, count,
+        iw00, iw10, iw01, iw11,
+        t_out, gx_out, gy_out,
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn extract_template_gradients_fixed_u8_avx2(
+    r_m1: *const u8, r_0: *const u8, r_1: *const u8, r_p2: *const u8,
+    bx: usize, count: usize,
+    iw00: i32, iw10: i32, iw01: i32, iw11: i32,
+    t_out: &mut [i16],
+    gx_out: &mut [i16],
+    gy_out: &mut [i16],
+) -> (i32, i32, i32) {
+    use std::arch::x86_64::*;
+
+    let chunks = count / 8;
+    let vw01 = _mm_set1_epi32((iw00 & 0xFFFF) | (iw10 << 16));
+    let vw23 = _mm_set1_epi32((iw01 & 0xFFFF) | (iw11 << 16));
+    let vround = _mm_set1_epi32(W_ROUND);
+
+    let mut sum_h00 = _mm256_setzero_si256();
+    let mut sum_h01 = _mm256_setzero_si256();
+    let mut sum_h11 = _mm256_setzero_si256();
+
+    let vbilerp = |row0: *const u8, row1: *const u8, idx: usize| {
+        let v0a = _mm_loadl_epi64(row0.add(idx) as *const __m128i);
+        let v0b = _mm_loadl_epi64(row0.add(idx + 1) as *const __m128i);
+        let v1a = _mm_loadl_epi64(row1.add(idx) as *const __m128i);
+        let v1b = _mm_loadl_epi64(row1.add(idx + 1) as *const __m128i);
+        let v0a16 = _mm_cvtepu8_epi16(v0a);
+        let v0b16 = _mm_cvtepu8_epi16(v0b);
+        let v1a16 = _mm_cvtepu8_epi16(v1a);
+        let v1b16 = _mm_cvtepu8_epi16(v1b);
+        let r0_lo = _mm_unpacklo_epi16(v0a16, v0b16);
+        let r0_hi = _mm_unpackhi_epi16(v0a16, v0b16);
+        let r1_lo = _mm_unpacklo_epi16(v1a16, v1b16);
+        let r1_hi = _mm_unpackhi_epi16(v1a16, v1b16);
+        let acc_lo = _mm_add_epi32(_mm_madd_epi16(r0_lo, vw01), _mm_madd_epi16(r1_lo, vw23));
+        let acc_hi = _mm_add_epi32(_mm_madd_epi16(r0_hi, vw01), _mm_madd_epi16(r1_hi, vw23));
+        let res_lo = _mm_srai_epi32(_mm_add_epi32(acc_lo, vround), 10);
+        let res_hi = _mm_srai_epi32(_mm_add_epi32(acc_hi, vround), 10);
+        _mm_packs_epi32(res_lo, res_hi)
+    };
+
+    for i in 0..chunks {
+        let off = i * 8;
+        let ix = bx + off;
+
+        let vt    = vbilerp(r_0, r_1, ix);
+        let vb0_p = vbilerp(r_0, r_1, ix + 1);
+        let vb0_m = vbilerp(r_0, r_1, ix - 1);
+        let vbm   = vbilerp(r_m1, r_0, ix);
+        let vbp   = vbilerp(r_1, r_p2, ix);
+
+        let vgx = _mm_sub_epi16(vb0_p, vb0_m);
+        let vgy = _mm_sub_epi16(vbp, vbm);
+
+        _mm_storeu_si128(t_out.as_mut_ptr().add(off) as *mut __m128i, vt);
+        _mm_storeu_si128(gx_out.as_mut_ptr().add(off) as *mut __m128i, vgx);
+        _mm_storeu_si128(gy_out.as_mut_ptr().add(off) as *mut __m128i, vgy);
+
+        // madd_epi16 needs 16-bit inputs.
+        // We have 8 i16 values. We use 128-bit _mm_madd_epi16 which takes 8 pairs -> 4 i32.
+        
+        let vh00 = _mm_madd_epi16(vgx, vgx);
+        let vh01 = _mm_madd_epi16(vgx, vgy);
+        let vh11 = _mm_madd_epi16(vgy, vgy);
+        
+        sum_h00 = _mm256_add_epi32(sum_h00, _mm256_castsi128_si256(vh00));
+        sum_h01 = _mm256_add_epi32(sum_h01, _mm256_castsi128_si256(vh01));
+        sum_h11 = _mm256_add_epi32(sum_h11, _mm256_castsi128_si256(vh11));
+    }
+
+    let mut h00 = hsum256_epi32(sum_h00);
+    let mut h01 = hsum256_epi32(sum_h01);
+    let mut h11 = hsum256_epi32(sum_h11);
+
+    for lx in (chunks * 8)..count {
+        let ix = bx + lx;
+        let t_val = bilerp_fixed_u8(r_0, r_1, ix, iw00, iw10, iw01, iw11);
+        let gx = bilerp_fixed_u8(r_0, r_1, ix + 1, iw00, iw10, iw01, iw11)
+               - bilerp_fixed_u8(r_0, r_1, ix - 1, iw00, iw10, iw01, iw11);
+        let gy = bilerp_fixed_u8(r_1, r_p2, ix, iw00, iw10, iw01, iw11)
+               - bilerp_fixed_u8(r_m1, r_0, ix, iw00, iw10, iw01, iw11);
+
+        *t_out.get_unchecked_mut(lx) = t_val;
+        *gx_out.get_unchecked_mut(lx) = gx;
+        *gy_out.get_unchecked_mut(lx) = gy;
+
+        h00 += gx as i32 * gx as i32;
+        h01 += gx as i32 * gy as i32;
+        h11 += gy as i32 * gy as i32;
+    }
+
+    (h00, h01, h11)
+}
+
+/// Fused warp and accumulation for the IC iteration loop (fixed-point u8).
+///
+/// Samples a row of warped pixels and immediately accumulates the right-hand
+/// Fused warp and accumulation for the IC iteration loop (fixed-point u8).
+///
+/// Samples a row of warped pixels and immediately accumulates the right-hand
+/// side b = [sum(gx*e), sum(gy*e)] using integer arithmetic.
+///
+/// # Safety
+/// Caller must ensure r0, r1 have at least `bx + count + 1` valid elements.
+#[inline]
+unsafe fn warp_and_accumulate_fixed_u8(
+    r0: *const u8, r1: *const u8,
+    bx: usize, count: usize,
+    iw00: i32, iw10: i32, iw01: i32, iw11: i32,
+    t_ptr: *const i16,
+    gx_ptr: *const i16,
+    gy_ptr: *const i16,
+    b0: &mut i32,
+    b1: &mut i32,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            use std::arch::x86_64::*;
+            let mut sum_b0 = _mm256_setzero_si256();
+            let mut sum_b1 = _mm256_setzero_si256();
+            warp_and_accumulate_fixed_u8_avx2(
+                r0, r1, bx, count, iw00, iw10, iw01, iw11,
+                t_ptr, gx_ptr, gy_ptr, &mut sum_b0, &mut sum_b1
+            );
+            *b0 += hsum256_epi32(sum_b0);
+            *b1 += hsum256_epi32(sum_b1);
+
+            // Scalar tail (last few pixels of the row).
+            let chunks = count / 8;
+            for lx in (chunks * 8)..count {
+                let ix = bx + lx;
+                let w_val = bilerp_fixed_u8(r0, r1, ix, iw00, iw10, iw01, iw11);
+                let e = *t_ptr.add(lx) as i32 - w_val as i32;
+                *b0 += *gx_ptr.add(lx) as i32 * e;
+                *b1 += *gy_ptr.add(lx) as i32 * e;
+            }
+            return;
+        }
+    }
+    warp_and_accumulate_fixed_u8_scalar(r0, r1, bx, count, iw00, iw10, iw01, iw11, t_ptr, gx_ptr, gy_ptr, b0, b1);
+}
+
+#[inline]
+unsafe fn warp_and_accumulate_fixed_u8_scalar(
+    r0: *const u8, r1: *const u8,
+    bx: usize, count: usize,
+    iw00: i32, iw10: i32, iw01: i32, iw11: i32,
+    t_ptr: *const i16,
+    gx_ptr: *const i16,
+    gy_ptr: *const i16,
+    b0: &mut i32,
+    b1: &mut i32,
+) {
+    for lx in 0..count {
+        let ix = bx + lx;
+        let w_val = bilerp_fixed_u8(r0, r1, ix, iw00, iw10, iw01, iw11);
+        let e = *t_ptr.add(lx) as i32 - w_val as i32;
+        *b0 += *gx_ptr.add(lx) as i32 * e;
+        *b1 += *gy_ptr.add(lx) as i32 * e;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn warp_and_accumulate_fixed_u8_avx2(
+    r0: *const u8, r1: *const u8,
+    bx: usize, count: usize,
+    iw00: i32, iw10: i32, iw01: i32, iw11: i32,
+    t_ptr: *const i16,
+    gx_ptr: *const i16,
+    gy_ptr: *const i16,
+    sum_b0: &mut std::arch::x86_64::__m256i,
+    sum_b1: &mut std::arch::x86_64::__m256i,
+) {
+    use std::arch::x86_64::*;
+
+    let chunks = count / 8;
+    let vw01 = _mm_set1_epi32((iw00 & 0xFFFF) | (iw10 << 16));
+    let vw23 = _mm_set1_epi32((iw01 & 0xFFFF) | (iw11 << 16));
+    let vround = _mm_set1_epi32(W_ROUND);
+
+    for i in 0..chunks {
+        let off = i * 8;
+        let ix = bx + off;
+        
+        let v0a = _mm_loadl_epi64(r0.add(ix) as *const __m128i);
+        let v0b = _mm_loadl_epi64(r0.add(ix + 1) as *const __m128i);
+        let v1a = _mm_loadl_epi64(r1.add(ix) as *const __m128i);
+        let v1b = _mm_loadl_epi64(r1.add(ix + 1) as *const __m128i);
+
+        let v0a16 = _mm_cvtepu8_epi16(v0a);
+        let v0b16 = _mm_cvtepu8_epi16(v0b);
+        let v1a16 = _mm_cvtepu8_epi16(v1a);
+        let v1b16 = _mm_cvtepu8_epi16(v1b);
+
+        let r0_lo = _mm_unpacklo_epi16(v0a16, v0b16);
+        let r0_hi = _mm_unpackhi_epi16(v0a16, v0b16);
+        let r1_lo = _mm_unpacklo_epi16(v1a16, v1b16);
+        let r1_hi = _mm_unpackhi_epi16(v1a16, v1b16);
+
+        let acc_lo = _mm_add_epi32(_mm_madd_epi16(r0_lo, vw01), _mm_madd_epi16(r1_lo, vw23));
+        let acc_hi = _mm_add_epi32(_mm_madd_epi16(r0_hi, vw01), _mm_madd_epi16(r1_hi, vw23));
+
+        let res_lo = _mm_srai_epi32(_mm_add_epi32(acc_lo, vround), 10);
+        let res_hi = _mm_srai_epi32(_mm_add_epi32(acc_hi, vround), 10);
+        let vw = _mm_packs_epi32(res_lo, res_hi); // i16 warped row
+
+        let vt = _mm_loadu_si128(t_ptr.add(off) as *const __m128i);
+        let vgx = _mm_loadu_si128(gx_ptr.add(off) as *const __m128i);
+        let vgy = _mm_loadu_si128(gy_ptr.add(off) as *const __m128i);
+
+        let ve = _mm_sub_epi16(vt, vw); // e = t - w (i16)
+
+        // b0 += gx * e, b1 += gy * e (i32 accumulation)
+        *sum_b0 = _mm256_add_epi32(*sum_b0, _mm256_castsi128_si256(_mm_madd_epi16(vgx, ve)));
+        *sum_b1 = _mm256_add_epi32(*sum_b1, _mm256_castsi128_si256(_mm_madd_epi16(vgy, ve)));
+    }
+}
+
+#[inline]
+unsafe fn extract_template_gradients_fixed_u8_scalar(
+    r_m1: *const u8, r_0: *const u8, r_1: *const u8, r_p2: *const u8,
+    bx: usize, count: usize,
+    iw00: i32, iw10: i32, iw01: i32, iw11: i32,
+    t_out: &mut [i16],
+    gx_out: &mut [i16],
+    gy_out: &mut [i16],
+) -> (i32, i32, i32) {
+    let mut h00 = 0i32;
+    let mut h01 = 0i32;
+    let mut h11 = 0i32;
+
+    for lx in 0..count {
+        let ix = bx + lx;
+        let t_val = bilerp_fixed_u8(r_0, r_1, ix, iw00, iw10, iw01, iw11);
+        let gx = bilerp_fixed_u8(r_0, r_1, ix + 1, iw00, iw10, iw01, iw11)
+               - bilerp_fixed_u8(r_0, r_1, ix - 1, iw00, iw10, iw01, iw11);
+        let gy = bilerp_fixed_u8(r_1, r_p2, ix, iw00, iw10, iw01, iw11)
+               - bilerp_fixed_u8(r_m1, r_0, ix, iw00, iw10, iw01, iw11);
+
+        *t_out.get_unchecked_mut(lx) = t_val;
+        *gx_out.get_unchecked_mut(lx) = gx;
+        *gy_out.get_unchecked_mut(lx) = gy;
+
+        h00 += gx as i32 * gx as i32;
+        h01 += gx as i32 * gy as i32;
+        h11 += gy as i32 * gy as i32;
+    }
+    (h00, h01, h11)
+}
 
 /// AVX2 fixed-point IC accumulation.
 ///
@@ -1618,46 +1955,6 @@ unsafe fn accumulate_ic_fixed_avx2(t: &[i16], w: &[i16], gx: &[i16], gy: &[i16])
     (b0, b1)
 }
 
-/// AVX2 fixed-point Hessian accumulation.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn accumulate_hessian_fixed_avx2(gx: &[i16], gy: &[i16]) -> (i32, i32, i32) {
-    use std::arch::x86_64::*;
-
-    let n = gx.len();
-    let chunks = n / 16;
-
-    let mut sum_h00 = _mm256_setzero_si256();
-    let mut sum_h01 = _mm256_setzero_si256();
-    let mut sum_h11 = _mm256_setzero_si256();
-
-    let gx_ptr = gx.as_ptr();
-    let gy_ptr = gy.as_ptr();
-
-    for i in 0..chunks {
-        let off = i * 16;
-        let vgx = _mm256_loadu_si256(gx_ptr.add(off) as *const __m256i);
-        let vgy = _mm256_loadu_si256(gy_ptr.add(off) as *const __m256i);
-
-        sum_h00 = _mm256_add_epi32(sum_h00, _mm256_madd_epi16(vgx, vgx));
-        sum_h01 = _mm256_add_epi32(sum_h01, _mm256_madd_epi16(vgx, vgy));
-        sum_h11 = _mm256_add_epi32(sum_h11, _mm256_madd_epi16(vgy, vgy));
-    }
-
-    let mut h00 = hsum256_epi32(sum_h00);
-    let mut h01 = hsum256_epi32(sum_h01);
-    let mut h11 = hsum256_epi32(sum_h11);
-
-    for i in (chunks * 16)..n {
-        let gxi = *gx_ptr.add(i) as i32;
-        let gyi = *gy_ptr.add(i) as i32;
-        h00 += gxi * gxi;
-        h01 += gxi * gyi;
-        h11 += gyi * gyi;
-    }
-
-    (h00, h01, h11)
-}
 
 /// Horizontal sum of 8 i32 lanes in a __m256i → single i32.
 #[cfg(target_arch = "x86_64")]
@@ -1675,6 +1972,178 @@ unsafe fn hsum256_epi32(v: std::arch::x86_64::__m256i) -> i32 {
     let shuf2 = _mm_shuffle_epi32(sum64, 0b_10_11_00_01);
     let sum32 = _mm_add_epi32(sum64, shuf2);
     _mm_cvtsi128_si32(sum32)
+}
+
+/// Fused warp and accumulation for the IC iteration loop (f32).
+///
+/// Samples a row of warped pixels and immediately accumulates the right-hand
+/// side b = [sum(gx*e), sum(gy*e)].
+///
+/// # Safety
+/// Caller must ensure r0, r1 have at least `bx + count + 1` valid elements.
+#[inline]
+unsafe fn warp_and_accumulate(
+    r0: *const f32, r1: *const f32,
+    bx: usize, count: usize,
+    w00: f32, w10: f32, w01: f32, w11: f32,
+    t_ptr: *const f32,
+    gx_ptr: *const f32,
+    gy_ptr: *const f32,
+    b0: &mut f32,
+    b1: &mut f32,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::*;
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            let mut sum_b0 = _mm256_setzero_ps();
+            let mut sum_b1 = _mm256_setzero_ps();
+            warp_and_accumulate_avx2(
+                r0, r1, bx, count, w00, w10, w01, w11,
+                t_ptr, gx_ptr, gy_ptr, &mut sum_b0, &mut sum_b1
+            );
+            *b0 += simd_avx2::hsum256(sum_b0);
+            *b1 += simd_avx2::hsum256(sum_b1);
+            
+            // Scalar tail (last few pixels of the row).
+            let chunks = count / 8;
+            for lx in (chunks * 8)..count {
+                let ix = bx + lx;
+                let w_val = bilerp_ptr(r0, r1, ix, w00, w10, w01, w11);
+                let e = *t_ptr.add(lx) - w_val;
+                *b0 += *gx_ptr.add(lx) * e;
+                *b1 += *gy_ptr.add(lx) * e;
+            }
+            return;
+        }
+    }
+    warp_and_accumulate_scalar(r0, r1, bx, count, w00, w10, w01, w11, t_ptr, gx_ptr, gy_ptr, b0, b1);
+}
+
+#[inline]
+unsafe fn warp_and_accumulate_scalar(
+    r0: *const f32, r1: *const f32,
+    bx: usize, count: usize,
+    w00: f32, w10: f32, w01: f32, w11: f32,
+    t_ptr: *const f32,
+    gx_ptr: *const f32,
+    gy_ptr: *const f32,
+    b0: &mut f32,
+    b1: &mut f32,
+) {
+    for lx in 0..count {
+        let ix = bx + lx;
+        let w_val = bilerp_ptr(r0, r1, ix, w00, w10, w01, w11);
+        let e = *t_ptr.add(lx) - w_val;
+        *b0 += *gx_ptr.add(lx) * e;
+        *b1 += *gy_ptr.add(lx) * e;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn warp_and_accumulate_avx2(
+    r0: *const f32, r1: *const f32,
+    bx: usize, count: usize,
+    w00: f32, w10: f32, w01: f32, w11: f32,
+    t_ptr: *const f32,
+    gx_ptr: *const f32,
+    gy_ptr: *const f32,
+    sum_b0: &mut std::arch::x86_64::__m256,
+    sum_b1: &mut std::arch::x86_64::__m256,
+) {
+    use std::arch::x86_64::*;
+
+    let chunks = count / 8;
+    let r0b = r0.add(bx);
+    let r1b = r1.add(bx);
+
+    let vw00 = _mm256_set1_ps(w00);
+    let vw10 = _mm256_set1_ps(w10);
+    let vw01 = _mm256_set1_ps(w01);
+    let vw11 = _mm256_set1_ps(w11);
+
+    for i in 0..chunks {
+        let off = i * 8;
+        let v_r0   = _mm256_loadu_ps(r0b.add(off));
+        let v_r0_1 = _mm256_loadu_ps(r0b.add(off + 1));
+        let v_r1   = _mm256_loadu_ps(r1b.add(off));
+        let v_r1_1 = _mm256_loadu_ps(r1b.add(off + 1));
+
+        let mut vw = _mm256_mul_ps(vw00, v_r0);
+        vw = _mm256_fmadd_ps(vw10, v_r0_1, vw);
+        vw = _mm256_fmadd_ps(vw01, v_r1, vw);
+        vw = _mm256_fmadd_ps(vw11, v_r1_1, vw);
+
+        let vt = _mm256_loadu_ps(t_ptr.add(off));
+        let vgx = _mm256_loadu_ps(gx_ptr.add(off));
+        let vgy = _mm256_loadu_ps(gy_ptr.add(off));
+
+        let ve = _mm256_sub_ps(vt, vw);
+        *sum_b0 = _mm256_fmadd_ps(vgx, ve, *sum_b0);
+        *sum_b1 = _mm256_fmadd_ps(vgy, ve, *sum_b1);
+    }
+}
+
+/// Iterate over an entire patch (all rows) in a single #[target_feature] boundary.
+/// This allows the compiler to inline the inner AVX2 loop and hoist weight broadcasts.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn ic_iterate_patch_avx2(
+    img_data: *const f32,
+    img_stride: usize,
+    bx: usize,
+    by: usize,
+    rows: usize,
+    cols_per_row: usize, // stride-aligned, multiple of 8
+    buf_stride: usize,   // stride between rows in t/gx/gy buffers
+    w00: f32, w10: f32, w01: f32, w11: f32,
+    t_ptr: *const f32,
+    gx_ptr: *const f32,
+    gy_ptr: *const f32,
+) -> (f32, f32) {
+    use std::arch::x86_64::*;
+
+    let mut v_b0 = _mm256_setzero_ps();
+    let mut v_b1 = _mm256_setzero_ps();
+
+    let vw00 = _mm256_set1_ps(w00);
+    let vw10 = _mm256_set1_ps(w10);
+    let vw01 = _mm256_set1_ps(w01);
+    let vw11 = _mm256_set1_ps(w11);
+
+    let chunks = cols_per_row / 8;
+
+    for ly in 0..rows {
+        let r0 = img_data.add((by + ly) * img_stride + bx);
+        let r1 = img_data.add((by + ly + 1) * img_stride + bx);
+        let t_row = t_ptr.add(ly * buf_stride);
+        let gx_row = gx_ptr.add(ly * buf_stride);
+        let gy_row = gy_ptr.add(ly * buf_stride);
+
+        for i in 0..chunks {
+            let off = i * 8;
+            let v_r0   = _mm256_loadu_ps(r0.add(off));
+            let v_r0_1 = _mm256_loadu_ps(r0.add(off + 1));
+            let v_r1   = _mm256_loadu_ps(r1.add(off));
+            let v_r1_1 = _mm256_loadu_ps(r1.add(off + 1));
+
+            let mut vw = _mm256_mul_ps(vw00, v_r0);
+            vw = _mm256_fmadd_ps(vw10, v_r0_1, vw);
+            vw = _mm256_fmadd_ps(vw01, v_r1, vw);
+            vw = _mm256_fmadd_ps(vw11, v_r1_1, vw);
+
+            let vt = _mm256_loadu_ps(t_row.add(off));
+            let vgx = _mm256_loadu_ps(gx_row.add(off));
+            let vgy = _mm256_loadu_ps(gy_row.add(off));
+
+            let ve = _mm256_sub_ps(vt, vw);
+            v_b0 = _mm256_fmadd_ps(vgx, ve, v_b0);
+            v_b1 = _mm256_fmadd_ps(vgy, ve, v_b1);
+        }
+    }
+
+    (simd_avx2::hsum256(v_b0), simd_avx2::hsum256(v_b1))
 }
 
 // ==========================================================================
@@ -1741,53 +2210,6 @@ unsafe fn accumulate_ic_fixed_neon(t: &[i16], w: &[i16], gx: &[i16], gy: &[i16])
     (b0, b1)
 }
 
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn accumulate_hessian_fixed_neon(gx: &[i16], gy: &[i16]) -> (i32, i32, i32) {
-    use std::arch::aarch64::*;
-
-    let n = gx.len();
-    let chunks = n / 8;
-
-    let mut sum_h00 = vdupq_n_s32(0);
-    let mut sum_h01 = vdupq_n_s32(0);
-    let mut sum_h11 = vdupq_n_s32(0);
-
-    let gx_ptr = gx.as_ptr();
-    let gy_ptr = gy.as_ptr();
-
-    for i in 0..chunks {
-        let off = i * 8;
-        let vgx = vld1q_s16(gx_ptr.add(off));
-        let vgy = vld1q_s16(gy_ptr.add(off));
-
-        let gx_lo = vget_low_s16(vgx);
-        let gx_hi = vget_high_s16(vgx);
-        let gy_lo = vget_low_s16(vgy);
-        let gy_hi = vget_high_s16(vgy);
-
-        sum_h00 = vmlal_s16(sum_h00, gx_lo, gx_lo);
-        sum_h00 = vmlal_s16(sum_h00, gx_hi, gx_hi);
-        sum_h01 = vmlal_s16(sum_h01, gx_lo, gy_lo);
-        sum_h01 = vmlal_s16(sum_h01, gx_hi, gy_hi);
-        sum_h11 = vmlal_s16(sum_h11, gy_lo, gy_lo);
-        sum_h11 = vmlal_s16(sum_h11, gy_hi, gy_hi);
-    }
-
-    let mut h00 = vaddvq_s32(sum_h00);
-    let mut h01 = vaddvq_s32(sum_h01);
-    let mut h11 = vaddvq_s32(sum_h11);
-
-    for i in (chunks * 8)..n {
-        let gxi = *gx_ptr.add(i) as i32;
-        let gyi = *gy_ptr.add(i) as i32;
-        h00 += gxi * gxi;
-        h01 += gxi * gyi;
-        h11 += gyi * gyi;
-    }
-
-    (h00, h01, h11)
-}
 
 // ==========================================================================
 // Direct u8 bilinear interpolation (for fixed-point path)
@@ -1845,28 +2267,6 @@ fn bilerp_clamped_u8(img: &Image<u8>, x: f32, y: f32) -> i16 {
         let p11 = img.get_unchecked(x0 + 1, y0 + 1) as i32;
 
         ((iw00 * p00 + iw10 * p10 + iw01 * p01 + iw11 * p11 + W_ROUND) >> 10) as i16
-    }
-}
-
-/// Extract one row of warped pixels via fixed-point bilinear from u8 data.
-///
-/// Dispatches to SIMD when available. Fills `out` with i16 interpolated values.
-///
-/// # Safety
-/// Caller must ensure r0, r1 have at least `bx + count + 1` valid elements.
-#[inline]
-unsafe fn extract_warped_row_fixed_u8(
-    r0: *const u8, r1: *const u8,
-    bx: usize, count: usize,
-    iw00: i32, iw10: i32, iw01: i32, iw11: i32,
-    out: &mut [i16],
-) {
-    // Scalar extraction (SIMD for u8 bilinear is complex due to weight
-    // widths; the accumulation SIMD is where the big win is).
-    for lx in 0..count {
-        *out.get_unchecked_mut(lx) = bilerp_fixed_u8(
-            r0, r1, bx + lx, iw00, iw10, iw01, iw11,
-        );
     }
 }
 
@@ -2217,63 +2617,6 @@ mod tests {
         assert!((fa_dy - ic_dy).abs() < 1.0, "FA vs IC dy: {fa_dy:.2} vs {ic_dy:.2}");
     }
 
-    // ===== SIMD-specific correctness tests =====
-
-    #[test]
-    fn test_accumulate_ic_simd_matches_scalar() {
-        let n = 529; // 23×23 patch
-        let t: Vec<f32> = (0..n).map(|i| (i as f32) * 0.1).collect();
-        let w: Vec<f32> = (0..n).map(|i| (i as f32) * 0.1 + 0.05).collect();
-        let gx: Vec<f32> = (0..n).map(|i| ((i * 7) as f32).sin()).collect();
-        let gy: Vec<f32> = (0..n).map(|i| ((i * 13) as f32).cos()).collect();
-
-        let (s_b0, s_b1) = accumulate_ic_scalar(&t, &w, &gx, &gy);
-        let (d_b0, d_b1) = accumulate_ic(&t, &w, &gx, &gy);
-
-        assert!(
-            (s_b0 - d_b0).abs() < 1e-2,
-            "accumulate_ic b0: scalar={s_b0}, dispatch={d_b0}"
-        );
-        assert!(
-            (s_b1 - d_b1).abs() < 1e-2,
-            "accumulate_ic b1: scalar={s_b1}, dispatch={d_b1}"
-        );
-    }
-
-    #[test]
-    fn test_accumulate_hessian_simd_matches_scalar() {
-        let n = 529;
-        let gx: Vec<f32> = (0..n).map(|i| ((i * 7) as f32).sin()).collect();
-        let gy: Vec<f32> = (0..n).map(|i| ((i * 13) as f32).cos()).collect();
-
-        let (s_h00, s_h01, s_h11) = accumulate_hessian_scalar(&gx, &gy);
-        let (d_h00, d_h01, d_h11) = accumulate_hessian(&gx, &gy);
-
-        assert!((s_h00 - d_h00).abs() < 1e-2, "hessian h00: {s_h00} vs {d_h00}");
-        assert!((s_h01 - d_h01).abs() < 1e-2, "hessian h01: {s_h01} vs {d_h01}");
-        assert!((s_h11 - d_h11).abs() < 1e-2, "hessian h11: {s_h11} vs {d_h11}");
-    }
-
-    #[test]
-    fn test_accumulate_ic_odd_length() {
-        // Non-multiple-of-8 length to test scalar tail.
-        let n = 23; // 23 elements = 2 chunks + 7 tail
-        let t: Vec<f32> = (0..n).map(|i| i as f32).collect();
-        let w: Vec<f32> = vec![0.0; n];
-        let gx: Vec<f32> = vec![1.0; n];
-        let gy: Vec<f32> = vec![2.0; n];
-
-        let (b0, b1) = accumulate_ic(&t, &w, &gx, &gy);
-
-        // b0 = Σ 1.0 * i = n*(n-1)/2 = 253
-        // b1 = Σ 2.0 * i = 2 * 253 = 506
-        let expected_b0 = (n * (n - 1) / 2) as f32;
-        let expected_b1 = 2.0 * expected_b0;
-
-        assert!((b0 - expected_b0).abs() < 1e-3, "odd len b0: {b0} vs {expected_b0}");
-        assert!((b1 - expected_b1).abs() < 1e-3, "odd len b1: {b1} vs {expected_b1}");
-    }
-
     // ===== Fixed-point IC tests =====
 
     fn make_fixed_tracker(window_size: usize, max_levels: usize) -> KltTracker {
@@ -2410,20 +2753,6 @@ mod tests {
 
         assert_eq!(b0, d_b0, "fixed accumulate b0 mismatch");
         assert_eq!(b1, d_b1, "fixed accumulate b1 mismatch");
-    }
-
-    #[test]
-    fn test_fixed_hessian_simd_matches_scalar() {
-        let n = 529;
-        let gx: Vec<i16> = (0..n).map(|i| ((i * 7) as f32).sin() as i16).collect();
-        let gy: Vec<i16> = (0..n).map(|i| ((i * 13) as f32).cos() as i16).collect();
-
-        let (s_h00, s_h01, s_h11) = accumulate_hessian_fixed_scalar(&gx, &gy);
-        let (d_h00, d_h01, d_h11) = accumulate_hessian_fixed(&gx, &gy);
-
-        assert_eq!(s_h00, d_h00, "fixed hessian h00 mismatch");
-        assert_eq!(s_h01, d_h01, "fixed hessian h01 mismatch");
-        assert_eq!(s_h11, d_h11, "fixed hessian h11 mismatch");
     }
 
     #[test]
