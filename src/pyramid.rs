@@ -50,6 +50,21 @@ pub struct Pyramid {
     /// Levels 1+ are the u8 outputs from `pyrdown_int`.
     /// Empty when built via `build()` (f32 path).
     pub u8_levels: Vec<Image<u8>>,
+    /// Optional replicate-padded f32 levels for KLT.
+    ///
+    /// When `pad_border > 0`, each entry is a copy of `levels[i]` with
+    /// `pad_border` extra pixels on every side, filled by replicating the
+    /// edge values. This lets KLT skip per-feature bounds checks and the
+    /// scalar `interpolate_bilinear` border fallback, since features within
+    /// the original image always have a valid SIMD-readable patch around
+    /// them in the padded buffer.
+    ///
+    /// Visible (0,0) of the padded image is at coordinate `(pad_border,
+    /// pad_border)`. Width/height of `padded_levels[i]` are
+    /// `levels[i].width() + 2*pad_border` × `levels[i].height() + 2*pad_border`.
+    pub padded_levels: Vec<Image<f32>>,
+    /// Border size for `padded_levels`. 0 means padded levels are not built.
+    pub pad_border: usize,
 }
 
 /// Pre-allocated scratch buffers for pyramid construction.
@@ -107,7 +122,7 @@ impl Pyramid {
             levels.push(down);
         }
 
-        Pyramid { levels, u8_levels: Vec::new() }
+        Pyramid { levels, u8_levels: Vec::new(), padded_levels: Vec::new(), pad_border: 0 }
     }
 
     /// Build a Gaussian pyramid from a u8 image, reusing buffers.
@@ -137,6 +152,14 @@ impl Pyramid {
         }
         self.u8_levels.truncate(num_levels);
 
+        // ── padded f32 level storage (for KLT) ──
+        if self.pad_border > 0 {
+            while self.padded_levels.len() < num_levels {
+                self.padded_levels.push(Image::new(1, 1));
+            }
+            self.padded_levels.truncate(num_levels);
+        }
+
         // Level 0 u8: copy of original image (contiguous, stride == width).
         {
             let sw = src.width();
@@ -157,8 +180,19 @@ impl Pyramid {
             }
         }
 
-        // Level 0: u8 → f32 (no blur).
-        to_f32_image_u8_into(src, &mut self.levels[0]);
+        // Level 0: u8 → f32 (no blur). frontend reads levels[0] for FAST
+        // detection, so always write the unpadded buffer here. Also write
+        // padded copy in same pass when enabled.
+        if self.pad_border > 0 {
+            to_f32_image_u8_into_padded(
+                src,
+                Some(&mut self.levels[0]),
+                &mut self.padded_levels[0],
+                self.pad_border,
+            );
+        } else {
+            to_f32_image_u8_into(src, &mut self.levels[0]);
+        }
 
         if num_levels < 2 {
             return;
@@ -201,10 +235,35 @@ impl Pyramid {
                 let read_slice = std::slice::from_raw_parts(read_ptr, read_len);
                 let write_slice = std::slice::from_raw_parts_mut(write_ptr, write_len);
 
+                // Resize the padded output ahead of time so we can hand a
+                // mutable reference to pyrdown_int alongside the unpadded one.
+                if self.pad_border > 0 {
+                    let pw = dw + 2 * self.pad_border;
+                    let ph = dh + 2 * self.pad_border;
+                    if self.padded_levels[i].width() != pw
+                        || self.padded_levels[i].height() != ph
+                    {
+                        self.padded_levels[i].clear_resize(pw, ph);
+                    }
+                }
+
+                // When padding is enabled, only the padded buffer is
+                // consumed by KLT for levels >= 1; skip the unpadded write.
+                // The unpadded f32 buffer for level 0 is still produced by
+                // to_f32_image_u8_into_padded above for frontend FAST.
+                let (unpad_arg, pad_arg): (Option<&mut Image<f32>>, Option<&mut Image<f32>>) =
+                    if self.pad_border > 0 {
+                        (None, Some(&mut self.padded_levels[i]))
+                    } else {
+                        (Some(&mut self.levels[i]), None)
+                    };
+
                 pyrdown_int(
                     read_slice, prev_w, prev_h, read_stride,
-                    &mut self.levels[i],
+                    unpad_arg,
                     write_slice,
+                    pad_arg,
+                    self.pad_border,
                     h_buf,
                 );
 
@@ -215,6 +274,26 @@ impl Pyramid {
 
             prev_w = dw;
             prev_h = dh;
+        }
+    }
+
+    /// Configure the replicate-padding border for KLT.
+    ///
+    /// Call once after construction. Subsequent `build_reuse` calls will
+    /// automatically populate `padded_levels` with the requested border.
+    /// Pass 0 to disable padding (default).
+    pub fn set_pad_border(&mut self, border: usize) {
+        self.pad_border = border;
+    }
+
+    fn rebuild_padded_levels(&mut self) {
+        let border = self.pad_border;
+        while self.padded_levels.len() < self.levels.len() {
+            self.padded_levels.push(Image::new(1, 1));
+        }
+        self.padded_levels.truncate(self.levels.len());
+        for i in 0..self.levels.len() {
+            pad_replicate_into(&self.levels[i], &mut self.padded_levels[i], border);
         }
     }
 
@@ -258,13 +337,32 @@ fn pyrdown_int(
     sw: usize,
     sh: usize,
     src_stride: usize,
-    dst_f32: &mut Image<f32>,
+    // Unpadded f32 output. Pass `None` when only the padded buffer is
+    // consumed downstream (e.g. KLT in InverseCompositional mode) — saves
+    // ~10-20µs/frame of dead writes.
+    mut dst_f32: Option<&mut Image<f32>>,
     dst_u8: &mut [u8],
+    // Optional padded f32 output: same pixel data as dst_f32 but with
+    // `pad_border` pixels of replicate padding on every side. Written in
+    // the same pass as dst_f32 to avoid a second read of the unpadded
+    // buffer. Caller must ensure dimensions are (dw + 2*pad_border) ×
+    // (dh + 2*pad_border) and stride == pad_w. Borders are filled here.
+    dst_f32_pad: Option<&mut Image<f32>>,
+    pad_border: usize,
     h_buf: &mut [u16],
 ) {
     let dw = sw / 2;
     let dh = sh / 2;
-    dst_f32.clear_resize(dw, dh);
+    if let Some(ref mut dst) = dst_f32 {
+        dst.clear_resize(dw, dh);
+    }
+    if let Some(ref pad) = dst_f32_pad {
+        let pw = dw + 2 * pad_border;
+        let ph = dh + 2 * pad_border;
+        debug_assert_eq!(pad.width(), pw);
+        debug_assert_eq!(pad.height(), ph);
+        debug_assert_eq!(pad.stride(), pw);
+    }
 
     if dw == 0 || dh == 0 {
         return;
@@ -322,8 +420,27 @@ fn pyrdown_int(
     //   f32 output = acc × (1/256)
     //   u8 output  = (acc + 128) >> 8  (rounded)
 
-    let dst_f32_stride = dst_f32.stride();
-    let dst_f32_slice = dst_f32.as_mut_slice();
+    let (dst_f32_ptr, dst_f32_stride) = match dst_f32 {
+        Some(dst) => {
+            let stride = dst.stride();
+            (dst.as_mut_slice().as_mut_ptr(), stride)
+        }
+        None => (std::ptr::null_mut::<f32>(), 0),
+    };
+    let has_unpadded = !dst_f32_ptr.is_null();
+
+    // Padded output: capture raw pointer + stride so the inner loop can
+    // write to it without going through the Option each iteration.
+    let (pad_ptr, pad_stride) = match dst_f32_pad.as_ref() {
+        Some(pad) => {
+            let stride = pad.stride();
+            // Pointer to visible (0,0) of the padded image.
+            let p = unsafe { pad.as_slice().as_ptr().add(pad_border * stride + pad_border) };
+            (p as *mut f32, stride)
+        }
+        None => (std::ptr::null_mut::<f32>(), 0),
+    };
+    let has_pad = !pad_ptr.is_null();
 
     const INV256: f32 = 1.0 / 256.0;
 
@@ -341,6 +458,7 @@ fn pyrdown_int(
 
         let f32_off = oy * dst_f32_stride;
         let u8_off = oy * dw;
+        let pad_row = if has_pad { unsafe { pad_ptr.add(oy * pad_stride) } } else { pad_ptr };
 
         unsafe {
             for ox in 0..dw {
@@ -352,10 +470,20 @@ fn pyrdown_int(
                     + 4 * *h_buf.get_unchecked(r3 + sx) as u32
                     + *h_buf.get_unchecked(r4 + sx) as u32;
 
-                *dst_f32_slice.get_unchecked_mut(f32_off + ox) = acc as f32 * INV256;
+                let f32_val = acc as f32 * INV256;
+                if has_unpadded {
+                    *dst_f32_ptr.add(f32_off + ox) = f32_val;
+                }
                 *dst_u8.get_unchecked_mut(u8_off + ox) = ((acc + 128) >> 8) as u8;
+                if has_pad {
+                    *pad_row.add(ox) = f32_val;
+                }
             }
         }
+    }
+
+    if let Some(pad) = dst_f32_pad {
+        fill_replicate_borders(pad, pad_border);
     }
 }
 
@@ -558,6 +686,110 @@ fn downsample_2x_into(src: &Image<f32>, dst: &mut Image<f32>) {
 }
 
 // =============================================================================
+// Replicate-padded copy used by KLT
+// =============================================================================
+
+/// Fill the replicate-padding borders of `dst`, assuming the visible
+/// rectangle `[border, border+vw) × [border, border+vh)` is already filled
+/// with the desired pixel values. Used by the fused pyrdown / u8→f32 path
+/// to avoid a second read pass over the unpadded data.
+fn fill_replicate_borders(dst: &mut Image<f32>, border: usize) {
+    let pw = dst.width();
+    let ph = dst.height();
+    let stride = dst.stride();
+    debug_assert_eq!(stride, pw, "padded image must have stride == width");
+    if border == 0 || pw == 0 || ph == 0 {
+        return;
+    }
+    let vw = pw - 2 * border;
+    let vh = ph - 2 * border;
+    let data = dst.as_mut_slice();
+
+    // Left + right borders for each visible row.
+    for y in 0..vh {
+        let row_off = (border + y) * stride;
+        let left_val = data[row_off + border];
+        let right_val = data[row_off + border + vw - 1];
+        for i in 0..border {
+            data[row_off + i] = left_val;
+            data[row_off + border + vw + i] = right_val;
+        }
+    }
+
+    // Top: replicate row at y=border into rows 0..border.
+    let template_off = border * stride;
+    let (top, rest) = data.split_at_mut(template_off);
+    let template = &rest[..stride];
+    for y in 0..border {
+        let off = y * stride;
+        top[off..off + stride].copy_from_slice(template);
+    }
+
+    // Bottom: replicate last interior row into rows border+vh..ph.
+    let last_interior = border + vh - 1;
+    let split = (last_interior + 1) * stride;
+    let (head, tail) = data.split_at_mut(split);
+    let template = &head[last_interior * stride .. last_interior * stride + stride];
+    for y in 0..border {
+        let off = y * stride;
+        tail[off..off + stride].copy_from_slice(template);
+    }
+}
+
+/// Copy `src` into `dst` with `border` pixels of replicate padding on every
+/// side. The visible (0,0) of `src` lands at coordinate `(border, border)`
+/// of `dst`. `dst` is resized to `(src.width()+2*border) × (src.height()+2*border)`.
+fn pad_replicate_into(src: &Image<f32>, dst: &mut Image<f32>, border: usize) {
+    let w = src.width();
+    let h = src.height();
+    let pw = w + 2 * border;
+    let ph = h + 2 * border;
+
+    if dst.width() != pw || dst.height() != ph {
+        dst.clear_resize(pw, ph);
+    }
+
+    let dst_stride = dst.stride();
+    debug_assert_eq!(dst_stride, pw, "padded image must have stride == width");
+    let dst_slice = dst.as_mut_slice();
+
+    // Copy interior rows + fill left/right side borders for each interior row.
+    for y in 0..h {
+        let src_row = src.row(y);
+        let dy = y + border;
+        let row_off = dy * dst_stride;
+        let left_val = src_row[0];
+        let right_val = src_row[w - 1];
+        for i in 0..border {
+            dst_slice[row_off + i] = left_val;
+        }
+        dst_slice[row_off + border .. row_off + border + w].copy_from_slice(src_row);
+        for i in 0..border {
+            dst_slice[row_off + border + w + i] = right_val;
+        }
+    }
+
+    // Top border: replicate the first interior row (at y = border) into rows 0..border.
+    let src_row_off = border * dst_stride;
+    let (top, rest) = dst_slice.split_at_mut(src_row_off);
+    let template = &rest[..dst_stride];
+    for y in 0..border {
+        let off = y * dst_stride;
+        top[off..off + dst_stride].copy_from_slice(template);
+    }
+
+    // Bottom border: replicate the last interior row (at y = border + h - 1) into rows border+h..ph.
+    let last_interior = border + h - 1;
+    let split = (last_interior + 1) * dst_stride;
+    let (head, tail) = dst_slice.split_at_mut(split);
+    let template = &head[last_interior * dst_stride .. last_interior * dst_stride + dst_stride];
+    for y in 0..border {
+        let off = y * dst_stride;
+        tail[off..off + dst_stride].copy_from_slice(template);
+    }
+}
+
+// =============================================================================
 // u8 → f32 conversion helpers
 // =============================================================================
 
@@ -590,6 +822,66 @@ fn to_f32_image_u8_into(src: &Image<u8>, dst: &mut Image<f32>) {
             }
         }
     }
+}
+
+/// u8 → f32 written directly into a replicate-padded buffer.
+/// `dst` (unpadded) is optional: pass `None` when only the padded buffer
+/// is consumed downstream — saves one full-resolution write per frame.
+fn to_f32_image_u8_into_padded(
+    src: &Image<u8>,
+    dst: Option<&mut Image<f32>>,
+    dst_pad: &mut Image<f32>,
+    pad_border: usize,
+) {
+    let w = src.width();
+    let h = src.height();
+    let pw = w + 2 * pad_border;
+    let ph = h + 2 * pad_border;
+
+    if dst_pad.width() != pw || dst_pad.height() != ph {
+        dst_pad.clear_resize(pw, ph);
+    }
+
+    let src_stride = src.stride();
+    let pad_stride = dst_pad.stride();
+    debug_assert_eq!(pad_stride, pw);
+    let src_slice = src.as_slice();
+
+    let (dst_ptr, dst_stride) = match dst {
+        Some(dst) => {
+            dst.clear_resize(w, h);
+            let stride = dst.stride();
+            (dst.as_mut_slice().as_mut_ptr(), stride)
+        }
+        None => (std::ptr::null_mut::<f32>(), 0),
+    };
+    let has_unpadded = !dst_ptr.is_null();
+
+    let pad_ptr = unsafe {
+        dst_pad.as_mut_slice().as_mut_ptr().add(pad_border * pad_stride + pad_border)
+    };
+
+    for y in 0..h {
+        let src_off = y * src_stride;
+        let pad_row = unsafe { pad_ptr.add(y * pad_stride) };
+        unsafe {
+            if has_unpadded {
+                let dst_row = dst_ptr.add(y * dst_stride);
+                for x in 0..w {
+                    let v = *src_slice.get_unchecked(src_off + x) as f32;
+                    *dst_row.add(x) = v;
+                    *pad_row.add(x) = v;
+                }
+            } else {
+                for x in 0..w {
+                    let v = *src_slice.get_unchecked(src_off + x) as f32;
+                    *pad_row.add(x) = v;
+                }
+            }
+        }
+    }
+
+    fill_replicate_borders(dst_pad, pad_border);
 }
 
 // =============================================================================
@@ -805,7 +1097,7 @@ mod tests {
         let mut dst_u8 = vec![0u8; 100];
         let mut h_buf = vec![0u16; 400];
 
-        pyrdown_int(&src, 20, 20, 20, &mut dst_f32, &mut dst_u8, &mut h_buf);
+        pyrdown_int(&src, 20, 20, 20, Some(&mut dst_f32), &mut dst_u8, None, 0, &mut h_buf);
 
         for (x, y, v) in dst_f32.pixels() {
             assert!(
@@ -828,7 +1120,7 @@ mod tests {
         let mut dst_u8 = vec![0u8; 50 * 40];
         let mut h_buf = vec![0u16; 8000];
 
-        pyrdown_int(&src, 100, 80, 100, &mut dst_f32, &mut dst_u8, &mut h_buf);
+        pyrdown_int(&src, 100, 80, 100, Some(&mut dst_f32), &mut dst_u8, None, 0, &mut h_buf);
         assert_eq!(dst_f32.width(), 50);
         assert_eq!(dst_f32.height(), 40);
     }
@@ -837,7 +1129,7 @@ mod tests {
     fn test_build_reuse_constant() {
         // Constant image: build_reuse should preserve value at all levels.
         let img = Image::from_vec(64, 64, vec![128u8; 64 * 64]);
-        let mut pyr = Pyramid { levels: Vec::new(), u8_levels: Vec::new() };
+        let mut pyr = Pyramid { levels: Vec::new(), u8_levels: Vec::new(), padded_levels: Vec::new(), pad_border: 0 };
         let mut scratch = PyramidScratch::new(64, 64, 1.0);
         pyr.build_reuse(&img, 4, &mut scratch);
 
@@ -854,7 +1146,7 @@ mod tests {
     #[test]
     fn test_build_reuse_dimensions() {
         let img: Image<u8> = Image::new(640, 480);
-        let mut pyr = Pyramid { levels: Vec::new(), u8_levels: Vec::new() };
+        let mut pyr = Pyramid { levels: Vec::new(), u8_levels: Vec::new(), padded_levels: Vec::new(), pad_border: 0 };
         let mut scratch = PyramidScratch::new(640, 480, 1.0);
         pyr.build_reuse(&img, 5, &mut scratch);
 
@@ -878,7 +1170,7 @@ mod tests {
 
         let pyr_f32 = Pyramid::build(&img, 4, 1.0);
 
-        let mut pyr_int = Pyramid { levels: Vec::new(), u8_levels: Vec::new() };
+        let mut pyr_int = Pyramid { levels: Vec::new(), u8_levels: Vec::new(), padded_levels: Vec::new(), pad_border: 0 };
         let mut scratch = PyramidScratch::new(640, 480, 1.0);
         pyr_int.build_reuse(&img, 4, &mut scratch);
 
@@ -910,7 +1202,7 @@ mod tests {
         }
         let img = Image::from_vec(128, 128, data);
 
-        let mut pyr = Pyramid { levels: Vec::new(), u8_levels: Vec::new() };
+        let mut pyr = Pyramid { levels: Vec::new(), u8_levels: Vec::new(), padded_levels: Vec::new(), pad_border: 0 };
         let mut scratch = PyramidScratch::new(128, 128, 1.0);
         pyr.build_reuse(&img, 5, &mut scratch);
 

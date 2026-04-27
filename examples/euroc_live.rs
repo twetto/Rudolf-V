@@ -53,7 +53,10 @@ fn main() {
     }
 
     let dataset_path = PathBuf::from(&args[1]);
-    let max_frames: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
+    let max_frames: usize = args
+        .get(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(usize::MAX);
 
     let cam0_dir = dataset_path.join("mav0").join("cam0");
     let data_dir = cam0_dir.join("data");
@@ -71,7 +74,11 @@ fn main() {
         list_png_files(&data_dir)
     };
     let num_frames = image_files.len().min(max_frames);
-    println!("Dataset: {} ({} frames)", dataset_path.display(), num_frames);
+    println!(
+        "Dataset: {} ({} frames)",
+        dataset_path.display(),
+        num_frames
+    );
 
     // Load first image for dimensions.
     let first = load_grayscale(&data_dir.join(&image_files[0]));
@@ -102,12 +109,21 @@ fn main() {
     let sensor_yaml = cam0_dir.join("sensor.yaml");
     let camera = match CameraIntrinsics::from_euroc_yaml(&sensor_yaml) {
         Ok(cam) => {
-            println!("Camera: fx={:.1} fy={:.1} cx={:.1} cy={:.1}, {} distortion coeffs",
-                cam.fx, cam.fy, cam.cx, cam.cy, cam.distortion.len());
+            println!(
+                "Camera: fx={:.1} fy={:.1} cx={:.1} cy={:.1}, {} distortion coeffs",
+                cam.fx,
+                cam.fy,
+                cam.cx,
+                cam.cy,
+                cam.distortion.len()
+            );
             Some(cam)
         }
         Err(e) => {
-            eprintln!("Warning: no sensor.yaml ({}), geometric verification disabled", e);
+            eprintln!(
+                "Warning: no sensor.yaml ({}), geometric verification disabled",
+                e
+            );
             None
         }
     };
@@ -151,7 +167,9 @@ fn main() {
     let mut frame_delay_ms: u64 = 30; // ms between frames
     let mut last_frame_time = Instant::now();
 
-    println!("\nControls: Space=pause, S=step, Q/Esc=quit, +/-=speed, T=trails, F=flow, H=histeq\n");
+    println!(
+        "\nControls: Space=pause, S=step, Q/Esc=quit, +/-=speed, T=trails, F=flow, H=histeq\n"
+    );
 
     while window.is_open() && !window.is_key_down(Key::Escape) && !window.is_key_down(Key::Q) {
         // Handle input.
@@ -173,7 +191,10 @@ fn main() {
         if window.is_key_pressed(Key::H, minifb::KeyRepeat::No) {
             let next = match frontend.histeq() {
                 HistEqMethod::None => HistEqMethod::Global,
-                HistEqMethod::Global => HistEqMethod::Clahe { tile_size: 32, clip_limit: 2.0 },
+                HistEqMethod::Global => HistEqMethod::Clahe {
+                    tile_size: 32,
+                    clip_limit: 2.0,
+                },
                 HistEqMethod::Clahe { .. } => HistEqMethod::None,
             };
             frontend.set_histeq(next);
@@ -203,7 +224,6 @@ fn main() {
             && last_frame_time.elapsed().as_millis() >= frame_delay_ms as u128;
 
         if should_advance {
-
             let img = load_grayscale(&data_dir.join(&image_files[frame_idx]));
             let (features, stats) = frontend.process(&img);
 
@@ -214,10 +234,8 @@ fn main() {
             render_grayscale(&img, &mut fb, img_w, img_h, scale);
 
             // Update tracks.
-            let curr_positions: HashMap<u64, (f32, f32)> = features
-                .iter()
-                .map(|f| (f.id, (f.x, f.y)))
-                .collect();
+            let curr_positions: HashMap<u64, (f32, f32)> =
+                features.iter().map(|f| (f.id, (f.x, f.y))).collect();
 
             // Age all tracks, remove very old ones.
             tracks.values_mut().for_each(|t| t.age += 1);
@@ -247,7 +265,9 @@ fn main() {
                         let alpha = i as f32 / track.positions.len() as f32;
                         let color = fade_color(track.color, alpha * 0.6);
                         draw_line(
-                            &mut fb, win_w, win_h,
+                            &mut fb,
+                            win_w,
+                            win_h,
                             (track.positions[i - 1].0 * scale as f32) as i32,
                             (track.positions[i - 1].1 * scale as f32) as i32,
                             (track.positions[i].0 * scale as f32) as i32,
@@ -267,7 +287,9 @@ fn main() {
                         let mag = (dx * dx + dy * dy).sqrt();
                         if mag > 0.5 {
                             draw_arrow(
-                                &mut fb, win_w, win_h,
+                                &mut fb,
+                                win_w,
+                                win_h,
                                 (px * scale as f32) as i32,
                                 (py * scale as f32) as i32,
                                 (f.x * scale as f32) as i32,
@@ -283,9 +305,11 @@ fn main() {
             for f in &features {
                 let track_len = tracks.get(&f.id).map(|t| t.positions.len()).unwrap_or(0);
                 let color = survival_color(track_len, TRAIL_LENGTH);
-                
+
                 draw_circle(
-                    &mut fb, win_w, win_h,
+                    &mut fb,
+                    win_w,
+                    win_h,
                     (f.x * scale as f32) as i32,
                     (f.y * scale as f32) as i32,
                     2 * scale as i32,
@@ -296,9 +320,16 @@ fn main() {
             // HUD text (top-left info bar).
             draw_rect(&mut fb, win_w, win_h, 0, 0, win_w, 14, 0x222222);
             // Simple: just print to stdout since bitmap text is painful.
-            print!("\r{:5}: trk={:<3} lost={:<3} rej={:<3} new={:<3} tot={:<3} | {}  ",
-                frame_idx, stats.tracked, stats.lost, stats.rejected,
-                stats.new_detections, stats.total, stats.timing);
+            print!(
+                "\r{:5}: trk={:<3} lost={:<3} rej={:<3} new={:<3} tot={:<3} | {}  ",
+                frame_idx,
+                stats.tracked,
+                stats.lost,
+                stats.rejected,
+                stats.new_detections,
+                stats.total,
+                stats.timing
+            );
 
             prev_positions = curr_positions;
             frame_idx += 1;
@@ -338,7 +369,11 @@ fn list_png_files(dir: &Path) -> Vec<String> {
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
-            if name.ends_with(".png") { Some(name) } else { None }
+            if name.ends_with(".png") {
+                Some(name)
+            } else {
+                None
+            }
         })
         .collect();
     files.sort();
@@ -346,8 +381,8 @@ fn list_png_files(dir: &Path) -> Vec<String> {
 }
 
 fn load_grayscale(path: &Path) -> Image<u8> {
-    let img = image::open(path)
-        .unwrap_or_else(|e| panic!("Failed to load {}: {}", path.display(), e));
+    let img =
+        image::open(path).unwrap_or_else(|e| panic!("Failed to load {}: {}", path.display(), e));
     let gray = img.to_luma8();
     let (w, h) = gray.dimensions();
     Image::from_vec(w as usize, h as usize, gray.into_raw())
@@ -446,7 +481,16 @@ fn draw_arrow(fb: &mut [u32], w: usize, h: usize, x0: i32, y0: i32, x1: i32, y1:
 }
 
 /// Draw a filled rectangle.
-fn draw_rect(fb: &mut [u32], w: usize, h: usize, rx: usize, ry: usize, rw: usize, rh: usize, color: u32) {
+fn draw_rect(
+    fb: &mut [u32],
+    w: usize,
+    h: usize,
+    rx: usize,
+    ry: usize,
+    rw: usize,
+    rh: usize,
+    color: u32,
+) {
     for y in ry..(ry + rh).min(h) {
         for x in rx..(rx + rw).min(w) {
             fb[y * w + x] = color;
@@ -481,7 +525,11 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
         4 => (x, 0.0, c),
         _ => (c, 0.0, x),
     };
-    (((r + m) * 255.0) as u8, ((g + m) * 255.0) as u8, ((b + m) * 255.0) as u8)
+    (
+        ((r + m) * 255.0) as u8,
+        ((g + m) * 255.0) as u8,
+        ((b + m) * 255.0) as u8,
+    )
 }
 
 /// Compute a color based on track length (Red for short, Green for long).

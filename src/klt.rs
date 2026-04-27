@@ -347,20 +347,44 @@ impl KltTracker {
         let mut dx = 0.0f32;
         let mut dy = 0.0f32;
 
-        for level in (0..num_levels).rev() {
-            let prev_img = &prev_pyr.levels[level];
-            let curr_img = &curr_pyr.levels[level];
+        // If both pyramids carry replicate-padded f32 levels with a sufficient
+        // border, the IC path uses them and skips per-feature bounds checks.
+        let pad_border = if prev_pyr.pad_border >= self.window_size + 2
+            && curr_pyr.pad_border >= self.window_size + 2
+            && prev_pyr.padded_levels.len() >= num_levels
+            && curr_pyr.padded_levels.len() >= num_levels
+        {
+            prev_pyr.pad_border
+        } else {
+            0
+        };
 
+        for level in (0..num_levels).rev() {
             let scale = 1.0 / (1u32 << level) as f32;
             let feat_x = feature.x * scale;
             let feat_y = feature.y * scale;
 
             let result = match self.method {
                 LkMethod::ForwardAdditive => {
+                    let prev_img = &prev_pyr.levels[level];
+                    let curr_img = &curr_pyr.levels[level];
                     self.lk_forward_additive(prev_img, curr_img, feat_x, feat_y, dx, dy)
                 }
                 LkMethod::InverseCompositional => {
-                    self.lk_inverse_compositional(prev_img, curr_img, feat_x, feat_y, dx, dy, scratch)
+                    if pad_border > 0 {
+                        let prev_img = &prev_pyr.padded_levels[level];
+                        let curr_img = &curr_pyr.padded_levels[level];
+                        self.lk_inverse_compositional(
+                            prev_img, curr_img,
+                            feat_x + pad_border as f32,
+                            feat_y + pad_border as f32,
+                            dx, dy, scratch,
+                        )
+                    } else {
+                        let prev_img = &prev_pyr.levels[level];
+                        let curr_img = &curr_pyr.levels[level];
+                        self.lk_inverse_compositional(prev_img, curr_img, feat_x, feat_y, dx, dy, scratch)
+                    }
                 }
                 LkMethod::InverseCompositionalFixed => {
                     // Use direct u8 path when pyramid has u8 levels (build_reuse).
@@ -371,6 +395,8 @@ impl KltTracker {
                             feat_x, feat_y, dx, dy, scratch_fixed,
                         )
                     } else {
+                        let prev_img = &prev_pyr.levels[level];
+                        let curr_img = &curr_pyr.levels[level];
                         self.lk_ic_fixed(prev_img, curr_img, feat_x, feat_y, dx, dy, scratch_fixed)
                     }
                 }
