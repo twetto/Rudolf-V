@@ -40,7 +40,7 @@ use std::time::Instant;
 use crate::camera::CameraIntrinsics;
 use crate::essential::{self, Correspondence, RansacConfig};
 use crate::fast::Feature;
-use crate::frontend::{FrameStats, TimingStats};
+use crate::frontend::{select_by_tile_deficit, FrameStats, TimingStats};
 use crate::gpu::device::GpuDevice;
 use crate::gpu::fast::{GpuFastDetector, NmsStrategy};
 use crate::gpu::klt::GpuKltTracker;
@@ -89,10 +89,14 @@ pub struct GpuFrontendConfig {
     pub fast_threshold: u8,
     /// FAST arc length — minimum contiguous bright/dark pixels (9–12).
     pub fast_arc_length: usize,
-    /// Maximum number of tracked features.
+    /// Reservoir capacity: maximum number of tracked features.
     pub max_features: usize,
     /// Occupancy grid / NMS cell size in pixels.
     pub cell_size: usize,
+    /// Coarse tile columns for replenishment coverage balancing.
+    pub coarse_tile_cols: usize,
+    /// Coarse tile rows for replenishment coverage balancing.
+    pub coarse_tile_rows: usize,
     /// Number of Gaussian pyramid levels.
     pub pyramid_levels: usize,
     /// Gaussian pyramid sigma.
@@ -122,6 +126,8 @@ impl Default for GpuFrontendConfig {
             fast_arc_length: 9,
             max_features:    200,
             cell_size:       16,
+            coarse_tile_cols: 8,
+            coarse_tile_rows: 6,
             pyramid_levels:  3,
             pyramid_sigma:   1.0,
             klt_window:      7,
@@ -406,21 +412,42 @@ impl GpuFrontend {
 
         if slots > 0 {
             let mask = self.grid.unoccupied_mask();
+            let unoccupied: Vec<Feature> = winners
+                .iter()
+                .filter_map(|f| {
+                    let x = f.x as usize;
+                    let y = f.y as usize;
+                    if x < mask.width() && y < mask.height() && mask.get(x, y) > 0 {
+                        Some(Feature {
+                            x: f.x, y: f.y, score: f.score, level: f.level, id: 0,
+                            descriptor: 0,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let selected = select_by_tile_deficit(
+                &unoccupied,
+                &self.features,
+                slots,
+                self.config.max_features,
+                self.img_w,
+                self.img_h,
+                self.config.coarse_tile_cols,
+                self.config.coarse_tile_rows,
+            );
             let mut added = 0;
-            for f in &winners {
+            for f in &selected {
                 if added >= slots { break; }
-                let x = f.x as usize;
-                let y = f.y as usize;
-                if x < mask.width() && y < mask.height() && mask.get(x, y) > 0 {
-                    self.features.push(Feature {
-                        x: f.x, y: f.y, score: f.score, level: f.level, id: self.next_id,
-                        descriptor: 0,
-                    });
-                    self.next_id += 1;
-                    self.grid.mark(f.x, f.y);
-                    stats.new_detections += 1;
-                    added += 1;
-                }
+                self.features.push(Feature {
+                    x: f.x, y: f.y, score: f.score, level: f.level, id: self.next_id,
+                    descriptor: 0,
+                });
+                self.next_id += 1;
+                self.grid.mark(f.x, f.y);
+                stats.new_detections += 1;
+                added += 1;
             }
         }
         timing.detect = t0.elapsed().as_secs_f64();

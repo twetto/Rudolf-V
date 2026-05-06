@@ -39,6 +39,14 @@ pub enum DetectorType {
     Harris,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TileBounds {
+    x0: usize,
+    x1: usize,
+    y0: usize,
+    y1: usize,
+}
+
 /// Detector trait — unifies FAST and Harris behind a common interface.
 ///
 /// This is more idiomatic Rust than enum dispatch: you can add new
@@ -61,6 +69,113 @@ impl Detector for HarrisDetector {
     }
 }
 
+fn tile_bounds(
+    tile_x: usize,
+    tile_y: usize,
+    cols: usize,
+    rows: usize,
+    img_w: usize,
+    img_h: usize,
+) -> TileBounds {
+    TileBounds {
+        x0: tile_x * img_w / cols,
+        x1: (tile_x + 1) * img_w / cols,
+        y0: tile_y * img_h / rows,
+        y1: (tile_y + 1) * img_h / rows,
+    }
+}
+
+fn tile_index(feature: &Feature, cols: usize, rows: usize, img_w: usize, img_h: usize) -> usize {
+    let x = feature.x.max(0.0) as usize;
+    let y = feature.y.max(0.0) as usize;
+    let col = ((x * cols) / img_w.max(1)).min(cols - 1);
+    let row = ((y * rows) / img_h.max(1)).min(rows - 1);
+    row * cols + col
+}
+
+/// Selects new detection candidates by coarse tile deficit.
+///
+/// Grid NMS supplies at most one candidate per fine cell. This pass fixes
+/// row-major admission bias when there are more candidates than open slots:
+/// tiles below their area-proportional target are filled first, and candidates
+/// within a tile are admitted by corner score.
+pub(crate) fn select_by_tile_deficit(
+    candidates: &[Feature],
+    existing: &[Feature],
+    slots: usize,
+    capacity: usize,
+    img_w: usize,
+    img_h: usize,
+    tile_cols: usize,
+    tile_rows: usize,
+) -> Vec<Feature> {
+    if candidates.is_empty() || slots == 0 {
+        return Vec::new();
+    }
+
+    let cols = tile_cols.max(1);
+    let rows = tile_rows.max(1);
+    let tile_count = cols * rows;
+    let image_area = (img_w.max(1) * img_h.max(1)) as f32;
+
+    let mut target = vec![0usize; tile_count];
+    for tile_y in 0..rows {
+        for tile_x in 0..cols {
+            let idx = tile_y * cols + tile_x;
+            let b = tile_bounds(tile_x, tile_y, cols, rows, img_w, img_h);
+            let area = ((b.x1 - b.x0).max(1) * (b.y1 - b.y0).max(1)) as f32;
+            target[idx] = ((capacity as f32) * area / image_area).ceil() as usize;
+        }
+    }
+
+    let mut counts = vec![0usize; tile_count];
+    for feature in existing {
+        counts[tile_index(feature, cols, rows, img_w, img_h)] += 1;
+    }
+
+    let mut buckets: Vec<Vec<Feature>> = vec![Vec::new(); tile_count];
+    for candidate in candidates {
+        buckets[tile_index(candidate, cols, rows, img_w, img_h)].push(candidate.clone());
+    }
+    for bucket in &mut buckets {
+        bucket.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
+    let mut bucket_pos = vec![0usize; tile_count];
+    let mut selected = Vec::with_capacity(slots.min(candidates.len()));
+    while selected.len() < slots {
+        let best_tile = (0..tile_count)
+            .filter(|&idx| bucket_pos[idx] < buckets[idx].len())
+            .max_by(|&a, &b| {
+                let deficit_a = target[a] as isize - counts[a] as isize;
+                let deficit_b = target[b] as isize - counts[b] as isize;
+                deficit_a
+                    .cmp(&deficit_b)
+                    .then_with(|| {
+                        buckets[a][bucket_pos[a]]
+                            .score
+                            .partial_cmp(&buckets[b][bucket_pos[b]].score)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .then_with(|| b.cmp(&a))
+            });
+
+        let Some(tile) = best_tile else {
+            break;
+        };
+
+        selected.push(buckets[tile][bucket_pos[tile]].clone());
+        bucket_pos[tile] += 1;
+        counts[tile] += 1;
+    }
+
+    selected
+}
+
 /// Frontend configuration.
 #[derive(Clone)]
 pub struct FrontendConfig {
@@ -76,10 +191,14 @@ pub struct FrontendConfig {
     pub harris_threshold: f32,
     /// Harris block size.
     pub harris_block_size: usize,
-    /// Maximum number of tracked features.
+    /// Reservoir capacity: maximum number of tracked features.
     pub max_features: usize,
     /// Occupancy grid / NMS cell size in pixels.
     pub cell_size: usize,
+    /// Coarse tile columns for replenishment coverage balancing.
+    pub coarse_tile_cols: usize,
+    /// Coarse tile rows for replenishment coverage balancing.
+    pub coarse_tile_rows: usize,
     /// Number of Gaussian pyramid levels.
     pub pyramid_levels: usize,
     /// Gaussian pyramid sigma.
@@ -118,6 +237,8 @@ impl Default for FrontendConfig {
             harris_block_size: 2,
             max_features: 200,
             cell_size: 16,
+            coarse_tile_cols: 8,
+            coarse_tile_rows: 6,
             pyramid_levels: 3,
             pyramid_sigma: 1.0,
             klt_window: 7,
@@ -438,10 +559,20 @@ impl Frontend {
             // NMS on new detections only, then take up to slots_available.
             let nms = OccupancyNms::new(self.config.cell_size);
             let suppressed = nms.suppress(&new_features, self.img_w, self.img_h);
+            let selected = select_by_tile_deficit(
+                &suppressed,
+                &self.features,
+                slots_available,
+                self.config.max_features,
+                self.img_w,
+                self.img_h,
+                self.config.coarse_tile_cols,
+                self.config.coarse_tile_rows,
+            );
 
             // Step 5: Add new features with unique IDs.
             let curr_img = &self.curr_pyramid.levels[0];
-            for f in suppressed.iter().take(slots_available) {
+            for f in &selected {
                 // Ensure every feature has a valid LBP descriptor for later verification.
                 // FAST already provides this, but Harris/others might leave it as 0.
                 let descriptor = if f.descriptor == 0 {
@@ -536,6 +667,31 @@ mod tests {
             }
         }
         img
+    }
+
+    fn feature(x: f32, y: f32, score: f32) -> Feature {
+        Feature {
+            x,
+            y,
+            score,
+            level: 0,
+            id: 0,
+            descriptor: 0,
+        }
+    }
+
+    #[test]
+    fn test_tile_deficit_selection_fills_empty_tile_before_row_major_candidate() {
+        let candidates = vec![
+            feature(10.0, 10.0, 100.0),
+            feature(70.0, 10.0, 10.0),
+        ];
+        let existing = vec![feature(12.0, 12.0, 1.0)];
+
+        let selected = select_by_tile_deficit(&candidates, &existing, 1, 2, 100, 50, 2, 1);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].x, 70.0);
     }
 
     #[test]
