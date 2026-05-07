@@ -342,7 +342,11 @@ impl Frontend {
         let grid = OccupancyGrid::new(img_w, img_h, config.cell_size);
         let pyr_scratch = PyramidScratch::new(img_w, img_h, config.pyramid_sigma);
         let klt_scratch = KltScratch::new(config.klt_window);
-        let pad_border = config.klt_window + 2;
+        let pad_border = if config.klt_method == LkMethod::InverseCompositional {
+            config.klt_window + 2
+        } else {
+            0
+        };
         Frontend {
             config,
             prev_pyramid: Pyramid { levels: Vec::new(), u8_levels: Vec::new(), padded_levels: Vec::new(), pad_border },
