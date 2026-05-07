@@ -18,8 +18,7 @@
 
 use rudolf_v::camera::CameraIntrinsics;
 use rudolf_v::essential::RansacConfig;
-use rudolf_v::fast::Feature;
-use rudolf_v::frontend::{Frontend, FrontendConfig};
+use rudolf_v::frontend::{Frontend, FrontendConfig, TrackMeta, LbpPolicy};
 use rudolf_v::histeq::HistEqMethod;
 use rudolf_v::image::Image;
 use rudolf_v::klt::LkMethod;
@@ -43,6 +42,34 @@ struct Track {
     color: u32,
     /// Frames since last seen (for fade-out).
     age: usize,
+}
+
+#[derive(Clone, Copy)]
+enum MetaView {
+    Survival,
+    ReservoirScore,
+    KltQuality,
+    LbpDistance,
+}
+
+impl MetaView {
+    fn next(self) -> Self {
+        match self {
+            MetaView::Survival => MetaView::ReservoirScore,
+            MetaView::ReservoirScore => MetaView::KltQuality,
+            MetaView::KltQuality => MetaView::LbpDistance,
+            MetaView::LbpDistance => MetaView::Survival,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            MetaView::Survival => "survival",
+            MetaView::ReservoirScore => "reservoir-score",
+            MetaView::KltQuality => "klt-quality",
+            MetaView::LbpDistance => "lbp-distance",
+        }
+    }
 }
 
 fn main() {
@@ -128,16 +155,21 @@ fn main() {
         }
     };
 
+    let min_reservoir_score = env::var("RUDOLF_MIN_RESERVOIR_SCORE")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(f32::NEG_INFINITY);
+
     // Frontend.
     let config = FrontendConfig {
         //max_features: 40,
         //cell_size: 128,
-        //max_features: 2000,
-        //cell_size: 16,
+        max_features: 200,
+        cell_size: 32,
         // max_features: 100,
         // cell_size: 96,
-        max_features: 1410,
-        cell_size: 16,
+        // max_features: 1410,
+        // cell_size: 16,
         pyramid_levels: 4,
         klt_window: 11,
         klt_max_iter: 30,
@@ -153,9 +185,16 @@ fn main() {
             max_iterations: 200,
             confidence: 0.99,
         },
+        min_reservoir_score,
+        // lbp_policy: LbpPolicy::HardReject,
         ..Default::default()
     };
     let mut frontend = Frontend::new(config, img_w, img_h);
+    if min_reservoir_score.is_finite() {
+        println!("Reservoir pruning: score >= {:.2}", min_reservoir_score);
+    } else {
+        println!("Reservoir pruning: off");
+    }
 
     // Framebuffer (ARGB packed u32).
     let mut fb = vec![0u32; win_w * win_h];
@@ -170,11 +209,12 @@ fn main() {
     let mut paused = false;
     let mut show_trails = true;
     let mut show_flow = true;
+    let mut meta_view = MetaView::Survival;
     let mut frame_delay_ms: u64 = 30; // ms between frames
     let mut last_frame_time = Instant::now();
 
     println!(
-        "\nControls: Space=pause, S=step, Q/Esc=quit, +/-=speed, T=trails, F=flow, H=histeq\n"
+        "\nControls: Space=pause, S=step, Q/Esc=quit, +/-=speed, T=trails, F=flow, H=histeq, M=metadata\n"
     );
 
     while window.is_open() && !window.is_key_down(Key::Escape) && !window.is_key_down(Key::Q) {
@@ -193,6 +233,10 @@ fn main() {
         if window.is_key_pressed(Key::F, minifb::KeyRepeat::No) {
             show_flow = !show_flow;
             println!("Flow: {}", if show_flow { "on" } else { "off" });
+        }
+        if window.is_key_pressed(Key::M, minifb::KeyRepeat::No) {
+            meta_view = meta_view.next();
+            println!("Metadata view: {}", meta_view.label());
         }
         if window.is_key_pressed(Key::H, minifb::KeyRepeat::No) {
             let next = match frontend.histeq() {
@@ -231,10 +275,13 @@ fn main() {
 
         if should_advance {
             let img = load_grayscale(&data_dir.join(&image_files[frame_idx]));
-            let (features, stats) = frontend.process(&img);
-
-            // Clone features to release the mutable borrow on frontend.
-            let features: Vec<Feature> = features.to_vec();
+            let (features, stats, meta) = {
+                let (features, stats) = frontend.process(&img);
+                (features.to_vec(), stats, frontend.track_meta().to_vec())
+            };
+            let meta_by_id: HashMap<u64, TrackMeta> =
+                meta.iter().map(|m| (m.id, m.clone())).collect();
+            let meta_summary = summarize_meta(&meta);
 
             // Render frame to framebuffer.
             render_grayscale(&img, &mut fb, img_w, img_h, scale);
@@ -310,7 +357,8 @@ fn main() {
             // Draw feature points on top.
             for f in &features {
                 let track_len = tracks.get(&f.id).map(|t| t.positions.len()).unwrap_or(0);
-                let color = survival_color(track_len, TRAIL_LENGTH);
+                let meta = meta_by_id.get(&f.id);
+                let color = feature_color(meta_view, track_len, meta);
 
                 draw_circle(
                     &mut fb,
@@ -327,13 +375,18 @@ fn main() {
             draw_rect(&mut fb, win_w, win_h, 0, 0, win_w, 14, 0x222222);
             // Simple: just print to stdout since bitmap text is painful.
             print!(
-                "\r{:5}: trk={:<3} lost={:<3} rej={:<3} new={:<3} tot={:<3} | {}  ",
+                "\r{:5}: trk={:<3} lost={:<3} rej={:<3} new={:<3} tot={:<3} | score={:.2} klt={:.2} lbp={:.1}/{:<2} view={} | {}  ",
                 frame_idx,
                 stats.tracked,
                 stats.lost,
                 stats.rejected,
                 stats.new_detections,
                 stats.total,
+                meta_summary.avg_score,
+                meta_summary.avg_klt_quality,
+                meta_summary.avg_lbp_distance,
+                meta_summary.max_lbp_distance,
+                meta_view.label(),
                 stats.timing
             );
 
@@ -516,6 +569,65 @@ fn fade_color(color: u32, alpha: f32) -> u32 {
     let r = ((color >> 16) & 0xFF) as f32 * alpha;
     let g = ((color >> 8) & 0xFF) as f32 * alpha;
     let b = (color & 0xFF) as f32 * alpha;
+    ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+}
+
+#[derive(Default)]
+struct MetaSummary {
+    avg_score: f32,
+    avg_klt_quality: f32,
+    avg_lbp_distance: f32,
+    max_lbp_distance: u16,
+}
+
+fn summarize_meta(meta: &[TrackMeta]) -> MetaSummary {
+    if meta.is_empty() {
+        return MetaSummary::default();
+    }
+
+    let mut total_score = 0.0;
+    let mut total_klt_quality = 0.0;
+    let mut total_lbp_distance = 0u32;
+    let mut max_lbp_distance = 0u16;
+
+    for m in meta {
+        total_score += m.reservoir_score;
+        total_klt_quality += m.klt_quality;
+        total_lbp_distance += m.lbp_distance as u32;
+        max_lbp_distance = max_lbp_distance.max(m.lbp_distance);
+    }
+
+    let count = meta.len() as f32;
+    MetaSummary {
+        avg_score: total_score / count,
+        avg_klt_quality: total_klt_quality / count,
+        avg_lbp_distance: total_lbp_distance as f32 / count,
+        max_lbp_distance,
+    }
+}
+
+fn feature_color(view: MetaView, track_len: usize, meta: Option<&TrackMeta>) -> u32 {
+    match view {
+        MetaView::Survival => survival_color(track_len, TRAIL_LENGTH),
+        MetaView::ReservoirScore => {
+            let quality = meta
+                .map(|m| ((m.reservoir_score + 1.0) / 4.0).clamp(0.0, 1.0))
+                .unwrap_or(0.0);
+            quality_color(quality)
+        }
+        MetaView::KltQuality => quality_color(meta.map(|m| m.klt_quality).unwrap_or(0.0)),
+        MetaView::LbpDistance => {
+            let quality = meta
+                .map(|m| 1.0 - (m.lbp_distance as f32 / 16.0).min(1.0))
+                .unwrap_or(0.0);
+            quality_color(quality)
+        }
+    }
+}
+
+fn quality_color(quality: f32) -> u32 {
+    let hue = quality.clamp(0.0, 1.0) * 120.0;
+    let (r, g, b) = hsv_to_rgb(hue, 1.0, 1.0);
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
 

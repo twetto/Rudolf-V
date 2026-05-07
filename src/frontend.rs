@@ -39,12 +39,99 @@ pub enum DetectorType {
     Harris,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LbpPolicy {
+    /// Store LBP distance but never reject a reservoir track on LBP alone.
+    SoftPenalty,
+    /// Preserve the legacy behavior: reject when distance exceeds threshold.
+    HardReject,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct TileBounds {
     x0: usize,
     x1: usize,
     y0: usize,
     y1: usize,
+}
+
+/// Frontend-owned lifecycle and backend policy state for one reservoir track.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrackMeta {
+    pub id: u64,
+    pub age: u16,
+    pub is_ekf_landmark: bool,
+    pub ekf_landmark_id: Option<u32>,
+    pub klt_quality: f32,
+    pub lbp_distance: u16,
+    pub fine_cell: u16,
+    pub coarse_tile: u16,
+    pub reservoir_score: f32,
+}
+
+impl TrackMeta {
+    fn new(
+        feature: &Feature,
+        age: u16,
+        lbp_distance: u16,
+        img_w: usize,
+        img_h: usize,
+        cell_size: usize,
+        tile_cols: usize,
+        tile_rows: usize,
+    ) -> Self {
+        TrackMeta {
+            id: feature.id,
+            age,
+            is_ekf_landmark: false,
+            ekf_landmark_id: None,
+            klt_quality: 0.0,
+            lbp_distance,
+            fine_cell: fine_cell_index(feature, img_w, img_h, cell_size),
+            coarse_tile: tile_index(feature, tile_cols.max(1), tile_rows.max(1), img_w, img_h)
+                .min(u16::MAX as usize) as u16,
+            reservoir_score: reservoir_score(
+                feature,
+                age,
+                0.0,
+                lbp_distance,
+                img_w,
+                img_h,
+            ),
+        }
+    }
+
+    fn advanced(
+        &self,
+        feature: &Feature,
+        klt_quality: f32,
+        lbp_distance: u16,
+        img_w: usize,
+        img_h: usize,
+        cell_size: usize,
+        tile_cols: usize,
+        tile_rows: usize,
+    ) -> Self {
+        TrackMeta {
+            id: feature.id,
+            age: self.age.saturating_add(1),
+            is_ekf_landmark: self.is_ekf_landmark,
+            ekf_landmark_id: self.ekf_landmark_id,
+            klt_quality,
+            lbp_distance,
+            fine_cell: fine_cell_index(feature, img_w, img_h, cell_size),
+            coarse_tile: tile_index(feature, tile_cols.max(1), tile_rows.max(1), img_w, img_h)
+                .min(u16::MAX as usize) as u16,
+            reservoir_score: reservoir_score(
+                feature,
+                self.age.saturating_add(1),
+                klt_quality,
+                lbp_distance,
+                img_w,
+                img_h,
+            ),
+        }
+    }
 }
 
 /// Detector trait — unifies FAST and Harris behind a common interface.
@@ -93,6 +180,178 @@ fn tile_index(feature: &Feature, cols: usize, rows: usize, img_w: usize, img_h: 
     row * cols + col
 }
 
+fn fine_cell_index(feature: &Feature, img_w: usize, img_h: usize, cell_size: usize) -> u16 {
+    let cell = cell_size.max(1);
+    let cols = img_w.max(1).div_ceil(cell);
+    let rows = img_h.max(1).div_ceil(cell);
+    tile_index(feature, cols, rows, img_w, img_h).min(u16::MAX as usize) as u16
+}
+
+fn klt_quality_from_residual(residual: f32) -> f32 {
+    if residual.is_finite() {
+        1.0 / (1.0 + residual.max(0.0))
+    } else {
+        0.0
+    }
+}
+
+fn reservoir_score(
+    feature: &Feature,
+    age: u16,
+    klt_quality: f32,
+    lbp_distance: u16,
+    img_w: usize,
+    img_h: usize,
+) -> f32 {
+    let corner_score = (feature.score.max(0.0) / 255.0).min(1.0);
+    let age_score = (age as f32 / 10.0).min(1.0);
+    let lower_image_score = if img_h > 0 {
+        (feature.y / img_h as f32).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let lbp_penalty = (lbp_distance as f32 / 16.0).min(1.0);
+    let border_penalty = border_penalty(feature, img_w, img_h, 16.0);
+
+    2.0 * klt_quality.clamp(0.0, 1.0)
+        + 1.0 * corner_score
+        + 0.5 * age_score
+        + 0.5 * lower_image_score
+        - 1.0 * lbp_penalty
+        - 0.5 * border_penalty
+}
+
+fn border_penalty(feature: &Feature, img_w: usize, img_h: usize, margin: f32) -> f32 {
+    if img_w == 0 || img_h == 0 || margin <= 0.0 {
+        return 0.0;
+    }
+    let right = (img_w as f32 - 1.0 - feature.x).max(0.0);
+    let bottom = (img_h as f32 - 1.0 - feature.y).max(0.0);
+    let dist = feature.x.max(0.0).min(feature.y.max(0.0)).min(right).min(bottom);
+    ((margin - dist) / margin).clamp(0.0, 1.0)
+}
+
+fn prune_low_reservoir_score(
+    features: &mut Vec<Feature>,
+    track_meta: &mut Vec<TrackMeta>,
+    min_score: f32,
+) -> usize {
+    if !min_score.is_finite() || features.is_empty() {
+        return 0;
+    }
+
+    debug_assert_eq!(features.len(), track_meta.len());
+
+    let original_len = features.len();
+    let mut write = 0;
+    for i in 0..original_len {
+        if track_meta[i].reservoir_score >= min_score {
+            if write != i {
+                features[write] = features[i].clone();
+                track_meta[write] = track_meta[i].clone();
+            }
+            write += 1;
+        }
+    }
+
+    features.truncate(write);
+    track_meta.truncate(write);
+    original_len - write
+}
+
+fn tile_targets(
+    capacity: usize,
+    img_w: usize,
+    img_h: usize,
+    tile_cols: usize,
+    tile_rows: usize,
+) -> Vec<usize> {
+    let cols = tile_cols.max(1);
+    let rows = tile_rows.max(1);
+    let image_area = (img_w.max(1) * img_h.max(1)) as f32;
+    let mut target = vec![0usize; cols * rows];
+
+    for tile_y in 0..rows {
+        for tile_x in 0..cols {
+            let idx = tile_y * cols + tile_x;
+            let b = tile_bounds(tile_x, tile_y, cols, rows, img_w, img_h);
+            let area = ((b.x1 - b.x0).max(1) * (b.y1 - b.y0).max(1)) as f32;
+            target[idx] = ((capacity as f32) * area / image_area).ceil() as usize;
+        }
+    }
+
+    target
+}
+
+fn prune_overfull_tiles(
+    features: &mut Vec<Feature>,
+    track_meta: &mut Vec<TrackMeta>,
+    capacity: usize,
+    img_w: usize,
+    img_h: usize,
+    tile_cols: usize,
+    tile_rows: usize,
+) -> usize {
+    if features.is_empty() || capacity == 0 {
+        return 0;
+    }
+
+    debug_assert_eq!(features.len(), track_meta.len());
+
+    let cols = tile_cols.max(1);
+    let rows = tile_rows.max(1);
+    let tile_count = cols * rows;
+    let targets = tile_targets(capacity, img_w, img_h, cols, rows);
+    let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); tile_count];
+
+    for (idx, feature) in features.iter().enumerate() {
+        buckets[tile_index(feature, cols, rows, img_w, img_h)].push(idx);
+    }
+
+    let mut keep = vec![true; features.len()];
+    let mut pruned = 0;
+    for (tile, indices) in buckets.iter_mut().enumerate() {
+        let target = targets[tile];
+        if indices.len() <= target {
+            continue;
+        }
+
+        indices.sort_by(|&a, &b| {
+            track_meta[a]
+                .reservoir_score
+                .partial_cmp(&track_meta[b].reservoir_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| track_meta[a].age.cmp(&track_meta[b].age))
+                .then_with(|| features[a].id.cmp(&features[b].id))
+        });
+
+        for &idx in indices.iter().take(indices.len() - target) {
+            keep[idx] = false;
+            pruned += 1;
+        }
+    }
+
+    if pruned == 0 {
+        return 0;
+    }
+
+    let original_len = features.len();
+    let mut write = 0;
+    for i in 0..original_len {
+        if keep[i] {
+            if write != i {
+                features[write] = features[i].clone();
+                track_meta[write] = track_meta[i].clone();
+            }
+            write += 1;
+        }
+    }
+    features.truncate(write);
+    track_meta.truncate(write);
+
+    pruned
+}
+
 /// Selects new detection candidates by coarse tile deficit.
 ///
 /// Grid NMS supplies at most one candidate per fine cell. This pass fixes
@@ -116,17 +375,7 @@ pub(crate) fn select_by_tile_deficit(
     let cols = tile_cols.max(1);
     let rows = tile_rows.max(1);
     let tile_count = cols * rows;
-    let image_area = (img_w.max(1) * img_h.max(1)) as f32;
-
-    let mut target = vec![0usize; tile_count];
-    for tile_y in 0..rows {
-        for tile_x in 0..cols {
-            let idx = tile_y * cols + tile_x;
-            let b = tile_bounds(tile_x, tile_y, cols, rows, img_w, img_h);
-            let area = ((b.x1 - b.x0).max(1) * (b.y1 - b.y0).max(1)) as f32;
-            target[idx] = ((capacity as f32) * area / image_area).ceil() as usize;
-        }
-    }
+    let target = tile_targets(capacity, img_w, img_h, cols, rows);
 
     let mut counts = vec![0usize; tile_count];
     for feature in existing {
@@ -211,10 +460,22 @@ pub struct FrontendConfig {
     pub klt_epsilon: f32,
     /// KLT algorithm variant.
     pub klt_method: LkMethod,
+    /// Compute final level-0 patch residual for tracked points.
+    ///
+    /// Disabled by default because it adds an extra patch pass per track.
+    pub klt_residual_enabled: bool,
     /// LBP descriptor verification (occlusion/drift detection).
     pub lbp_verification_enabled: bool,
+    /// Whether high LBP distance is metadata only or a hard reservoir reject.
+    pub lbp_policy: LbpPolicy,
     /// Hamming distance threshold for LBP verification (max bits allowed).
     pub lbp_threshold: u32,
+    /// Reject tracked reservoir points whose soft score falls below this value.
+    ///
+    /// Defaults to negative infinity, which disables score-based pruning.
+    pub min_reservoir_score: f32,
+    /// Prune only over-target coarse tiles by local reservoir score.
+    pub tile_reservoir_pruning_enabled: bool,
     /// Histogram equalization preprocessing.
     /// Stabilizes brightness across frames when auto-exposure is active.
     pub histeq: HistEqMethod,
@@ -245,8 +506,12 @@ impl Default for FrontendConfig {
             klt_max_iter: 30,
             klt_epsilon: 0.01,
             klt_method: LkMethod::ForwardAdditive,
+            klt_residual_enabled: false,
             lbp_verification_enabled: true,
+            lbp_policy: LbpPolicy::SoftPenalty,
             lbp_threshold: 4,
+            min_reservoir_score: f32::NEG_INFINITY,
+            tile_reservoir_pruning_enabled: true,
             histeq: HistEqMethod::None,
             camera: None,
             ransac: RansacConfig::default(),
@@ -271,6 +536,8 @@ pub struct Frontend {
     has_prev: bool,
     /// Currently tracked features with persistent IDs.
     features: Vec<Feature>,
+    /// Metadata for `features`, kept index-aligned with the feature vector.
+    track_meta: Vec<TrackMeta>,
     /// Previous frame's feature positions (for geometric verification).
     prev_features: Vec<Feature>,
     /// Reusable buffer for KLT tracking results (avoids per-frame alloc).
@@ -355,6 +622,7 @@ impl Frontend {
             histeq_buf: Image::new(img_w, img_h),
             has_prev: false,
             features: Vec::new(),
+            track_meta: Vec::new(),
             prev_features: Vec::new(),
             track_results: Vec::new(),
             klt_scratch,
@@ -414,13 +682,15 @@ impl Frontend {
         let t0 = Instant::now();
         if self.has_prev {
             if !self.features.is_empty() {
+                debug_assert_eq!(self.features.len(), self.track_meta.len());
                 let tracker = KltTracker::with_method(
                     self.config.klt_window,
                     self.config.klt_max_iter,
                     self.config.klt_epsilon,
                     self.config.pyramid_levels,
                     self.config.klt_method,
-                );
+                )
+                .with_residual(self.config.klt_residual_enabled);
 
                 tracker.track_into_opt(
                     &self.prev_pyramid,
@@ -438,18 +708,37 @@ impl Frontend {
                 for i in 0..self.track_results.len() {
                     if self.track_results[i].status == TrackStatus::Tracked {
                         let feat = &self.track_results[i].feature;
+                        let mut lbp_distance = 0u16;
 
                         // LBP verification (occlusion/drift detection).
                         if self.config.lbp_verification_enabled {
                             let new_desc = compute_lbp_at(curr_img, feat.x, feat.y);
                             let dist = (new_desc ^ feat.descriptor).count_ones();
-                            if dist > self.config.lbp_threshold {
+                            lbp_distance = dist.min(u16::MAX as u32) as u16;
+                            if self.config.lbp_policy == LbpPolicy::HardReject
+                                && dist > self.config.lbp_threshold
+                            {
                                 stats.rejected += 1;
                                 continue;
                             }
                         }
 
                         self.features[write] = feat.clone();
+                        let klt_quality = if self.config.klt_residual_enabled {
+                            klt_quality_from_residual(self.track_results[i].residual)
+                        } else {
+                            1.0
+                        };
+                        self.track_meta[write] = self.track_meta[i].advanced(
+                            feat,
+                            klt_quality,
+                            lbp_distance,
+                            self.img_w,
+                            self.img_h,
+                            self.config.cell_size,
+                            self.config.coarse_tile_cols,
+                            self.config.coarse_tile_rows,
+                        );
                         write += 1;
                         stats.tracked += 1;
                     } else {
@@ -457,6 +746,7 @@ impl Frontend {
                     }
                 }
                 self.features.truncate(write);
+                self.track_meta.truncate(write);
                 timing.klt = t0.elapsed().as_secs_f64();
 
                 // Step 2b: Geometric verification (essential matrix RANSAC).
@@ -490,23 +780,29 @@ impl Frontend {
                             ) {
                                 // Remove outlier features.
                                 let mut inlier_features = Vec::new();
+                                let mut inlier_meta = Vec::new();
+                                let mut ransac_rejected = 0usize;
                                 for (ci, (feat_idx, _)) in corrs.iter().enumerate() {
                                     if result.inliers[ci] {
                                         inlier_features.push(self.features[*feat_idx].clone());
+                                        inlier_meta.push(self.track_meta[*feat_idx].clone());
                                     } else {
+                                        ransac_rejected += 1;
                                         stats.rejected += 1;
                                     }
                                 }
                                 // Also keep features that had no prev match (new this frame).
                                 let matched_ids: Vec<u64> = corrs.iter()
                                     .map(|(idx, _)| self.features[*idx].id).collect();
-                                for f in &self.features {
+                                for (idx, f) in self.features.iter().enumerate() {
                                     if !matched_ids.contains(&f.id) {
                                         inlier_features.push(f.clone());
+                                        inlier_meta.push(self.track_meta[idx].clone());
                                     }
                                 }
-                                stats.tracked -= stats.rejected;
+                                stats.tracked = stats.tracked.saturating_sub(ransac_rejected);
                                 self.features = inlier_features;
+                                self.track_meta = inlier_meta;
                             }
                         }
                     }
@@ -515,6 +811,28 @@ impl Frontend {
             }
         } else {
             // First frame: no tracking, no RANSAC.
+        }
+
+        let pruned = prune_low_reservoir_score(
+            &mut self.features,
+            &mut self.track_meta,
+            self.config.min_reservoir_score,
+        );
+        stats.rejected += pruned;
+        stats.tracked = stats.tracked.saturating_sub(pruned);
+
+        if self.config.tile_reservoir_pruning_enabled {
+            let pruned = prune_overfull_tiles(
+                &mut self.features,
+                &mut self.track_meta,
+                self.config.max_features,
+                self.img_w,
+                self.img_h,
+                self.config.coarse_tile_cols,
+                self.config.coarse_tile_rows,
+            );
+            stats.rejected += pruned;
+            stats.tracked = stats.tracked.saturating_sub(pruned);
         }
 
         // Step 3: Update occupancy grid from tracked features.
@@ -594,7 +912,18 @@ impl Frontend {
                     descriptor,
                 };
                 self.next_id += 1;
+                let new_meta = TrackMeta::new(
+                    &new_feat,
+                    1,
+                    0,
+                    self.img_w,
+                    self.img_h,
+                    self.config.cell_size,
+                    self.config.coarse_tile_cols,
+                    self.config.coarse_tile_rows,
+                );
                 self.features.push(new_feat);
+                self.track_meta.push(new_meta);
                 self.grid.mark(f.x, f.y);
                 stats.new_detections += 1;
             }
@@ -621,6 +950,13 @@ impl Frontend {
         &self.features
     }
 
+    /// Get metadata for the current feature list.
+    ///
+    /// The returned slice is index-aligned with [`Frontend::features`].
+    pub fn track_meta(&self) -> &[TrackMeta] {
+        &self.track_meta
+    }
+
     /// Number of frames processed so far.
     pub fn has_prev_frame(&self) -> bool {
         self.has_prev
@@ -630,6 +966,7 @@ impl Frontend {
     pub fn reset(&mut self) {
         self.has_prev = false;
         self.features.clear();
+        self.track_meta.clear();
         self.prev_features.clear();
         self.grid.clear();
         // Don't reset next_id — IDs should be globally unique.
@@ -779,6 +1116,283 @@ mod tests {
     }
 
     #[test]
+    fn test_track_meta_created_for_new_tracks() {
+        let img = make_scene(160, 120, 0, 0);
+        let config = FrontendConfig {
+            max_features: 50,
+            ..Default::default()
+        };
+        let mut frontend = Frontend::new(config, 160, 120);
+
+        let (features, _) = frontend.process(&img);
+        let ids: Vec<u64> = features.iter().map(|f| f.id).collect();
+        let meta = frontend.track_meta();
+
+        assert_eq!(meta.len(), ids.len());
+        assert!(meta.iter().all(|m| m.age == 1));
+        assert!(meta.iter().all(|m| !m.is_ekf_landmark));
+        assert!(meta.iter().all(|m| m.ekf_landmark_id.is_none()));
+        for (m, id) in meta.iter().zip(ids) {
+            assert_eq!(m.id, id);
+        }
+    }
+
+    #[test]
+    fn test_track_meta_age_advances_with_persisted_ids() {
+        let img1 = make_scene(160, 120, 0, 0);
+        let img2 = make_scene(160, 120, 2, 1);
+
+        let config = FrontendConfig {
+            max_features: 50,
+            ..Default::default()
+        };
+        let mut frontend = Frontend::new(config, 160, 120);
+
+        let ids_f1: Vec<u64> = frontend.process(&img1).0.iter().map(|f| f.id).collect();
+        frontend.process(&img2);
+
+        let persisted: Vec<&TrackMeta> = frontend.track_meta().iter()
+            .filter(|m| ids_f1.contains(&m.id))
+            .collect();
+
+        assert!(!persisted.is_empty(), "expected some persisted tracks");
+        assert!(persisted.iter().all(|m| m.age >= 2));
+        assert!(persisted.iter().all(|m| m.klt_quality > 0.0 && m.klt_quality <= 1.0));
+    }
+
+    #[test]
+    fn test_klt_residual_disabled_defaults_tracked_quality_to_one() {
+        let img1 = make_scene(160, 120, 0, 0);
+        let img2 = make_scene(160, 120, 2, 1);
+
+        let config = FrontendConfig {
+            klt_residual_enabled: false,
+            max_features: 50,
+            ..Default::default()
+        };
+        let mut frontend = Frontend::new(config, 160, 120);
+
+        let ids_f1: Vec<u64> = frontend.process(&img1).0.iter().map(|f| f.id).collect();
+        frontend.process(&img2);
+
+        let persisted: Vec<&TrackMeta> = frontend
+            .track_meta()
+            .iter()
+            .filter(|m| ids_f1.contains(&m.id))
+            .collect();
+
+        assert!(!persisted.is_empty(), "expected some persisted tracks");
+        assert!(persisted.iter().all(|m| m.klt_quality == 1.0));
+    }
+
+    #[test]
+    fn test_klt_residual_enabled_updates_quality_from_residual() {
+        let img1 = make_scene(160, 120, 0, 0);
+        let img2 = make_scene(160, 120, 2, 1);
+
+        let config = FrontendConfig {
+            klt_residual_enabled: true,
+            max_features: 50,
+            ..Default::default()
+        };
+        let mut frontend = Frontend::new(config, 160, 120);
+
+        let ids_f1: Vec<u64> = frontend.process(&img1).0.iter().map(|f| f.id).collect();
+        frontend.process(&img2);
+
+        let persisted: Vec<&TrackMeta> = frontend
+            .track_meta()
+            .iter()
+            .filter(|m| ids_f1.contains(&m.id))
+            .collect();
+
+        assert!(!persisted.is_empty(), "expected some persisted tracks");
+        assert!(persisted.iter().all(|m| m.klt_quality > 0.0 && m.klt_quality <= 1.0));
+    }
+
+    #[test]
+    fn test_track_meta_new_replenishment_tracks_start_at_age_one() {
+        let img1 = make_scene(160, 120, 0, 0);
+        let img2 = make_scene(160, 120, 15, 10);
+
+        let config = FrontendConfig {
+            max_features: 50,
+            ..Default::default()
+        };
+        let mut frontend = Frontend::new(config, 160, 120);
+
+        let ids_f1: Vec<u64> = frontend.process(&img1).0.iter().map(|f| f.id).collect();
+        frontend.process(&img2);
+
+        let new_tracks: Vec<&TrackMeta> = frontend.track_meta().iter()
+            .filter(|m| !ids_f1.contains(&m.id))
+            .collect();
+
+        assert!(!new_tracks.is_empty(), "expected replenished tracks");
+        assert!(new_tracks.iter().all(|m| m.age == 1));
+    }
+
+    #[test]
+    fn test_reservoir_score_penalizes_lbp_distance() {
+        let f = feature(50.0, 50.0, 100.0);
+
+        let clean = reservoir_score(&f, 3, 0.8, 0, 100, 100);
+        let bad_lbp = reservoir_score(&f, 3, 0.8, 16, 100, 100);
+
+        assert!(clean > bad_lbp, "LBP penalty should lower reservoir score");
+    }
+
+    #[test]
+    fn test_reservoir_score_rewards_age_and_quality() {
+        let f = feature(50.0, 50.0, 100.0);
+
+        let weak = reservoir_score(&f, 1, 0.1, 0, 100, 100);
+        let strong = reservoir_score(&f, 10, 0.9, 0, 100, 100);
+
+        assert!(strong > weak, "age and KLT quality should improve reservoir score");
+    }
+
+    #[test]
+    fn test_track_meta_reservoir_score_is_finite() {
+        let img1 = make_scene(160, 120, 0, 0);
+        let img2 = make_scene(160, 120, 2, 1);
+
+        let config = FrontendConfig {
+            max_features: 50,
+            ..Default::default()
+        };
+        let mut frontend = Frontend::new(config, 160, 120);
+
+        frontend.process(&img1);
+        frontend.process(&img2);
+
+        assert!(frontend.track_meta().iter().all(|m| m.reservoir_score.is_finite()));
+    }
+
+    #[test]
+    fn test_low_reservoir_score_pruning_disabled_by_default() {
+        let mut features = vec![feature(20.0, 20.0, 50.0)];
+        features[0].id = 7;
+        let mut meta = vec![TrackMeta::new(&features[0], 1, 0, 100, 100, 16, 2, 2)];
+        meta[0].reservoir_score = -10.0;
+
+        let pruned = prune_low_reservoir_score(
+            &mut features,
+            &mut meta,
+            FrontendConfig::default().min_reservoir_score,
+        );
+
+        assert_eq!(pruned, 0);
+        assert_eq!(features.len(), 1);
+        assert_eq!(meta.len(), 1);
+    }
+
+    #[test]
+    fn test_low_reservoir_score_pruning_removes_weak_tracks() {
+        let mut features = vec![
+            feature(20.0, 20.0, 50.0),
+            feature(40.0, 40.0, 50.0),
+            feature(60.0, 60.0, 50.0),
+        ];
+        for (i, f) in features.iter_mut().enumerate() {
+            f.id = (i + 1) as u64;
+        }
+        let mut meta: Vec<TrackMeta> = features
+            .iter()
+            .map(|f| TrackMeta::new(f, 2, 0, 100, 100, 16, 2, 2))
+            .collect();
+        meta[0].reservoir_score = 0.2;
+        meta[1].reservoir_score = -0.3;
+        meta[2].reservoir_score = 0.8;
+
+        let pruned = prune_low_reservoir_score(&mut features, &mut meta, 0.0);
+
+        assert_eq!(pruned, 1);
+        assert_eq!(features.iter().map(|f| f.id).collect::<Vec<_>>(), vec![1, 3]);
+        assert_eq!(meta.iter().map(|m| m.id).collect::<Vec<_>>(), vec![1, 3]);
+    }
+
+    #[test]
+    fn test_tile_pruning_removes_lowest_score_only_from_overfull_tile() {
+        let mut features = vec![
+            feature(10.0, 20.0, 50.0),
+            feature(20.0, 20.0, 50.0),
+            feature(30.0, 20.0, 50.0),
+            feature(80.0, 20.0, 50.0),
+        ];
+        for (i, f) in features.iter_mut().enumerate() {
+            f.id = (i + 1) as u64;
+        }
+        let mut meta: Vec<TrackMeta> = features
+            .iter()
+            .map(|f| TrackMeta::new(f, 2, 0, 100, 100, 16, 2, 1))
+            .collect();
+        meta[0].reservoir_score = 0.2;
+        meta[1].reservoir_score = 0.8;
+        meta[2].reservoir_score = 0.5;
+        meta[3].reservoir_score = -10.0;
+
+        let pruned = prune_overfull_tiles(&mut features, &mut meta, 4, 100, 100, 2, 1);
+
+        assert_eq!(pruned, 1);
+        assert_eq!(features.iter().map(|f| f.id).collect::<Vec<_>>(), vec![2, 3, 4]);
+        assert_eq!(meta.iter().map(|m| m.id).collect::<Vec<_>>(), vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn test_tile_pruning_disabled_keeps_overfull_tile() {
+        let mut features = vec![
+            feature(10.0, 20.0, 50.0),
+            feature(20.0, 20.0, 50.0),
+            feature(30.0, 20.0, 50.0),
+        ];
+        for (i, f) in features.iter_mut().enumerate() {
+            f.id = (i + 1) as u64;
+        }
+        let mut meta: Vec<TrackMeta> = features
+            .iter()
+            .map(|f| TrackMeta::new(f, 2, 0, 100, 100, 16, 2, 1))
+            .collect();
+
+        let config = FrontendConfig {
+            tile_reservoir_pruning_enabled: false,
+            ..Default::default()
+        };
+        let pruned = if config.tile_reservoir_pruning_enabled {
+            prune_overfull_tiles(&mut features, &mut meta, 2, 100, 100, 2, 1)
+        } else {
+            0
+        };
+
+        assert_eq!(pruned, 0);
+        assert_eq!(features.len(), 3);
+        assert_eq!(meta.len(), 3);
+    }
+
+    #[test]
+    fn test_low_reservoir_score_pruning_runs_before_replenishment() {
+        let img1 = make_scene(160, 120, 0, 0);
+        let img2 = make_scene(160, 120, 2, 1);
+
+        let config = FrontendConfig {
+            max_features: 30,
+            min_reservoir_score: 10.0,
+            ..Default::default()
+        };
+        let mut frontend = Frontend::new(config, 160, 120);
+
+        frontend.process(&img1);
+        let (_, stats) = frontend.process(&img2);
+
+        assert!(stats.rejected > 0, "score pruning should reject tracked points");
+        assert!(stats.new_detections > 0, "pruned tracks should free replenishment slots");
+        assert_eq!(frontend.features().len(), frontend.track_meta().len());
+        for (feature, meta) in frontend.features().iter().zip(frontend.track_meta()) {
+            assert_eq!(feature.id, meta.id);
+        }
+    }
+
+    #[test]
     fn test_max_features_respected() {
         let img = make_scene(160, 120, 0, 0);
         let max = 15;
@@ -872,6 +1486,7 @@ mod tests {
 
         frontend.reset();
         assert!(frontend.features().is_empty());
+        assert!(frontend.track_meta().is_empty());
         assert!(!frontend.has_prev_frame());
     }
 
@@ -890,6 +1505,52 @@ mod tests {
         frontend.process(&img1);
         let (_, stats) = frontend.process(&img2);
         assert!(stats.tracked > 0, "IC method should track features");
+    }
+
+    #[test]
+    fn test_lbp_soft_policy_does_not_reject_on_lbp_alone() {
+        let img1 = make_scene(160, 120, 0, 0);
+        let img2 = make_scene(160, 120, 2, 1);
+
+        let config = FrontendConfig {
+            lbp_policy: LbpPolicy::SoftPenalty,
+            lbp_threshold: 0,
+            tile_reservoir_pruning_enabled: false,
+            max_features: 30,
+            ..Default::default()
+        };
+        let mut frontend = Frontend::new(config, 160, 120);
+
+        frontend.process(&img1);
+        for f in &mut frontend.features {
+            f.descriptor = !f.descriptor;
+        }
+        let (_, stats) = frontend.process(&img2);
+
+        assert_eq!(stats.rejected, 0, "soft LBP policy should not hard-reject");
+        assert!(stats.tracked > 0, "soft LBP policy should keep tracked reservoir points");
+    }
+
+    #[test]
+    fn test_lbp_hard_policy_preserves_legacy_rejection() {
+        let img1 = make_scene(160, 120, 0, 0);
+        let img2 = make_scene(160, 120, 2, 1);
+
+        let config = FrontendConfig {
+            lbp_policy: LbpPolicy::HardReject,
+            lbp_threshold: 0,
+            max_features: 30,
+            ..Default::default()
+        };
+        let mut frontend = Frontend::new(config, 160, 120);
+
+        frontend.process(&img1);
+        for f in &mut frontend.features {
+            f.descriptor = !f.descriptor;
+        }
+        let (_, stats) = frontend.process(&img2);
+
+        assert!(stats.rejected > 0, "hard LBP policy should reject mismatched descriptors");
     }
 
     #[test]

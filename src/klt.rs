@@ -74,6 +74,9 @@ pub enum LkMethod {
 pub struct TrackedFeature {
     pub feature: Feature,
     pub status: TrackStatus,
+    /// Final mean absolute level-0 patch error. Lower is better.
+    /// This is a tracking-quality signal, not a hard gate.
+    pub residual: f32,
 }
 
 /// Pre-allocated scratch buffers for KLT tracking.
@@ -216,6 +219,7 @@ pub struct KltTracker {
     pub epsilon: f32,
     pub max_levels: usize,
     pub method: LkMethod,
+    pub compute_residual: bool,
 }
 
 impl KltTracker {
@@ -231,6 +235,7 @@ impl KltTracker {
             epsilon,
             max_levels,
             method: LkMethod::ForwardAdditive,
+            compute_residual: false,
         }
     }
 
@@ -247,7 +252,13 @@ impl KltTracker {
             epsilon,
             max_levels,
             method,
+            compute_residual: false,
         }
+    }
+
+    pub fn with_residual(mut self, compute_residual: bool) -> Self {
+        self.compute_residual = compute_residual;
+        self
     }
 
     pub fn track(
@@ -418,6 +429,7 @@ impl KltTracker {
                             descriptor: feature.descriptor,
                         },
                         status: TrackStatus::Lost,
+                        residual: f32::INFINITY,
                     };
                 }
             }
@@ -438,6 +450,21 @@ impl KltTracker {
         } else {
             TrackStatus::OutOfBounds
         };
+        let residual = if status == TrackStatus::Tracked && self.compute_residual {
+            mean_abs_patch_residual(
+                &prev_pyr.levels[0],
+                &curr_pyr.levels[0],
+                feature.x,
+                feature.y,
+                dx,
+                dy,
+                self.window_size,
+            )
+        } else if status == TrackStatus::Tracked {
+            f32::NAN
+        } else {
+            f32::INFINITY
+        };
 
         TrackedFeature {
             feature: Feature {
@@ -449,6 +476,7 @@ impl KltTracker {
                 descriptor: feature.descriptor,
             },
             status,
+            residual,
         }
     }
 
@@ -1276,6 +1304,33 @@ enum LkResult {
     Converged(f32, f32),
     MaxIter(f32, f32),
     Singular,
+}
+
+fn mean_abs_patch_residual(
+    prev_img: &Image<f32>,
+    curr_img: &Image<f32>,
+    feat_x: f32,
+    feat_y: f32,
+    dx: f32,
+    dy: f32,
+    window_size: usize,
+) -> f32 {
+    let half = window_size as isize;
+    let mut sum = 0.0f32;
+    let mut count = 0usize;
+
+    for py in -half..=half {
+        for px in -half..=half {
+            let px_f = px as f32;
+            let py_f = py as f32;
+            let t = interpolate_bilinear(prev_img, feat_x + px_f, feat_y + py_f);
+            let w = interpolate_bilinear(curr_img, feat_x + dx + px_f, feat_y + dy + py_f);
+            sum += (t - w).abs();
+            count += 1;
+        }
+    }
+
+    sum / count.max(1) as f32
 }
 
 /// Bilinear interpolation from two row pointers with constant weights.
@@ -2344,13 +2399,14 @@ mod tests {
         let pyr1 = Pyramid::build(&img1, 3, 1.0);
         let pyr2 = Pyramid::build(&img2, 3, 1.0);
 
-        let tracker = KltTracker::new(7, 30, 0.01, 3);
+        let tracker = KltTracker::new(7, 30, 0.01, 3).with_residual(true);
         let features = vec![Feature {
             x: 41.0, y: 41.0, score: 100.0, level: 0, id: 1, descriptor: 0,
         }];
 
         let results = tracker.track(&pyr1, &pyr2, &features);
         assert_eq!(results[0].status, TrackStatus::Tracked);
+        assert!(results[0].residual.is_finite(), "residual should be finite");
 
         let dx = results[0].feature.x - 41.0;
         let dy = results[0].feature.y - 41.0;

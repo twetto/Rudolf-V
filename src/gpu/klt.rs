@@ -606,6 +606,7 @@ impl GpuKltTracker {
                 TrackedFeature {
                     feature: Feature { x: r.x, y: r.y, score: f.score, level: f.level, id: f.id, descriptor: f.descriptor },
                     status,
+                    residual: f32::NAN,
                 }
             })
             .collect();
