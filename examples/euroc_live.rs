@@ -175,10 +175,6 @@ fn main() {
         klt_max_iter: 30,
         klt_method: LkMethod::InverseCompositional,
         histeq: HistEqMethod::Global,
-        // histeq: HistEqMethod::Clahe {
-        //     tile_size: 120,
-        //     clip_limit: 1.0,
-        // },
         camera,
         ransac: RansacConfig {
             threshold: 1e-5,
@@ -242,8 +238,8 @@ fn main() {
             let next = match frontend.histeq() {
                 HistEqMethod::None => HistEqMethod::Global,
                 HistEqMethod::Global => HistEqMethod::Clahe {
-                    tile_size: 32,
-                    clip_limit: 2.0,
+                    tile_size: 64,
+                    clip_limit: 4.0,
                 },
                 HistEqMethod::Clahe { .. } => HistEqMethod::None,
             };
@@ -283,8 +279,9 @@ fn main() {
                 meta.iter().map(|m| (m.id, m.clone())).collect();
             let meta_summary = summarize_meta(&meta);
 
-            // Render frame to framebuffer.
-            render_grayscale(&img, &mut fb, img_w, img_h, scale);
+            // Render the same preprocessed image used by the frontend.
+            let display_img = frontend.preprocessed_image().unwrap_or(&img);
+            render_grayscale(display_img, &mut fb, img_w, img_h, scale);
 
             // Update tracks.
             let curr_positions: HashMap<u64, (f32, f32)> =

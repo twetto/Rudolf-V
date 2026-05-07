@@ -957,6 +957,15 @@ impl Frontend {
         &self.track_meta
     }
 
+    /// Get the last histogram-equalized input image, if preprocessing is enabled.
+    pub fn preprocessed_image(&self) -> Option<&Image<u8>> {
+        if self.config.histeq == HistEqMethod::None {
+            None
+        } else {
+            Some(&self.histeq_buf)
+        }
+    }
+
     /// Number of frames processed so far.
     pub fn has_prev_frame(&self) -> bool {
         self.has_prev
