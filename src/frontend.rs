@@ -957,6 +957,48 @@ impl Frontend {
         &self.track_meta
     }
 
+    /// Drop frontend tracks by feature ID.
+    ///
+    /// Backend-side visibility logic can call this after deciding that an
+    /// optical-flow ID is occluded or otherwise invalid. Dropped IDs are not
+    /// tracked on the next frame and will disappear from the next vision
+    /// measurement, allowing the backend to marginalize matching landmarks.
+    ///
+    /// Returns the number of active tracks removed.
+    pub fn drop_tracks(&mut self, ids: &[u64]) -> usize {
+        if ids.is_empty() || self.features.is_empty() {
+            return 0;
+        }
+
+        debug_assert_eq!(self.features.len(), self.track_meta.len());
+
+        let before = self.features.len();
+        let mut write = 0usize;
+
+        for read in 0..self.features.len() {
+            if ids.contains(&self.features[read].id) {
+                continue;
+            }
+
+            if write != read {
+                self.features[write] = self.features[read].clone();
+                self.track_meta[write] = self.track_meta[read].clone();
+            }
+            write += 1;
+        }
+
+        self.features.truncate(write);
+        self.track_meta.truncate(write);
+        self.prev_features.retain(|feature| !ids.contains(&feature.id));
+
+        self.grid.clear();
+        for feature in &self.features {
+            self.grid.mark(feature.x, feature.y);
+        }
+
+        before - write
+    }
+
     /// Get the last histogram-equalized input image, if preprocessing is enabled.
     pub fn preprocessed_image(&self) -> Option<&Image<u8>> {
         if self.config.histeq == HistEqMethod::None {
@@ -1497,6 +1539,47 @@ mod tests {
         assert!(frontend.features().is_empty());
         assert!(frontend.track_meta().is_empty());
         assert!(!frontend.has_prev_frame());
+    }
+
+    #[test]
+    fn test_drop_tracks_removes_features_and_metadata() {
+        let img = make_scene(160, 120, 0, 0);
+        let config = FrontendConfig {
+            max_features: 30,
+            ..Default::default()
+        };
+        let mut frontend = Frontend::new(config, 160, 120);
+
+        frontend.process(&img);
+        let drop_id = frontend.features()[0].id;
+        let before = frontend.features().len();
+
+        let removed = frontend.drop_tracks(&[drop_id]);
+
+        assert_eq!(removed, 1);
+        assert_eq!(frontend.features().len(), before - 1);
+        assert_eq!(frontend.features().len(), frontend.track_meta().len());
+        assert!(frontend.features().iter().all(|feature| feature.id != drop_id));
+        assert!(frontend.track_meta().iter().all(|meta| meta.id != drop_id));
+    }
+
+    #[test]
+    fn test_drop_tracks_ignores_missing_ids() {
+        let img = make_scene(160, 120, 0, 0);
+        let config = FrontendConfig {
+            max_features: 30,
+            ..Default::default()
+        };
+        let mut frontend = Frontend::new(config, 160, 120);
+
+        frontend.process(&img);
+        let before = frontend.features().len();
+
+        let removed = frontend.drop_tracks(&[u64::MAX]);
+
+        assert_eq!(removed, 0);
+        assert_eq!(frontend.features().len(), before);
+        assert_eq!(frontend.features().len(), frontend.track_meta().len());
     }
 
     #[test]

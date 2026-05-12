@@ -470,6 +470,31 @@ impl GpuFrontend {
         &self.features
     }
 
+    /// Drop frontend tracks by feature ID.
+    ///
+    /// Backend-side visibility logic can call this after deciding that an
+    /// optical-flow ID is occluded or otherwise invalid. Dropped IDs are not
+    /// tracked on the next frame and will disappear from the next vision
+    /// measurement, allowing the backend to marginalize matching landmarks.
+    ///
+    /// Returns the number of active tracks removed.
+    pub fn drop_tracks(&mut self, ids: &[u64]) -> usize {
+        if ids.is_empty() || self.features.is_empty() {
+            return 0;
+        }
+
+        let before = self.features.len();
+        self.features.retain(|feature| !ids.contains(&feature.id));
+        self.prev_features.retain(|feature| !ids.contains(&feature.id));
+
+        self.grid.clear();
+        for feature in &self.features {
+            self.grid.mark(feature.x, feature.y);
+        }
+
+        before - self.features.len()
+    }
+
     /// Whether at least one frame has been processed.
     pub fn has_prev_frame(&self) -> bool {
         self.has_prev
