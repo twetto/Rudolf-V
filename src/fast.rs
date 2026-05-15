@@ -40,10 +40,22 @@ use rayon::prelude::*;
 /// Bresenham circle of radius 3: 16 (dx, dy) offsets.
 /// Listed clockwise starting from 12 o'clock, matching Rosten's convention.
 const CIRCLE_OFFSETS: [(isize, isize); 16] = [
-    ( 0, -3), ( 1, -3), ( 2, -2), ( 3, -1),
-    ( 3,  0), ( 3,  1), ( 2,  2), ( 1,  3),
-    ( 0,  3), (-1,  3), (-2,  2), (-3,  1),
-    (-3,  0), (-3, -1), (-2, -2), (-1, -3),
+    (0, -3),
+    (1, -3),
+    (2, -2),
+    (3, -1),
+    (3, 0),
+    (3, 1),
+    (2, 2),
+    (1, 3),
+    (0, 3),
+    (-1, 3),
+    (-2, 2),
+    (-3, 1),
+    (-3, 0),
+    (-3, -1),
+    (-2, -2),
+    (-1, -3),
 ];
 
 /// A detected feature point.
@@ -127,6 +139,13 @@ impl FastDetector {
         let arc_length = self.arc_length;
         let min_cardinals: u8 = if arc_length >= 12 { 3 } else { 2 };
 
+        let cell_shift = if !grid.is_empty() {
+            debug_assert!(cell_size.is_power_of_two(), "cell_size must be power of 2");
+            cell_size.trailing_zeros()
+        } else {
+            0
+        };
+
         #[cfg(feature = "parallel")]
         {
             return (3..(h - 3))
@@ -134,10 +153,19 @@ impl FastDetector {
                 .flat_map(|y| {
                     let mut row_features = Vec::new();
                     detect_row(
-                        slice, stride, w, y, 0,
-                        &circle_off, &card,
-                        thresh, arc_length, min_cardinals,
-                        grid, grid_cols, cell_size,
+                        slice,
+                        stride,
+                        w,
+                        y,
+                        0,
+                        &circle_off,
+                        &card,
+                        thresh,
+                        arc_length,
+                        min_cardinals,
+                        grid,
+                        grid_cols,
+                        cell_shift,
                         &mut row_features,
                     );
                     row_features
@@ -150,10 +178,19 @@ impl FastDetector {
             let mut features = Vec::new();
             for y in 3..(h - 3) {
                 detect_row(
-                    slice, stride, w, y, 0,
-                    &circle_off, &card,
-                    thresh, arc_length, min_cardinals,
-                    grid, grid_cols, cell_size,
+                    slice,
+                    stride,
+                    w,
+                    y,
+                    0,
+                    &circle_off,
+                    &card,
+                    thresh,
+                    arc_length,
+                    min_cardinals,
+                    grid,
+                    grid_cols,
+                    cell_shift,
                     &mut features,
                 );
             }
@@ -186,13 +223,11 @@ fn precompute_offsets(stride: usize) -> ([isize; 16], [isize; 4]) {
     (circle_off, card)
 }
 
-/// Process one row of FAST detection with inline occupancy skipping.
+/// Process one row of FAST detection with cell-range occupancy skipping.
 ///
-/// When `grid` is non-empty, checks one bool per cell boundary and jumps
-/// past occupied cells. When `grid` is empty, scans the full row.
-///
-/// Uses a `while` loop so we can jump x forward by an entire cell width
-/// when we hit an occupied cell.
+/// Outer loop iterates grid cells (~6 per row for 752px / 128-cell);
+/// inner loop scans pixels within each unoccupied cell with zero grid
+/// overhead. When `grid` is empty, scans the full row in one range.
 #[inline]
 fn detect_row(
     slice: &[u8],
@@ -207,135 +242,369 @@ fn detect_row(
     min_cardinals: u8,
     grid: &[bool],
     grid_cols: usize,
-    cell_size: usize,
+    cell_shift: u32,
     features: &mut Vec<Feature>,
 ) {
     let row_base = y * stride;
     let has_grid = !grid.is_empty();
-    let grid_row_off = if has_grid { (y / cell_size) * grid_cols } else { 0 };
+    let grid_row_off = if has_grid {
+        (y >> cell_shift) * grid_cols
+    } else {
+        0
+    };
 
     let x_min = 3usize;
     let x_max = w - 3;
 
-    let mut x = x_min;
-    while x < x_max {
-        // ── Occupancy skip: one bool check per cell boundary ──
-        if has_grid {
-            let gc = x / cell_size;
-            if gc < grid_cols && grid[grid_row_off + gc] {
-                // Jump to the start of the next cell.
-                x = (gc + 1) * cell_size;
-                continue;
+    // No grid → single range covering the full row.
+    if !has_grid {
+        detect_row_range(
+            slice,
+            row_base,
+            x_min,
+            x_max,
+            y,
+            level,
+            circle_off,
+            cardinal_off,
+            thresh,
+            arc_length,
+            min_cardinals,
+            features,
+        );
+        return;
+    }
+
+    // ── Cell-range iteration: one grid check per cell boundary ──
+    let mut cell_x = x_min;
+    while cell_x < x_max {
+        let gc = cell_x >> cell_shift;
+        if gc < grid_cols && grid[grid_row_off + gc] {
+            // Jump past the entire occupied cell.
+            cell_x = (gc + 1) << cell_shift;
+            continue;
+        }
+        let run_end = (((gc + 1) << cell_shift) as usize).min(x_max);
+        detect_row_range(
+            slice,
+            row_base,
+            cell_x,
+            run_end,
+            y,
+            level,
+            circle_off,
+            cardinal_off,
+            thresh,
+            arc_length,
+            min_cardinals,
+            features,
+        );
+        cell_x = run_end;
+    }
+}
+
+/// Scan pixels in [x_start, x_end) for FAST corners. No grid checks.
+#[inline]
+fn detect_row_range(
+    slice: &[u8],
+    row_base: usize,
+    x_start: usize,
+    x_end: usize,
+    y: usize,
+    level: usize,
+    circle_off: &[isize; 16],
+    cardinal_off: &[isize; 4],
+    thresh: i16,
+    arc_length: usize,
+    min_cardinals: u8,
+    features: &mut Vec<Feature>,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            unsafe {
+                detect_row_range_avx2(
+                    slice,
+                    row_base,
+                    x_start,
+                    x_end,
+                    y,
+                    level,
+                    circle_off,
+                    cardinal_off,
+                    thresh,
+                    arc_length,
+                    min_cardinals,
+                    features,
+                );
+            }
+            return;
+        }
+    }
+
+    detect_row_range_scalar(
+        slice,
+        row_base,
+        x_start,
+        x_end,
+        y,
+        level,
+        circle_off,
+        cardinal_off,
+        thresh,
+        arc_length,
+        min_cardinals,
+        features,
+    );
+}
+
+/// Full 16-point FAST test + scoring + LBP for a single pixel that passed
+/// the cardinal early-reject. Shared by both scalar and AVX2 paths.
+#[inline]
+unsafe fn fast_full_test(
+    slice: &[u8],
+    base: usize,
+    x: usize,
+    y: usize,
+    level: usize,
+    circle_off: &[isize; 16],
+    thresh: i16,
+    arc_length: usize,
+    features: &mut Vec<Feature>,
+) {
+    let center = *slice.get_unchecked(base) as i16;
+    let hi = center + thresh;
+    let lo = center - thresh;
+
+    // --- Full 16-point test ---
+    let mut bright_mask: u16 = 0;
+    let mut dark_mask: u16 = 0;
+    let mut circle_vals = [0i16; 16];
+
+    for i in 0..16 {
+        let v = *slice.get_unchecked((base as isize + circle_off[i]) as usize) as i16;
+        circle_vals[i] = v;
+        if v > hi {
+            bright_mask |= 1 << i;
+        } else if v < lo {
+            dark_mask |= 1 << i;
+        }
+    }
+
+    // Quick popcount rejection.
+    let bright_has = bright_mask.count_ones() as usize >= arc_length;
+    let dark_has = dark_mask.count_ones() as usize >= arc_length;
+    if !bright_has && !dark_has {
+        return;
+    }
+
+    // Contiguous-arc check + scoring.
+    let mut best_score = -1.0f32;
+
+    if bright_has {
+        let m32 = (bright_mask as u32) | ((bright_mask as u32) << 16);
+        let mut acc = m32;
+        for _ in 1..arc_length {
+            acc &= acc >> 1;
+        }
+        if acc != 0 {
+            let score = bitmask_best_arc_score(center, &circle_vals, thresh, bright_mask);
+            best_score = best_score.max(score);
+        }
+    }
+
+    if dark_has {
+        let m32 = (dark_mask as u32) | ((dark_mask as u32) << 16);
+        let mut acc = m32;
+        for _ in 1..arc_length {
+            acc &= acc >> 1;
+        }
+        if acc != 0 {
+            let score = bitmask_best_arc_score(center, &circle_vals, thresh, dark_mask);
+            best_score = best_score.max(score);
+        }
+    }
+
+    if best_score >= 0.0 {
+        // Compute RI-LBP descriptor (native radius 3).
+        let mut lbp: u16 = 0;
+        for i in 0..16 {
+            if circle_vals[i] >= center {
+                lbp |= 1 << i;
             }
         }
+        let descriptor = compute_min_rotation(lbp);
 
+        features.push(Feature {
+            x: x as f32,
+            y: y as f32,
+            score: best_score,
+            level,
+            id: 0,
+            descriptor,
+        });
+    }
+}
+
+/// Scalar scan — fallback for non-AVX2 and for the AVX2 tail.
+#[inline]
+fn detect_row_range_scalar(
+    slice: &[u8],
+    row_base: usize,
+    x_start: usize,
+    x_end: usize,
+    y: usize,
+    level: usize,
+    circle_off: &[isize; 16],
+    cardinal_off: &[isize; 4],
+    thresh: i16,
+    arc_length: usize,
+    min_cardinals: u8,
+    features: &mut Vec<Feature>,
+) {
+    let mut x = x_start;
+    while x < x_end {
         let base = row_base + x;
 
         // SAFETY: x in [3, w-3), y in [3, h-3), all circle offsets
         // are at most ±3 in each dimension, so base + offset is
         // always within the image slice.
         unsafe {
-        let center = *slice.get_unchecked(base) as i16;
-        let hi = center + thresh;
-        let lo = center - thresh;
+            let center = *slice.get_unchecked(base) as i16;
+            let hi = center + thresh;
+            let lo = center - thresh;
 
-        // --- Quick rejection (Rosten's high-speed test) ---
-        let p0  = *slice.get_unchecked((base as isize + cardinal_off[0]) as usize) as i16;
-        let p4  = *slice.get_unchecked((base as isize + cardinal_off[1]) as usize) as i16;
-        let p8  = *slice.get_unchecked((base as isize + cardinal_off[2]) as usize) as i16;
-        let p12 = *slice.get_unchecked((base as isize + cardinal_off[3]) as usize) as i16;
+            // --- Quick rejection (Rosten's high-speed test) ---
+            let p0 = *slice.get_unchecked((base as isize + cardinal_off[0]) as usize) as i16;
+            let p4 = *slice.get_unchecked((base as isize + cardinal_off[1]) as usize) as i16;
+            let p8 = *slice.get_unchecked((base as isize + cardinal_off[2]) as usize) as i16;
+            let p12 = *slice.get_unchecked((base as isize + cardinal_off[3]) as usize) as i16;
 
-        let bright_count = (p0 > hi) as u8
-            + (p4 > hi) as u8
-            + (p8 > hi) as u8
-            + (p12 > hi) as u8;
-        let dark_count = (p0 < lo) as u8
-            + (p4 < lo) as u8
-            + (p8 < lo) as u8
-            + (p12 < lo) as u8;
+            let bright_count =
+                (p0 > hi) as u8 + (p4 > hi) as u8 + (p8 > hi) as u8 + (p12 > hi) as u8;
+            let dark_count = (p0 < lo) as u8 + (p4 < lo) as u8 + (p8 < lo) as u8 + (p12 < lo) as u8;
 
-        if bright_count < min_cardinals && dark_count < min_cardinals {
-            x += 1;
-            continue;
-        }
-
-        // --- Full 16-point test ---
-        let mut bright_mask: u16 = 0;
-        let mut dark_mask: u16 = 0;
-        let mut circle_vals = [0i16; 16];
-
-        for i in 0..16 {
-            let v = *slice.get_unchecked(
-                (base as isize + circle_off[i]) as usize
-            ) as i16;
-            circle_vals[i] = v;
-            if v > hi {
-                bright_mask |= 1 << i;
-            } else if v < lo {
-                dark_mask |= 1 << i;
+            if bright_count >= min_cardinals || dark_count >= min_cardinals {
+                fast_full_test(
+                    slice, base, x, y, level, circle_off, thresh, arc_length, features,
+                );
             }
-        }
-
-        // Quick popcount rejection.
-        let bright_has = bright_mask.count_ones() as usize >= arc_length;
-        let dark_has = dark_mask.count_ones() as usize >= arc_length;
-        if !bright_has && !dark_has {
-            x += 1;
-            continue;
-        }
-
-        // Contiguous-arc check + scoring.
-        let mut best_score = -1.0f32;
-
-        if bright_has {
-            let m32 = (bright_mask as u32) | ((bright_mask as u32) << 16);
-            let mut acc = m32;
-            for _ in 1..arc_length {
-                acc &= acc >> 1;
-            }
-            if acc != 0 {
-                let score = bitmask_best_arc_score(
-                    center, &circle_vals, thresh, bright_mask);
-                best_score = best_score.max(score);
-            }
-        }
-
-        if dark_has {
-            let m32 = (dark_mask as u32) | ((dark_mask as u32) << 16);
-            let mut acc = m32;
-            for _ in 1..arc_length {
-                acc &= acc >> 1;
-            }
-            if acc != 0 {
-                let score = bitmask_best_arc_score(
-                    center, &circle_vals, thresh, dark_mask);
-                best_score = best_score.max(score);
-            }
-        }
-
-        if best_score >= 0.0 {
-            // Compute RI-LBP descriptor (native radius 3).
-            let mut lbp: u16 = 0;
-            for i in 0..16 {
-                if circle_vals[i] >= center {
-                    lbp |= 1 << i;
-                }
-            }
-            let descriptor = compute_min_rotation(lbp);
-
-            features.push(Feature {
-                x: x as f32,
-                y: y as f32,
-                score: best_score,
-                level,
-                id: 0,
-                descriptor,
-            });
-        }
         } // unsafe
 
         x += 1;
     }
+}
+
+/// AVX2: process 32 center pixels at a time for cardinal early-reject,
+/// then scalar full test for the ~15% that survive.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn detect_row_range_avx2(
+    slice: &[u8],
+    row_base: usize,
+    x_start: usize,
+    x_end: usize,
+    y: usize,
+    level: usize,
+    circle_off: &[isize; 16],
+    cardinal_off: &[isize; 4],
+    thresh: i16,
+    arc_length: usize,
+    min_cardinals: u8,
+    features: &mut Vec<Feature>,
+) {
+    use std::arch::x86_64::*;
+
+    let ptr = slice.as_ptr();
+    let thresh_v = _mm256_set1_epi8(thresh as i8);
+    let one = _mm256_set1_epi8(1);
+    let min_card_v = _mm256_set1_epi8(min_cardinals as i8);
+
+    let mut x = x_start;
+
+    // --- AVX2 main loop: 32 pixels per iteration ---
+    while x + 32 <= x_end {
+        let base = row_base + x;
+        let base_ptr = ptr.add(base);
+
+        // Load 32 center pixels.
+        let center = _mm256_loadu_si256(base_ptr as *const __m256i);
+
+        // Saturating thresholds: c_hi = min(center + thresh, 255),
+        //                        c_lo = max(center - thresh, 0).
+        let c_hi = _mm256_adds_epu8(center, thresh_v);
+        let c_lo = _mm256_subs_epu8(center, thresh_v);
+
+        // Load 32 pixels at each cardinal offset.
+        // SAFETY: same bounds guarantee as scalar — all offsets ±3 rows/cols.
+        let p0 = _mm256_loadu_si256(base_ptr.offset(cardinal_off[0]) as *const __m256i);
+        let p4 = _mm256_loadu_si256(base_ptr.offset(cardinal_off[1]) as *const __m256i);
+        let p8 = _mm256_loadu_si256(base_ptr.offset(cardinal_off[2]) as *const __m256i);
+        let p12 = _mm256_loadu_si256(base_ptr.offset(cardinal_off[3]) as *const __m256i);
+
+        // Bright cardinal count: subs(p, c_hi) > 0 means p > center + thresh.
+        // min(nonzero, 1) converts to 0/1, then sum the 4 cardinals.
+        let b0 = _mm256_min_epu8(_mm256_subs_epu8(p0, c_hi), one);
+        let b4 = _mm256_min_epu8(_mm256_subs_epu8(p4, c_hi), one);
+        let b8 = _mm256_min_epu8(_mm256_subs_epu8(p8, c_hi), one);
+        let b12 = _mm256_min_epu8(_mm256_subs_epu8(p12, c_hi), one);
+        let bright_count = _mm256_add_epi8(_mm256_add_epi8(b0, b4), _mm256_add_epi8(b8, b12));
+
+        // Dark cardinal count: subs(c_lo, p) > 0 means p < center - thresh.
+        let d0 = _mm256_min_epu8(_mm256_subs_epu8(c_lo, p0), one);
+        let d4 = _mm256_min_epu8(_mm256_subs_epu8(c_lo, p4), one);
+        let d8 = _mm256_min_epu8(_mm256_subs_epu8(c_lo, p8), one);
+        let d12 = _mm256_min_epu8(_mm256_subs_epu8(c_lo, p12), one);
+        let dark_count = _mm256_add_epi8(_mm256_add_epi8(d0, d4), _mm256_add_epi8(d8, d12));
+
+        // Pass if bright_count >= min_cardinals OR dark_count >= min_cardinals.
+        // Unsigned compare a >= b: max(a, b) == a.
+        let bright_ok = _mm256_cmpeq_epi8(_mm256_max_epu8(bright_count, min_card_v), bright_count);
+        let dark_ok = _mm256_cmpeq_epi8(_mm256_max_epu8(dark_count, min_card_v), dark_count);
+        let pass = _mm256_or_si256(bright_ok, dark_ok);
+        let mut pass_mask = _mm256_movemask_epi8(pass) as u32;
+
+        // Skip entire 32-pixel chunk if no candidates.
+        if pass_mask == 0 {
+            x += 32;
+            continue;
+        }
+
+        // Scalar full test for each surviving pixel.
+        while pass_mask != 0 {
+            let bit = pass_mask.trailing_zeros() as usize;
+            pass_mask &= pass_mask - 1;
+            fast_full_test(
+                slice,
+                row_base + x + bit,
+                x + bit,
+                y,
+                level,
+                circle_off,
+                thresh,
+                arc_length,
+                features,
+            );
+        }
+
+        x += 32;
+    }
+
+    // --- Scalar tail for remaining < 32 pixels ---
+    detect_row_range_scalar(
+        slice,
+        row_base,
+        x,
+        x_end,
+        y,
+        level,
+        circle_off,
+        cardinal_off,
+        thresh,
+        arc_length,
+        min_cardinals,
+        features,
+    );
 }
 
 /// Compute the rotation-invariant LBP by finding the minimum value
@@ -355,12 +624,7 @@ fn compute_min_rotation(mut v: u16) -> u16 {
 /// Find the longest contiguous arc in a circular 16-bit mask and
 /// compute its score. Used only for confirmed corners (rare path).
 #[inline]
-fn bitmask_best_arc_score(
-    center: i16,
-    circle: &[i16; 16],
-    thresh: i16,
-    mask: u16,
-) -> f32 {
+fn bitmask_best_arc_score(center: i16, circle: &[i16; 16], thresh: i16, mask: u16) -> f32 {
     let m32 = (mask as u32) | ((mask as u32) << 16);
     let mut best_start = 0usize;
     let mut best_len = 0usize;
@@ -416,9 +680,9 @@ mod tests {
         let det = FastDetector::new(30, 9);
         let features = det.detect(&img);
         assert!(!features.is_empty(), "expected at least one bright corner");
-        let near_center = features.iter().any(|f| {
-            (f.x - 10.0).abs() <= 4.0 && (f.y - 10.0).abs() <= 4.0
-        });
+        let near_center = features
+            .iter()
+            .any(|f| (f.x - 10.0).abs() <= 4.0 && (f.y - 10.0).abs() <= 4.0);
         assert!(near_center, "expected a feature near (10, 10)");
         assert!(features[0].score > 0.0);
     }
@@ -439,7 +703,11 @@ mod tests {
         let d_ref = compute_min_rotation(v);
         for _ in 0..16 {
             v = v.rotate_right(1);
-            assert_eq!(compute_min_rotation(v), d_ref, "RI-LBP should be invariant to rotation");
+            assert_eq!(
+                compute_min_rotation(v),
+                d_ref,
+                "RI-LBP should be invariant to rotation"
+            );
         }
     }
 
@@ -465,8 +733,14 @@ mod tests {
         let det_low = FastDetector::new(10, 9);
         let det_high = FastDetector::new(20, 9);
 
-        assert!(!det_low.detect(&img).is_empty(), "low threshold should detect");
-        assert!(det_high.detect(&img).is_empty(), "high threshold should reject");
+        assert!(
+            !det_low.detect(&img).is_empty(),
+            "low threshold should detect"
+        );
+        assert!(
+            det_high.detect(&img).is_empty(),
+            "high threshold should reject"
+        );
     }
 
     #[test]
@@ -476,20 +750,29 @@ mod tests {
         let cy = 10usize;
         for i in 0..10 {
             let (dx, dy) = CIRCLE_OFFSETS[i];
-            img.set((cx as isize + dx) as usize, (cy as isize + dy) as usize, 200);
+            img.set(
+                (cx as isize + dx) as usize,
+                (cy as isize + dy) as usize,
+                200,
+            );
         }
 
         let det9 = FastDetector::new(20, 9);
         let det12 = FastDetector::new(20, 12);
 
         let has_center = |features: &[Feature]| {
-            features.iter().any(|f| f.x as usize == cx && f.y as usize == cy)
+            features
+                .iter()
+                .any(|f| f.x as usize == cx && f.y as usize == cy)
         };
 
         let f9 = det9.detect(&img);
         let f12 = det12.detect(&img);
         assert!(has_center(&f9), "FAST-9 should detect corner at center");
-        assert!(!has_center(&f12), "FAST-12 should not detect corner at center");
+        assert!(
+            !has_center(&f12),
+            "FAST-12 should not detect corner at center"
+        );
     }
 
     #[test]
@@ -523,7 +806,8 @@ mod tests {
         assert!(
             f_high[0].score > f_low[0].score,
             "higher contrast should give higher score: {} vs {}",
-            f_high[0].score, f_low[0].score,
+            f_high[0].score,
+            f_low[0].score,
         );
     }
 
@@ -547,8 +831,11 @@ mod tests {
         let full = det.detect(&img);
         let skip = det.detect_unoccupied(&img, &grid, cols, 16);
 
-        assert_eq!(full.len(), skip.len(),
-            "all-empty grid should match full detect");
+        assert_eq!(
+            full.len(),
+            skip.len(),
+            "all-empty grid should match full detect"
+        );
     }
 
     #[test]
@@ -577,10 +864,17 @@ mod tests {
         let full = det.detect(&img);
         let skip = det.detect_unoccupied(&img, &grid, cols, 16);
 
-        assert!(full.iter().any(|f| f.x >= 16.0 && f.x < 32.0 && f.y >= 16.0 && f.y < 32.0),
-            "full detect should find corner in center cell");
-        assert!(!skip.iter().any(|f| f.x >= 16.0 && f.x < 32.0 && f.y >= 16.0 && f.y < 32.0),
-            "grid-skip should not find corner in occupied center cell");
+        assert!(
+            full.iter()
+                .any(|f| f.x >= 16.0 && f.x < 32.0 && f.y >= 16.0 && f.y < 32.0),
+            "full detect should find corner in center cell"
+        );
+        assert!(
+            !skip
+                .iter()
+                .any(|f| f.x >= 16.0 && f.x < 32.0 && f.y >= 16.0 && f.y < 32.0),
+            "grid-skip should not find corner in occupied center cell"
+        );
     }
 
     #[test]
