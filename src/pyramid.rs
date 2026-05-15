@@ -122,7 +122,12 @@ impl Pyramid {
             levels.push(down);
         }
 
-        Pyramid { levels, u8_levels: Vec::new(), padded_levels: Vec::new(), pad_border: 0 }
+        Pyramid {
+            levels,
+            u8_levels: Vec::new(),
+            padded_levels: Vec::new(),
+            pad_border: 0,
+        }
     }
 
     /// Build a Gaussian pyramid from a u8 image, reusing buffers.
@@ -199,7 +204,11 @@ impl Pyramid {
         }
 
         // Destructure scratch for independent borrows.
-        let PyramidScratch { ref mut h_buf, ref mut u8_ping, ref mut u8_pong } = *scratch;
+        let PyramidScratch {
+            ref mut h_buf,
+            ref mut u8_ping,
+            ref mut u8_pong,
+        } = *scratch;
 
         let ping_ptr = u8_ping.as_mut_ptr();
         let pong_ptr = u8_pong.as_mut_ptr();
@@ -228,8 +237,10 @@ impl Pyramid {
             };
 
             let write_len = dw * dh;
-            debug_assert!(write_len <= write_cap,
-                "u8 buffer too small: need {write_len}, have {write_cap}");
+            debug_assert!(
+                write_len <= write_cap,
+                "u8 buffer too small: need {write_len}, have {write_cap}"
+            );
 
             unsafe {
                 let read_slice = std::slice::from_raw_parts(read_ptr, read_len);
@@ -240,9 +251,7 @@ impl Pyramid {
                 if self.pad_border > 0 {
                     let pw = dw + 2 * self.pad_border;
                     let ph = dh + 2 * self.pad_border;
-                    if self.padded_levels[i].width() != pw
-                        || self.padded_levels[i].height() != ph
-                    {
+                    if self.padded_levels[i].width() != pw || self.padded_levels[i].height() != ph {
                         self.padded_levels[i].clear_resize(pw, ph);
                     }
                 }
@@ -259,7 +268,10 @@ impl Pyramid {
                     };
 
                 pyrdown_int(
-                    read_slice, prev_w, prev_h, read_stride,
+                    read_slice,
+                    prev_w,
+                    prev_h,
+                    read_stride,
                     unpad_arg,
                     write_slice,
                     pad_arg,
@@ -269,7 +281,9 @@ impl Pyramid {
 
                 // Copy u8 output into Image<u8> for fixed-point KLT.
                 self.u8_levels[i].clear_resize(dw, dh);
-                self.u8_levels[i].as_mut_slice().copy_from_slice(&write_slice[..write_len]);
+                self.u8_levels[i]
+                    .as_mut_slice()
+                    .copy_from_slice(&write_slice[..write_len]);
             }
 
             prev_w = dw;
@@ -389,18 +403,33 @@ fn pyrdown_int(
 
         // Interior: x in [2, sw-2) — no clamping needed.
         if sw > 4 {
-            unsafe {
-                let src_row = src.as_ptr().add(row_off);
-                let h_row = h_buf.as_mut_ptr().add(hrow_off);
-                for x in 2..sw - 2 {
-                    let p = |off: usize| -> u16 { *src_row.add(off) as u16 };
-                    *h_row.add(x) =
-                          p(x - 2)
-                        + 4 * p(x - 1)
-                        + 6 * p(x)
-                        + 4 * p(x + 1)
-                        + p(x + 2);
+            #[cfg(target_arch = "x86_64")]
+            {
+                if is_x86_feature_detected!("avx2") {
+                    unsafe {
+                        hblur_row_u8_avx2(
+                            src.as_ptr().add(row_off),
+                            h_buf.as_mut_ptr().add(hrow_off),
+                            sw,
+                        );
+                    }
+                } else {
+                    unsafe {
+                        hblur_row_u8_scalar(
+                            src.as_ptr().add(row_off),
+                            h_buf.as_mut_ptr().add(hrow_off),
+                            sw,
+                        );
+                    }
                 }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            unsafe {
+                hblur_row_u8_scalar(
+                    src.as_ptr().add(row_off),
+                    h_buf.as_mut_ptr().add(hrow_off),
+                    sw,
+                );
             }
         }
 
@@ -435,7 +464,11 @@ fn pyrdown_int(
         Some(pad) => {
             let stride = pad.stride();
             // Pointer to visible (0,0) of the padded image.
-            let p = unsafe { pad.as_slice().as_ptr().add(pad_border * stride + pad_border) };
+            let p = unsafe {
+                pad.as_slice()
+                    .as_ptr()
+                    .add(pad_border * stride + pad_border)
+            };
             (p as *mut f32, stride)
         }
         None => (std::ptr::null_mut::<f32>(), 0),
@@ -447,9 +480,8 @@ fn pyrdown_int(
     for oy in 0..dh {
         let sy = oy * 2;
 
-        let clamp_row = |dy: isize| -> usize {
-            (sy as isize + dy).clamp(0, (sh - 1) as isize) as usize * sw
-        };
+        let clamp_row =
+            |dy: isize| -> usize { (sy as isize + dy).clamp(0, (sh - 1) as isize) as usize * sw };
         let r0 = clamp_row(-2);
         let r1 = clamp_row(-1);
         let r2 = sy * sw;
@@ -458,13 +490,41 @@ fn pyrdown_int(
 
         let f32_off = oy * dst_f32_stride;
         let u8_off = oy * dw;
-        let pad_row = if has_pad { unsafe { pad_ptr.add(oy * pad_stride) } } else { pad_ptr };
+        let pad_row = if has_pad {
+            unsafe { pad_ptr.add(oy * pad_stride) }
+        } else {
+            pad_ptr
+        };
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") {
+                unsafe {
+                    vblur_row_avx2(
+                        h_buf,
+                        r0,
+                        r1,
+                        r2,
+                        r3,
+                        r4,
+                        dw,
+                        dst_f32_ptr,
+                        f32_off,
+                        has_unpadded,
+                        dst_u8,
+                        u8_off,
+                        pad_row,
+                        has_pad,
+                    );
+                }
+                continue;
+            }
+        }
 
         unsafe {
             for ox in 0..dw {
                 let sx = ox * 2;
-                let acc =
-                      *h_buf.get_unchecked(r0 + sx) as u32
+                let acc = *h_buf.get_unchecked(r0 + sx) as u32
                     + 4 * *h_buf.get_unchecked(r1 + sx) as u32
                     + 6 * *h_buf.get_unchecked(r2 + sx) as u32
                     + 4 * *h_buf.get_unchecked(r3 + sx) as u32
@@ -488,6 +548,183 @@ fn pyrdown_int(
 }
 
 // =============================================================================
+// u8 → u16 horizontal blur helpers (kernel [1, 4, 6, 4, 1])
+// =============================================================================
+
+/// Scalar interior hblur for x in [2, sw-2).
+#[inline]
+unsafe fn hblur_row_u8_scalar(src_row: *const u8, h_row: *mut u16, sw: usize) {
+    for x in 2..sw - 2 {
+        let p = |off: usize| -> u16 { *src_row.add(off) as u16 };
+        *h_row.add(x) = p(x - 2) + 4 * p(x - 1) + 6 * p(x) + 4 * p(x + 1) + p(x + 2);
+    }
+}
+
+/// AVX2 interior hblur: processes 16 u16 outputs per iteration.
+/// Loads 5 overlapping u8 windows, widens to u16, applies [1,4,6,4,1].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn hblur_row_u8_avx2(src_row: *const u8, h_row: *mut u16, sw: usize) {
+    use std::arch::x86_64::*;
+
+    let k1 = _mm256_set1_epi16(1);
+    let k4 = _mm256_set1_epi16(4);
+    let k6 = _mm256_set1_epi16(6);
+
+    let mut x = 2usize;
+    let end = sw - 2;
+
+    // Process 16 outputs per iteration.
+    while x + 16 <= end {
+        // Load 16 u8 at each of the 5 tap offsets, widen to u16.
+        let s0 = _mm256_cvtepu8_epi16(_mm_loadu_si128(src_row.add(x - 2) as *const __m128i));
+        let s1 = _mm256_cvtepu8_epi16(_mm_loadu_si128(src_row.add(x - 1) as *const __m128i));
+        let s2 = _mm256_cvtepu8_epi16(_mm_loadu_si128(src_row.add(x) as *const __m128i));
+        let s3 = _mm256_cvtepu8_epi16(_mm_loadu_si128(src_row.add(x + 1) as *const __m128i));
+        let s4 = _mm256_cvtepu8_epi16(_mm_loadu_si128(src_row.add(x + 2) as *const __m128i));
+
+        // acc = 1*s0 + 4*s1 + 6*s2 + 4*s3 + 1*s4
+        let acc = _mm256_add_epi16(
+            _mm256_add_epi16(_mm256_mullo_epi16(s0, k1), _mm256_mullo_epi16(s1, k4)),
+            _mm256_add_epi16(
+                _mm256_mullo_epi16(s2, k6),
+                _mm256_add_epi16(_mm256_mullo_epi16(s3, k4), _mm256_mullo_epi16(s4, k1)),
+            ),
+        );
+
+        _mm256_storeu_si256(h_row.add(x) as *mut __m256i, acc);
+        x += 16;
+    }
+
+    // Scalar tail.
+    while x < end {
+        let p = |off: usize| -> u16 { *src_row.add(off) as u16 };
+        *h_row.add(x) = p(x - 2) + 4 * p(x - 1) + 6 * p(x) + 4 * p(x + 1) + p(x + 2);
+        x += 1;
+    }
+}
+
+/// AVX2 vertical blur + downsample for one output row.
+/// Reads 5 h_buf rows at stride-2 (even columns only), applies [1,4,6,4,1],
+/// writes f32 and u8 outputs.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn vblur_row_avx2(
+    h_buf: &[u16],
+    r0: usize,
+    r1: usize,
+    r2: usize,
+    r3: usize,
+    r4: usize,
+    dw: usize,
+    dst_f32_ptr: *mut f32,
+    f32_off: usize,
+    has_unpadded: bool,
+    dst_u8: &mut [u8],
+    u8_off: usize,
+    pad_row: *mut f32,
+    has_pad: bool,
+) {
+    use std::arch::x86_64::*;
+
+    let inv256 = _mm256_set1_ps(1.0 / 256.0);
+    let add128 = _mm256_set1_epi32(128);
+    let h_ptr = h_buf.as_ptr();
+
+    // Deinterleave shuffle: pick even u16 lanes from 16 consecutive u16s.
+    // Input:  [0,1,2,3,4,5,6,7] in each 128-bit lane
+    // Output: [0,2,4,6,_,_,_,_] packed into low 64 bits of each lane
+    // We use _mm256_packus_epi32 after widening + masking to get even elements.
+
+    let mut ox = 0usize;
+
+    // Process 8 output pixels per iteration.
+    // Each output pixel reads h_buf[row + ox*2], so 8 outputs need 16 u16s.
+    while ox + 8 <= dw {
+        let sx = ox * 2;
+
+        // Load 16 consecutive u16 from each row, then pick even indices.
+        // Even indices: 0,2,4,6,8,10,12,14 → 8 u16 values → 8 u32 for accumulation.
+        let load_even = |row_off: usize| -> __m256i {
+            let base = h_ptr.add(row_off + sx);
+            // Load 16 u16 = 256 bits
+            let v = _mm256_loadu_si256(base as *const __m256i);
+            // Shift + mask to extract even-indexed u16 into u32:
+            // AND with 0x0000FFFF pattern to zero odd u16 halves
+            let mask = _mm256_set1_epi32(0x0000FFFF_u32 as i32);
+            _mm256_and_si256(v, mask)
+        };
+
+        // Each load_even gives us 8 x u32 (even-indexed u16, zero-extended).
+        let v0 = load_even(r0);
+        let v1 = load_even(r1);
+        let v2 = load_even(r2);
+        let v3 = load_even(r3);
+        let v4 = load_even(r4);
+
+        // acc = 1*v0 + 4*v1 + 6*v2 + 4*v3 + 1*v4  (all in u32)
+        let k4 = _mm256_set1_epi32(4);
+        let k6 = _mm256_set1_epi32(6);
+        let acc = _mm256_add_epi32(
+            _mm256_add_epi32(v0, v4),
+            _mm256_add_epi32(
+                _mm256_mullo_epi32(_mm256_add_epi32(v1, v3), k4),
+                _mm256_mullo_epi32(v2, k6),
+            ),
+        );
+
+        // f32 output: acc * (1/256)
+        let f32_vals = _mm256_mul_ps(_mm256_cvtepi32_ps(acc), inv256);
+        if has_unpadded {
+            _mm256_storeu_ps(dst_f32_ptr.add(f32_off + ox), f32_vals);
+        }
+        if has_pad {
+            _mm256_storeu_ps(pad_row.add(ox), f32_vals);
+        }
+
+        // u8 output: (acc + 128) >> 8
+        let u8_vals = _mm256_srli_epi32(_mm256_add_epi32(acc, add128), 8);
+        // Pack 8 x u32 → 8 x u16 → 8 x u8 (with saturation)
+        let packed16 = _mm256_packus_epi32(u8_vals, _mm256_setzero_si256());
+        // packed16 = [a0..a3, 0000, a4..a7, 0000] (128-bit lane interleave)
+        let packed8 = _mm256_packus_epi16(packed16, _mm256_setzero_si256());
+        // packed8 = [a0..a3, 0000, 0000, 0000, a4..a7, 0000, 0000, 0000]
+        // Extract low 4 bytes from each 128-bit lane.
+        let lo = _mm256_castsi256_si128(packed8);
+        let hi = _mm256_extracti128_si256(packed8, 1);
+        // Combine: lo has bytes [0..3], hi has bytes [4..7]
+        let combined = _mm_unpacklo_epi32(lo, hi);
+        _mm_storel_epi64(
+            dst_u8.as_mut_ptr().add(u8_off + ox) as *mut __m128i,
+            combined,
+        );
+
+        ox += 8;
+    }
+
+    // Scalar tail.
+    while ox < dw {
+        let sx = ox * 2;
+        let acc = *h_buf.get_unchecked(r0 + sx) as u32
+            + 4 * *h_buf.get_unchecked(r1 + sx) as u32
+            + 6 * *h_buf.get_unchecked(r2 + sx) as u32
+            + 4 * *h_buf.get_unchecked(r3 + sx) as u32
+            + *h_buf.get_unchecked(r4 + sx) as u32;
+
+        let f32_val = acc as f32 * (1.0 / 256.0);
+        if has_unpadded {
+            *dst_f32_ptr.add(f32_off + ox) = f32_val;
+        }
+        *dst_u8.get_unchecked_mut(u8_off + ox) = ((acc + 128) >> 8) as u8;
+        if has_pad {
+            *pad_row.add(ox) = f32_val;
+        }
+        ox += 1;
+    }
+}
+
+// =============================================================================
 // f32 fused blur + downsample (generic path, kept for build() and tests)
 // =============================================================================
 
@@ -496,11 +733,7 @@ const K1: f32 = 4.0 / 16.0;
 const K2: f32 = 6.0 / 16.0;
 
 /// f32 fused Gaussian blur + 2× downsample. Used by `build()`.
-fn pyrdown_fused(
-    src: &Image<f32>,
-    dst: &mut Image<f32>,
-    h_buf: &mut Vec<f32>,
-) {
+fn pyrdown_fused(src: &Image<f32>, dst: &mut Image<f32>, h_buf: &mut Vec<f32>) {
     let sw = src.width();
     let sh = src.height();
     let dw = sw / 2;
@@ -529,8 +762,7 @@ fn pyrdown_fused(
                 let idx = (x as isize + dx).clamp(0, (sw - 1) as isize) as usize;
                 src_slice[row_off + idx]
             };
-            h_buf[hrow_off + x] = K0 * sx(-2) + K1 * sx(-1) + K2 * sx(0)
-                                 + K1 * sx(1)  + K0 * sx(2);
+            h_buf[hrow_off + x] = K0 * sx(-2) + K1 * sx(-1) + K2 * sx(0) + K1 * sx(1) + K0 * sx(2);
         }
 
         if sw > 4 {
@@ -545,8 +777,7 @@ fn pyrdown_fused(
                 let idx = (x as isize + dx).clamp(0, (sw - 1) as isize) as usize;
                 src_slice[row_off + idx]
             };
-            h_buf[hrow_off + x] = K0 * sx(-2) + K1 * sx(-1) + K2 * sx(0)
-                                 + K1 * sx(1)  + K0 * sx(2);
+            h_buf[hrow_off + x] = K0 * sx(-2) + K1 * sx(-1) + K2 * sx(0) + K1 * sx(1) + K0 * sx(2);
         }
     }
 
@@ -557,9 +788,8 @@ fn pyrdown_fused(
     for oy in 0..dh {
         let sy = oy * 2;
 
-        let clamp_row = |dy: isize| -> usize {
-            (sy as isize + dy).clamp(0, (sh - 1) as isize) as usize * sw
-        };
+        let clamp_row =
+            |dy: isize| -> usize { (sy as isize + dy).clamp(0, (sh - 1) as isize) as usize * sw };
         let r0 = clamp_row(-2);
         let r1 = clamp_row(-1);
         let r2 = sy * sw;
@@ -572,10 +802,10 @@ fn pyrdown_fused(
             for ox in 0..dw {
                 let sx = ox * 2;
                 let v = K0 * *h_buf.get_unchecked(r0 + sx)
-                      + K1 * *h_buf.get_unchecked(r1 + sx)
-                      + K2 * *h_buf.get_unchecked(r2 + sx)
-                      + K1 * *h_buf.get_unchecked(r3 + sx)
-                      + K0 * *h_buf.get_unchecked(r4 + sx);
+                    + K1 * *h_buf.get_unchecked(r1 + sx)
+                    + K2 * *h_buf.get_unchecked(r2 + sx)
+                    + K1 * *h_buf.get_unchecked(r3 + sx)
+                    + K0 * *h_buf.get_unchecked(r4 + sx);
                 *dst_slice.get_unchecked_mut(out_off + ox) = v;
             }
         }
@@ -591,7 +821,9 @@ fn hblur_row_interior(src: &[f32], dst: &mut [f32], width: usize) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            unsafe { hblur_row_avx2(src, dst, width); }
+            unsafe {
+                hblur_row_avx2(src, dst, width);
+            }
             return;
         }
     }
@@ -602,8 +834,7 @@ fn hblur_row_interior(src: &[f32], dst: &mut [f32], width: usize) {
 fn hblur_row_scalar(src: &[f32], dst: &mut [f32], width: usize) {
     unsafe {
         for x in 2..width - 2 {
-            *dst.get_unchecked_mut(x) =
-                  K0 * *src.get_unchecked(x - 2)
+            *dst.get_unchecked_mut(x) = K0 * *src.get_unchecked(x - 2)
                 + K1 * *src.get_unchecked(x - 1)
                 + K2 * *src.get_unchecked(x)
                 + K1 * *src.get_unchecked(x + 1)
@@ -633,7 +864,7 @@ unsafe fn hblur_row_avx2(src: &[f32], dst: &mut [f32], width: usize) {
         let x = interior_start + i * 8;
         let vm2 = _mm256_loadu_ps(src_ptr.add(x - 2));
         let vm1 = _mm256_loadu_ps(src_ptr.add(x - 1));
-        let v0  = _mm256_loadu_ps(src_ptr.add(x));
+        let v0 = _mm256_loadu_ps(src_ptr.add(x));
         let vp1 = _mm256_loadu_ps(src_ptr.add(x + 1));
         let vp2 = _mm256_loadu_ps(src_ptr.add(x + 2));
 
@@ -647,8 +878,7 @@ unsafe fn hblur_row_avx2(src: &[f32], dst: &mut [f32], width: usize) {
     }
 
     for x in (interior_start + chunks * 8)..interior_end {
-        *dst_ptr.add(x) =
-              K0 * *src_ptr.add(x - 2)
+        *dst_ptr.add(x) = K0 * *src_ptr.add(x - 2)
             + K1 * *src_ptr.add(x - 1)
             + K2 * *src_ptr.add(x)
             + K1 * *src_ptr.add(x + 1)
@@ -667,7 +897,9 @@ fn downsample_2x(src: &Image<f32>) -> Image<f32> {
     let mut dst = Image::new(new_w, new_h);
     for y in 0..new_h {
         for x in 0..new_w {
-            unsafe { dst.set_unchecked(x, y, src.get_unchecked(x * 2, y * 2)); }
+            unsafe {
+                dst.set_unchecked(x, y, src.get_unchecked(x * 2, y * 2));
+            }
         }
     }
     dst
@@ -680,7 +912,9 @@ fn downsample_2x_into(src: &Image<f32>, dst: &mut Image<f32>) {
     dst.clear_resize(new_w, new_h);
     for y in 0..new_h {
         for x in 0..new_w {
-            unsafe { dst.set_unchecked(x, y, src.get_unchecked(x * 2, y * 2)); }
+            unsafe {
+                dst.set_unchecked(x, y, src.get_unchecked(x * 2, y * 2));
+            }
         }
     }
 }
@@ -729,7 +963,7 @@ fn fill_replicate_borders(dst: &mut Image<f32>, border: usize) {
     let last_interior = border + vh - 1;
     let split = (last_interior + 1) * stride;
     let (head, tail) = data.split_at_mut(split);
-    let template = &head[last_interior * stride .. last_interior * stride + stride];
+    let template = &head[last_interior * stride..last_interior * stride + stride];
     for y in 0..border {
         let off = y * stride;
         tail[off..off + stride].copy_from_slice(template);
@@ -763,7 +997,7 @@ fn pad_replicate_into(src: &Image<f32>, dst: &mut Image<f32>, border: usize) {
         for i in 0..border {
             dst_slice[row_off + i] = left_val;
         }
-        dst_slice[row_off + border .. row_off + border + w].copy_from_slice(src_row);
+        dst_slice[row_off + border..row_off + border + w].copy_from_slice(src_row);
         for i in 0..border {
             dst_slice[row_off + border + w + i] = right_val;
         }
@@ -782,7 +1016,7 @@ fn pad_replicate_into(src: &Image<f32>, dst: &mut Image<f32>, border: usize) {
     let last_interior = border + h - 1;
     let split = (last_interior + 1) * dst_stride;
     let (head, tail) = dst_slice.split_at_mut(split);
-    let template = &head[last_interior * dst_stride .. last_interior * dst_stride + dst_stride];
+    let template = &head[last_interior * dst_stride..last_interior * dst_stride + dst_stride];
     for y in 0..border {
         let off = y * dst_stride;
         tail[off..off + dst_stride].copy_from_slice(template);
@@ -858,7 +1092,10 @@ fn to_f32_image_u8_into_padded(
     let has_unpadded = !dst_ptr.is_null();
 
     let pad_ptr = unsafe {
-        dst_pad.as_mut_slice().as_mut_ptr().add(pad_border * pad_stride + pad_border)
+        dst_pad
+            .as_mut_slice()
+            .as_mut_ptr()
+            .add(pad_border * pad_stride + pad_border)
     };
 
     for y in 0..h {
@@ -981,7 +1218,10 @@ mod tests {
         let variance = |img: &Image<f32>| {
             let n = (img.width() * img.height()) as f32;
             let mean: f32 = img.pixels().map(|(_, _, v)| v).sum::<f32>() / n;
-            img.pixels().map(|(_, _, v)| (v - mean) * (v - mean)).sum::<f32>() / n
+            img.pixels()
+                .map(|(_, _, v)| (v - mean) * (v - mean))
+                .sum::<f32>()
+                / n
         };
 
         let mut prev_var = variance(&pyr.levels[0]);
@@ -1054,13 +1294,18 @@ mod tests {
         let var = |img: &Image<f32>| {
             let n = (img.width() * img.height()) as f32;
             let mean: f32 = img.pixels().map(|(_, _, v)| v).sum::<f32>() / n;
-            img.pixels().map(|(_, _, v)| (v - mean) * (v - mean)).sum::<f32>() / n
+            img.pixels()
+                .map(|(_, _, v)| (v - mean) * (v - mean))
+                .sum::<f32>()
+                / n
         };
 
         let var_src = var(&src);
         let var_dst = var(&dst);
-        assert!(var_dst < var_src,
-            "fused pyrdown should reduce variance: src={var_src}, dst={var_dst}");
+        assert!(
+            var_dst < var_src,
+            "fused pyrdown should reduce variance: src={var_src}, dst={var_dst}"
+        );
     }
 
     #[test]
@@ -1081,7 +1326,8 @@ mod tests {
                 assert!(
                     dst.get(x, y) >= dst.get(x - 1, y) - 0.1,
                     "monotonicity violated at ({x},{y}): {} < {}",
-                    dst.get(x, y), dst.get(x - 1, y)
+                    dst.get(x, y),
+                    dst.get(x - 1, y)
                 );
             }
         }
@@ -1097,7 +1343,17 @@ mod tests {
         let mut dst_u8 = vec![0u8; 100];
         let mut h_buf = vec![0u16; 400];
 
-        pyrdown_int(&src, 20, 20, 20, Some(&mut dst_f32), &mut dst_u8, None, 0, &mut h_buf);
+        pyrdown_int(
+            &src,
+            20,
+            20,
+            20,
+            Some(&mut dst_f32),
+            &mut dst_u8,
+            None,
+            0,
+            &mut h_buf,
+        );
 
         for (x, y, v) in dst_f32.pixels() {
             assert!(
@@ -1120,7 +1376,17 @@ mod tests {
         let mut dst_u8 = vec![0u8; 50 * 40];
         let mut h_buf = vec![0u16; 8000];
 
-        pyrdown_int(&src, 100, 80, 100, Some(&mut dst_f32), &mut dst_u8, None, 0, &mut h_buf);
+        pyrdown_int(
+            &src,
+            100,
+            80,
+            100,
+            Some(&mut dst_f32),
+            &mut dst_u8,
+            None,
+            0,
+            &mut h_buf,
+        );
         assert_eq!(dst_f32.width(), 50);
         assert_eq!(dst_f32.height(), 40);
     }
@@ -1129,7 +1395,12 @@ mod tests {
     fn test_build_reuse_constant() {
         // Constant image: build_reuse should preserve value at all levels.
         let img = Image::from_vec(64, 64, vec![128u8; 64 * 64]);
-        let mut pyr = Pyramid { levels: Vec::new(), u8_levels: Vec::new(), padded_levels: Vec::new(), pad_border: 0 };
+        let mut pyr = Pyramid {
+            levels: Vec::new(),
+            u8_levels: Vec::new(),
+            padded_levels: Vec::new(),
+            pad_border: 0,
+        };
         let mut scratch = PyramidScratch::new(64, 64, 1.0);
         pyr.build_reuse(&img, 4, &mut scratch);
 
@@ -1146,7 +1417,12 @@ mod tests {
     #[test]
     fn test_build_reuse_dimensions() {
         let img: Image<u8> = Image::new(640, 480);
-        let mut pyr = Pyramid { levels: Vec::new(), u8_levels: Vec::new(), padded_levels: Vec::new(), pad_border: 0 };
+        let mut pyr = Pyramid {
+            levels: Vec::new(),
+            u8_levels: Vec::new(),
+            padded_levels: Vec::new(),
+            pad_border: 0,
+        };
         let mut scratch = PyramidScratch::new(640, 480, 1.0);
         pyr.build_reuse(&img, 5, &mut scratch);
 
@@ -1170,7 +1446,12 @@ mod tests {
 
         let pyr_f32 = Pyramid::build(&img, 4, 1.0);
 
-        let mut pyr_int = Pyramid { levels: Vec::new(), u8_levels: Vec::new(), padded_levels: Vec::new(), pad_border: 0 };
+        let mut pyr_int = Pyramid {
+            levels: Vec::new(),
+            u8_levels: Vec::new(),
+            padded_levels: Vec::new(),
+            pad_border: 0,
+        };
         let mut scratch = PyramidScratch::new(640, 480, 1.0);
         pyr_int.build_reuse(&img, 4, &mut scratch);
 
@@ -1202,14 +1483,22 @@ mod tests {
         }
         let img = Image::from_vec(128, 128, data);
 
-        let mut pyr = Pyramid { levels: Vec::new(), u8_levels: Vec::new(), padded_levels: Vec::new(), pad_border: 0 };
+        let mut pyr = Pyramid {
+            levels: Vec::new(),
+            u8_levels: Vec::new(),
+            padded_levels: Vec::new(),
+            pad_border: 0,
+        };
         let mut scratch = PyramidScratch::new(128, 128, 1.0);
         pyr.build_reuse(&img, 5, &mut scratch);
 
         let variance = |img: &Image<f32>| {
             let n = (img.width() * img.height()) as f32;
             let mean: f32 = img.pixels().map(|(_, _, v)| v).sum::<f32>() / n;
-            img.pixels().map(|(_, _, v)| (v - mean) * (v - mean)).sum::<f32>() / n
+            img.pixels()
+                .map(|(_, _, v)| (v - mean) * (v - mean))
+                .sum::<f32>()
+                / n
         };
 
         let mut prev_var = variance(&pyr.levels[0]);
