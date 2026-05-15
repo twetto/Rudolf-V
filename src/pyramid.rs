@@ -385,6 +385,11 @@ fn pyrdown_int(
     // Ensure h_buf is large enough.
     debug_assert!(h_buf.len() >= sw * sh);
 
+    #[cfg(target_arch = "x86_64")]
+    let use_avx2 = is_x86_feature_detected!("avx2");
+    #[cfg(not(target_arch = "x86_64"))]
+    let use_avx2 = false;
+
     // ── Phase 1: Horizontal blur (u8 → u16) ──────────────────────────
     // Kernel [1, 4, 6, 4, 1], no division. Max output 4080.
 
@@ -403,28 +408,22 @@ fn pyrdown_int(
 
         // Interior: x in [2, sw-2) — no clamping needed.
         if sw > 4 {
-            #[cfg(target_arch = "x86_64")]
-            {
-                if is_x86_feature_detected!("avx2") {
-                    unsafe {
-                        hblur_row_u8_avx2(
-                            src.as_ptr().add(row_off),
-                            h_buf.as_mut_ptr().add(hrow_off),
-                            sw,
-                        );
-                    }
-                } else {
-                    unsafe {
-                        hblur_row_u8_scalar(
-                            src.as_ptr().add(row_off),
-                            h_buf.as_mut_ptr().add(hrow_off),
-                            sw,
-                        );
-                    }
-                }
-            }
-            #[cfg(not(target_arch = "x86_64"))]
             unsafe {
+                #[cfg(target_arch = "x86_64")]
+                if use_avx2 {
+                    hblur_row_u8_avx2(
+                        src.as_ptr().add(row_off),
+                        h_buf.as_mut_ptr().add(hrow_off),
+                        sw,
+                    );
+                } else {
+                    hblur_row_u8_scalar(
+                        src.as_ptr().add(row_off),
+                        h_buf.as_mut_ptr().add(hrow_off),
+                        sw,
+                    );
+                }
+                #[cfg(not(target_arch = "x86_64"))]
                 hblur_row_u8_scalar(
                     src.as_ptr().add(row_off),
                     h_buf.as_mut_ptr().add(hrow_off),
@@ -497,28 +496,26 @@ fn pyrdown_int(
         };
 
         #[cfg(target_arch = "x86_64")]
-        {
-            if is_x86_feature_detected!("avx2") {
-                unsafe {
-                    vblur_row_avx2(
-                        h_buf,
-                        r0,
-                        r1,
-                        r2,
-                        r3,
-                        r4,
-                        dw,
-                        dst_f32_ptr,
-                        f32_off,
-                        has_unpadded,
-                        dst_u8,
-                        u8_off,
-                        pad_row,
-                        has_pad,
-                    );
-                }
-                continue;
+        if use_avx2 {
+            unsafe {
+                vblur_row_avx2(
+                    h_buf,
+                    r0,
+                    r1,
+                    r2,
+                    r3,
+                    r4,
+                    dw,
+                    dst_f32_ptr,
+                    f32_off,
+                    has_unpadded,
+                    dst_u8,
+                    u8_off,
+                    pad_row,
+                    has_pad,
+                );
             }
+            continue;
         }
 
         unsafe {
@@ -567,7 +564,6 @@ unsafe fn hblur_row_u8_scalar(src_row: *const u8, h_row: *mut u16, sw: usize) {
 unsafe fn hblur_row_u8_avx2(src_row: *const u8, h_row: *mut u16, sw: usize) {
     use std::arch::x86_64::*;
 
-    let k1 = _mm256_set1_epi16(1);
     let k4 = _mm256_set1_epi16(4);
     let k6 = _mm256_set1_epi16(6);
 
@@ -585,10 +581,10 @@ unsafe fn hblur_row_u8_avx2(src_row: *const u8, h_row: *mut u16, sw: usize) {
 
         // acc = 1*s0 + 4*s1 + 6*s2 + 4*s3 + 1*s4
         let acc = _mm256_add_epi16(
-            _mm256_add_epi16(_mm256_mullo_epi16(s0, k1), _mm256_mullo_epi16(s1, k4)),
+            _mm256_add_epi16(s0, _mm256_mullo_epi16(s1, k4)),
             _mm256_add_epi16(
                 _mm256_mullo_epi16(s2, k6),
-                _mm256_add_epi16(_mm256_mullo_epi16(s3, k4), _mm256_mullo_epi16(s4, k1)),
+                _mm256_add_epi16(_mm256_mullo_epi16(s3, k4), s4),
             ),
         );
 

@@ -21,10 +21,10 @@
 // - BITMASK CONTIGUOUS CHECK: u16 bright/dark masks, popcount reject,
 //   AND-shift for N contiguous bits. Branchless.
 //
-// - INLINE OCCUPANCY SKIP: When an occupancy grid is provided, the x-loop
-//   checks one bool per cell boundary and jumps past occupied cells.
-//   No mask allocation, no Vec of ranges — just a while loop with an
-//   integer division every cell_size pixels.
+// - CELL-RANGE OCCUPANCY SKIP: When an occupancy grid is provided, the
+//   outer loop iterates grid cells with bit-shift indexing (cell_size must
+//   be power of 2), skipping occupied cells entirely. The inner pixel loop
+//   has zero grid overhead.
 //
 // - RAYON ROW PARALLELISM (feature-gated): Each row is independent.
 //
