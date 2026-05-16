@@ -300,17 +300,6 @@ impl Pyramid {
         self.pad_border = border;
     }
 
-    fn rebuild_padded_levels(&mut self) {
-        let border = self.pad_border;
-        while self.padded_levels.len() < self.levels.len() {
-            self.padded_levels.push(Image::new(1, 1));
-        }
-        self.padded_levels.truncate(self.levels.len());
-        for i in 0..self.levels.len() {
-            pad_replicate_into(&self.levels[i], &mut self.padded_levels[i], border);
-        }
-    }
-
     /// Number of pyramid levels.
     pub fn num_levels(&self) -> usize {
         self.levels.len()
@@ -387,8 +376,6 @@ fn pyrdown_int(
 
     #[cfg(target_arch = "x86_64")]
     let use_avx2 = is_x86_feature_detected!("avx2");
-    #[cfg(not(target_arch = "x86_64"))]
-    let use_avx2 = false;
 
     // ── Phase 1: Horizontal blur (u8 → u16) ──────────────────────────
     // Kernel [1, 4, 6, 4, 1], no division. Max output 4080.
@@ -966,59 +953,6 @@ fn fill_replicate_borders(dst: &mut Image<f32>, border: usize) {
     }
 }
 
-/// Copy `src` into `dst` with `border` pixels of replicate padding on every
-/// side. The visible (0,0) of `src` lands at coordinate `(border, border)`
-/// of `dst`. `dst` is resized to `(src.width()+2*border) × (src.height()+2*border)`.
-fn pad_replicate_into(src: &Image<f32>, dst: &mut Image<f32>, border: usize) {
-    let w = src.width();
-    let h = src.height();
-    let pw = w + 2 * border;
-    let ph = h + 2 * border;
-
-    if dst.width() != pw || dst.height() != ph {
-        dst.clear_resize(pw, ph);
-    }
-
-    let dst_stride = dst.stride();
-    debug_assert_eq!(dst_stride, pw, "padded image must have stride == width");
-    let dst_slice = dst.as_mut_slice();
-
-    // Copy interior rows + fill left/right side borders for each interior row.
-    for y in 0..h {
-        let src_row = src.row(y);
-        let dy = y + border;
-        let row_off = dy * dst_stride;
-        let left_val = src_row[0];
-        let right_val = src_row[w - 1];
-        for i in 0..border {
-            dst_slice[row_off + i] = left_val;
-        }
-        dst_slice[row_off + border..row_off + border + w].copy_from_slice(src_row);
-        for i in 0..border {
-            dst_slice[row_off + border + w + i] = right_val;
-        }
-    }
-
-    // Top border: replicate the first interior row (at y = border) into rows 0..border.
-    let src_row_off = border * dst_stride;
-    let (top, rest) = dst_slice.split_at_mut(src_row_off);
-    let template = &rest[..dst_stride];
-    for y in 0..border {
-        let off = y * dst_stride;
-        top[off..off + dst_stride].copy_from_slice(template);
-    }
-
-    // Bottom border: replicate the last interior row (at y = border + h - 1) into rows border+h..ph.
-    let last_interior = border + h - 1;
-    let split = (last_interior + 1) * dst_stride;
-    let (head, tail) = dst_slice.split_at_mut(split);
-    let template = &head[last_interior * dst_stride..last_interior * dst_stride + dst_stride];
-    for y in 0..border {
-        let off = y * dst_stride;
-        tail[off..off + dst_stride].copy_from_slice(template);
-    }
-}
-
 // =============================================================================
 // u8 → f32 conversion helpers
 // =============================================================================
@@ -1079,7 +1013,12 @@ fn to_f32_image_u8_into_padded(
 
     let (dst_ptr, dst_stride) = match dst {
         Some(dst) => {
-            dst.clear_resize(w, h);
+            // Only zero/resize when dimensions actually changed — every
+            // pixel is overwritten below anyway, so the zero on a re-use
+            // is wasted work. (Matches the gating on dst_pad above.)
+            if dst.width() != w || dst.height() != h {
+                dst.clear_resize(w, h);
+            }
             let stride = dst.stride();
             (dst.as_mut_slice().as_mut_ptr(), stride)
         }

@@ -342,6 +342,25 @@ fn detect_row_range(
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        detect_row_range_neon(
+            slice,
+            row_base,
+            x_start,
+            x_end,
+            y,
+            level,
+            circle_off,
+            cardinal_off,
+            thresh,
+            arc_length,
+            min_cardinals,
+            features,
+        );
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
     detect_row_range_scalar(
         slice,
         row_base,
@@ -591,6 +610,109 @@ unsafe fn detect_row_range_avx2(
     }
 
     // --- Scalar tail for remaining < 32 pixels ---
+    detect_row_range_scalar(
+        slice,
+        row_base,
+        x,
+        x_end,
+        y,
+        level,
+        circle_off,
+        cardinal_off,
+        thresh,
+        arc_length,
+        min_cardinals,
+        features,
+    );
+}
+
+/// NEON: process 16 center pixels at a time for cardinal early-reject.
+/// Mirrors `detect_row_range_avx2` with half-width vectors.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn detect_row_range_neon(
+    slice: &[u8],
+    row_base: usize,
+    x_start: usize,
+    x_end: usize,
+    y: usize,
+    level: usize,
+    circle_off: &[isize; 16],
+    cardinal_off: &[isize; 4],
+    thresh: i16,
+    arc_length: usize,
+    min_cardinals: u8,
+    features: &mut Vec<Feature>,
+) {
+    use std::arch::aarch64::*;
+
+    let ptr = slice.as_ptr();
+    let thresh_v = vdupq_n_u8(thresh as u8);
+    let one = vdupq_n_u8(1);
+    let min_card_v = vdupq_n_u8(min_cardinals);
+
+    let mut x = x_start;
+
+    while x + 16 <= x_end {
+        let base = row_base + x;
+        let base_ptr = ptr.add(base);
+
+        let center = vld1q_u8(base_ptr);
+        let c_hi = vqaddq_u8(center, thresh_v);
+        let c_lo = vqsubq_u8(center, thresh_v);
+
+        let p0 = vld1q_u8(base_ptr.offset(cardinal_off[0]));
+        let p4 = vld1q_u8(base_ptr.offset(cardinal_off[1]));
+        let p8 = vld1q_u8(base_ptr.offset(cardinal_off[2]));
+        let p12 = vld1q_u8(base_ptr.offset(cardinal_off[3]));
+
+        // Bright: vqsubq_u8(p, c_hi) > 0 means p > center + thresh.
+        let b0 = vminq_u8(vqsubq_u8(p0, c_hi), one);
+        let b4 = vminq_u8(vqsubq_u8(p4, c_hi), one);
+        let b8 = vminq_u8(vqsubq_u8(p8, c_hi), one);
+        let b12 = vminq_u8(vqsubq_u8(p12, c_hi), one);
+        let bright_count = vaddq_u8(vaddq_u8(b0, b4), vaddq_u8(b8, b12));
+
+        // Dark: vqsubq_u8(c_lo, p) > 0 means p < center - thresh.
+        let d0 = vminq_u8(vqsubq_u8(c_lo, p0), one);
+        let d4 = vminq_u8(vqsubq_u8(c_lo, p4), one);
+        let d8 = vminq_u8(vqsubq_u8(c_lo, p8), one);
+        let d12 = vminq_u8(vqsubq_u8(c_lo, p12), one);
+        let dark_count = vaddq_u8(vaddq_u8(d0, d4), vaddq_u8(d8, d12));
+
+        let bright_ok = vcgeq_u8(bright_count, min_card_v); // 0xFF if pass, else 0x00
+        let dark_ok = vcgeq_u8(dark_count, min_card_v);
+        let pass = vorrq_u8(bright_ok, dark_ok);
+
+        // Early-skip via horizontal max.
+        if vmaxvq_u8(pass) == 0 {
+            x += 16;
+            continue;
+        }
+
+        // Pack 16 lanes of 0xFF/0x00 into 64 bits, one nibble per lane.
+        let nibble = vshrn_n_u16::<4>(vreinterpretq_u16_u8(pass));
+        let mut m: u64 = vget_lane_u64::<0>(vreinterpret_u64_u8(nibble));
+
+        while m != 0 {
+            let lane = (m.trailing_zeros() as usize) / 4;
+            m &= !(0xFu64 << (lane * 4));
+            fast_full_test(
+                slice,
+                row_base + x + lane,
+                x + lane,
+                y,
+                level,
+                circle_off,
+                thresh,
+                arc_length,
+                features,
+            );
+        }
+
+        x += 16;
+    }
+
     detect_row_range_scalar(
         slice,
         row_base,
