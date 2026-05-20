@@ -421,24 +421,14 @@ unsafe fn fast_full_test(
     let mut best_score = -1.0f32;
 
     if bright_has {
-        let m32 = (bright_mask as u32) | ((bright_mask as u32) << 16);
-        let mut acc = m32;
-        for _ in 1..arc_length {
-            acc &= acc >> 1;
-        }
-        if acc != 0 {
+        if has_contiguous_arc(bright_mask, arc_length) {
             let score = bitmask_best_arc_score(center, &circle_vals, thresh, bright_mask);
             best_score = best_score.max(score);
         }
     }
 
     if dark_has {
-        let m32 = (dark_mask as u32) | ((dark_mask as u32) << 16);
-        let mut acc = m32;
-        for _ in 1..arc_length {
-            acc &= acc >> 1;
-        }
-        if acc != 0 {
+        if has_contiguous_arc(dark_mask, arc_length) {
             let score = bitmask_best_arc_score(center, &circle_vals, thresh, dark_mask);
             best_score = best_score.max(score);
         }
@@ -589,7 +579,11 @@ unsafe fn detect_row_range_avx2(
             continue;
         }
 
-        // Scalar full test for each surviving pixel.
+        // Full SIMD FAST-arc gate for cardinal survivors. Scoring,
+        // descriptor computation, and Vec compaction stay scalar.
+        pass_mask &= full_ring_pass_mask_avx2(ptr, base, circle_off, c_hi, c_lo, arc_length);
+
+        // Scalar score/descriptor for each true FAST candidate.
         while pass_mask != 0 {
             let bit = pass_mask.trailing_zeros() as usize;
             pass_mask &= pass_mask - 1;
@@ -624,6 +618,42 @@ unsafe fn detect_row_range_avx2(
         min_cardinals,
         features,
     );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn full_ring_pass_mask_avx2(
+    ptr: *const u8,
+    base: usize,
+    circle_off: &[isize; 16],
+    c_hi: std::arch::x86_64::__m256i,
+    c_lo: std::arch::x86_64::__m256i,
+    arc_length: usize,
+) -> u32 {
+    use std::arch::x86_64::*;
+
+    let base_ptr = ptr.add(base);
+    let zero = _mm256_setzero_si256();
+    let one = _mm256_set1_epi8(1);
+    let arc = _mm256_set1_epi8(arc_length as i8);
+    let mut bright_run = zero;
+    let mut dark_run = zero;
+    let mut max_run = zero;
+
+    for k in 0..(16 + arc_length - 1) {
+        let p = _mm256_loadu_si256(base_ptr.offset(circle_off[k & 15]) as *const __m256i);
+
+        // p > c_hi and p < c_lo using saturated subtract. Clamp to 0/1 before
+        // comparison so large unsigned differences are not misread as signed.
+        let bright = _mm256_cmpgt_epi8(_mm256_min_epu8(_mm256_subs_epu8(p, c_hi), one), zero);
+        let dark = _mm256_cmpgt_epi8(_mm256_min_epu8(_mm256_subs_epu8(c_lo, p), one), zero);
+
+        bright_run = _mm256_and_si256(_mm256_add_epi8(bright_run, one), bright);
+        dark_run = _mm256_and_si256(_mm256_add_epi8(dark_run, one), dark);
+        max_run = _mm256_max_epu8(max_run, _mm256_max_epu8(bright_run, dark_run));
+    }
+
+    _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_max_epu8(max_run, arc), max_run)) as u32
 }
 
 /// NEON: process 16 center pixels at a time for cardinal early-reject.
@@ -694,6 +724,10 @@ unsafe fn detect_row_range_neon(
         let nibble = vshrn_n_u16::<4>(vreinterpretq_u16_u8(pass));
         let mut m: u64 = vget_lane_u64::<0>(vreinterpret_u64_u8(nibble));
 
+        // Full SIMD FAST-arc gate for cardinal survivors. Scoring,
+        // descriptor computation, and Vec compaction stay scalar.
+        m &= full_ring_pass_mask_neon(ptr, base, circle_off, c_hi, c_lo, arc_length);
+
         while m != 0 {
             let lane = (m.trailing_zeros() as usize) / 4;
             m &= !(0xFu64 << (lane * 4));
@@ -729,6 +763,40 @@ unsafe fn detect_row_range_neon(
     );
 }
 
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn full_ring_pass_mask_neon(
+    ptr: *const u8,
+    base: usize,
+    circle_off: &[isize; 16],
+    c_hi: std::arch::aarch64::uint8x16_t,
+    c_lo: std::arch::aarch64::uint8x16_t,
+    arc_length: usize,
+) -> u64 {
+    use std::arch::aarch64::*;
+
+    let base_ptr = ptr.add(base);
+    let one = vdupq_n_u8(1);
+    let arc = vdupq_n_u8(arc_length as u8);
+    let mut bright_run = vdupq_n_u8(0);
+    let mut dark_run = vdupq_n_u8(0);
+    let mut max_run = vdupq_n_u8(0);
+
+    for k in 0..(16 + arc_length - 1) {
+        let p = vld1q_u8(base_ptr.offset(circle_off[k & 15]));
+        let bright = vcgtq_u8(p, c_hi);
+        let dark = vcgtq_u8(c_lo, p);
+
+        bright_run = vandq_u8(vaddq_u8(bright_run, one), bright);
+        dark_run = vandq_u8(vaddq_u8(dark_run, one), dark);
+        max_run = vmaxq_u8(max_run, vmaxq_u8(bright_run, dark_run));
+    }
+
+    let pass = vcgeq_u8(max_run, arc);
+    let nibble = vshrn_n_u16::<4>(vreinterpretq_u16_u8(pass));
+    vget_lane_u64::<0>(vreinterpret_u64_u8(nibble))
+}
+
 /// Compute the rotation-invariant LBP by finding the minimum value
 /// among all 16 cyclic shifts.
 #[inline]
@@ -741,6 +809,15 @@ fn compute_min_rotation(mut v: u16) -> u16 {
         }
     }
     min_v
+}
+
+#[inline]
+fn has_contiguous_arc(mask: u16, arc_length: usize) -> bool {
+    let mut acc = (mask as u32) | ((mask as u32) << 16);
+    for _ in 1..arc_length {
+        acc &= acc >> 1;
+    }
+    acc != 0
 }
 
 /// Find the longest contiguous arc in a circular 16-bit mask and
@@ -810,6 +887,20 @@ mod tests {
     }
 
     #[test]
+    fn test_avx2_wide_bright_corner_with_large_contrast() {
+        let img = make_fast_corner_image(80, 10, 255);
+        let det = FastDetector::new(20, 9);
+        let features = det.detect(&img);
+        let near_center = features
+            .iter()
+            .any(|f| (f.x - 40.0).abs() <= 4.0 && (f.y - 40.0).abs() <= 4.0);
+        assert!(
+            near_center,
+            "wide image should detect high-contrast bright corner"
+        );
+    }
+
+    #[test]
     fn test_ri_lbp_stability() {
         // Create an image with a clear corner.
         let img = make_fast_corner_image(20, 100, 200);
@@ -830,6 +921,37 @@ mod tests {
                 d_ref,
                 "RI-LBP should be invariant to rotation"
             );
+        }
+    }
+
+    fn naive_has_contiguous_arc(mask: u16, arc_length: usize) -> bool {
+        for start in 0..16 {
+            let mut ok = true;
+            for offset in 0..arc_length {
+                let bit = (start + offset) & 15;
+                if mask & (1 << bit) == 0 {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn test_contiguous_arc_helper_exhaustive() {
+        for arc_length in 9..=12 {
+            for mask in 0u32..=u16::MAX as u32 {
+                let mask = mask as u16;
+                assert_eq!(
+                    has_contiguous_arc(mask, arc_length),
+                    naive_has_contiguous_arc(mask, arc_length),
+                    "mask={mask:#018b} arc_length={arc_length}"
+                );
+            }
         }
     }
 
