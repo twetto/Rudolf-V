@@ -143,6 +143,22 @@ impl Pyramid {
         num_levels: usize,
         scratch: &mut PyramidScratch,
     ) {
+        self.build_reuse_lut(src, num_levels, scratch, None);
+    }
+
+    /// Build pyramid with an optional LUT applied during level 0 construction.
+    ///
+    /// When `lut` is `Some`, each source pixel is remapped through the LUT
+    /// as it is copied into u8_levels[0] and converted to f32. This fuses
+    /// histogram equalization into the pyramid pass, eliminating a separate
+    /// full-image remap.
+    pub fn build_reuse_lut(
+        &mut self,
+        src: &Image<u8>,
+        num_levels: usize,
+        scratch: &mut PyramidScratch,
+        lut: Option<&[u8; 256]>,
+    ) {
         assert!(num_levels >= 1);
 
         // Ensure we have enough level slots.
@@ -166,6 +182,7 @@ impl Pyramid {
         }
 
         // Level 0 u8: copy of original image (contiguous, stride == width).
+        // When a LUT is provided, apply it during the copy (fused histeq).
         {
             let sw = src.width();
             let sh = src.height();
@@ -173,7 +190,18 @@ impl Pyramid {
             let src_stride = src.stride();
             let dst_slice = self.u8_levels[0].as_mut_slice();
             let src_slice = src.as_slice();
-            if src_stride == sw {
+            if let Some(lut) = lut {
+                for y in 0..sh {
+                    let dst_off = y * sw;
+                    let src_off = y * src_stride;
+                    unsafe {
+                        for x in 0..sw {
+                            *dst_slice.get_unchecked_mut(dst_off + x) =
+                                *lut.get_unchecked(*src_slice.get_unchecked(src_off + x) as usize);
+                        }
+                    }
+                }
+            } else if src_stride == sw {
                 dst_slice.copy_from_slice(&src_slice[..sw * sh]);
             } else {
                 for y in 0..sh {
@@ -185,18 +213,22 @@ impl Pyramid {
             }
         }
 
-        // Level 0: u8 → f32 (no blur). frontend reads levels[0] for FAST
-        // detection, so always write the unpadded buffer here. Also write
-        // padded copy in same pass when enabled.
+        // Level 0: u8 → f32 (no blur). When a LUT was applied, read from
+        // u8_levels[0] (already remapped) instead of src.
+        let level0_src = if lut.is_some() {
+            &self.u8_levels[0]
+        } else {
+            src
+        };
         if self.pad_border > 0 {
             to_f32_image_u8_into_padded(
-                src,
+                level0_src,
                 Some(&mut self.levels[0]),
                 &mut self.padded_levels[0],
                 self.pad_border,
             );
         } else {
-            to_f32_image_u8_into(src, &mut self.levels[0]);
+            to_f32_image_u8_into(level0_src, &mut self.levels[0]);
         }
 
         if num_levels < 2 {
@@ -223,7 +255,8 @@ impl Pyramid {
             let dh = prev_h / 2;
 
             let (read_ptr, read_len, read_stride) = if i == 1 {
-                (src.as_slice().as_ptr(), src.as_slice().len(), src.stride())
+                let l0 = &self.u8_levels[0];
+                (l0.as_slice().as_ptr(), l0.as_slice().len(), l0.stride())
             } else if i % 2 == 0 {
                 (ping_ptr as *const u8, prev_w * prev_h, prev_w)
             } else {

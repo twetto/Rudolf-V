@@ -44,10 +44,7 @@ pub enum HistEqMethod {
     /// Global histogram equalization.
     Global,
     /// CLAHE with the given tile size and clip limit.
-    Clahe {
-        tile_size: usize,
-        clip_limit: f32,
-    },
+    Clahe { tile_size: usize, clip_limit: f32 },
 }
 
 // ============================================================
@@ -59,6 +56,37 @@ pub fn equalize_histogram(image: &Image<u8>) -> Image<u8> {
     let mut out = Image::new(image.width(), image.height());
     equalize_histogram_into(image, &mut out);
     out
+}
+
+/// Compute the histogram equalization LUT without applying it.
+///
+/// Returns a 256-entry lookup table that maps input pixel values to
+/// equalized output values. The caller can apply this LUT during another
+/// pass (e.g., fused into pyramid construction) to avoid a separate remap.
+pub fn equalize_histogram_lut(image: &Image<u8>) -> [u8; 256] {
+    let w = image.width();
+    let h = image.height();
+    let n = w * h;
+
+    if n == 0 {
+        return [0u8; 256];
+    }
+
+    let src = image.as_slice();
+    let src_stride = image.stride();
+
+    let mut hist = [0u32; 256];
+    for y in 0..h {
+        let row = y * src_stride;
+        unsafe {
+            for x in 0..w {
+                let v = *src.get_unchecked(row + x) as usize;
+                *hist.get_unchecked_mut(v) += 1;
+            }
+        }
+    }
+
+    build_lut(&hist, n)
 }
 
 /// Apply global histogram equalization into a pre-allocated buffer.
@@ -87,7 +115,8 @@ pub fn equalize_histogram_into(image: &Image<u8>, out: &mut Image<u8>) {
     let hist = {
         // Each thread builds a local [u32; 256], then we reduce by summing.
         // No atomics, no contention on the 256 bins.
-        (0..h).into_par_iter()
+        (0..h)
+            .into_par_iter()
             .fold(
                 || [0u32; 256],
                 |mut local_hist, y| {
@@ -104,7 +133,9 @@ pub fn equalize_histogram_into(image: &Image<u8>, out: &mut Image<u8>) {
             .reduce(
                 || [0u32; 256],
                 |mut a, b| {
-                    for i in 0..256 { a[i] += b[i]; }
+                    for i in 0..256 {
+                        a[i] += b[i];
+                    }
                     a
                 },
             )
@@ -337,9 +368,10 @@ pub fn apply_histeq(image: &Image<u8>, method: HistEqMethod) -> Image<u8> {
     match method {
         HistEqMethod::None => image.clone(),
         HistEqMethod::Global => equalize_histogram(image),
-        HistEqMethod::Clahe { tile_size, clip_limit } => {
-            equalize_clahe(image, tile_size, clip_limit)
-        }
+        HistEqMethod::Clahe {
+            tile_size,
+            clip_limit,
+        } => equalize_clahe(image, tile_size, clip_limit),
     }
 }
 
@@ -367,9 +399,10 @@ pub fn apply_histeq_into(image: &Image<u8>, method: HistEqMethod, out: &mut Imag
             }
         }
         HistEqMethod::Global => equalize_histogram_into(image, out),
-        HistEqMethod::Clahe { tile_size, clip_limit } => {
-            equalize_clahe_into(image, tile_size, clip_limit, out)
-        }
+        HistEqMethod::Clahe {
+            tile_size,
+            clip_limit,
+        } => equalize_clahe_into(image, tile_size, clip_limit, out),
     }
 }
 
@@ -413,7 +446,10 @@ mod tests {
         let out = equalize_histogram(&img);
         let min_val = (0..w).map(|x| out.get(x, 0)).min().unwrap();
         let max_val = (0..w).map(|x| out.get(x, 0)).max().unwrap();
-        assert!(max_val - min_val > 100, "range {min_val}..{max_val} not expanded enough");
+        assert!(
+            max_val - min_val > 100,
+            "range {min_val}..{max_val} not expanded enough"
+        );
     }
 
     #[test]
@@ -458,8 +494,7 @@ mod tests {
         assert_eq!(alloc.height(), into.height());
         for y in 0..50 {
             for x in 0..50 {
-                assert_eq!(alloc.get(x, y), into.get(x, y),
-                    "mismatch at ({x},{y})");
+                assert_eq!(alloc.get(x, y), into.get(x, y), "mismatch at ({x},{y})");
             }
         }
     }

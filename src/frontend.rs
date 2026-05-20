@@ -27,7 +27,7 @@ use crate::fast::{FastDetector, Feature};
 use crate::harris::HarrisDetector;
 use crate::histeq::{self, HistEqMethod};
 use crate::image::Image;
-use crate::klt::{KltScratch, KltTracker, LkMethod, TrackedFeature, TrackStatus};
+use crate::klt::{KltScratch, KltTracker, LkMethod, TrackStatus, TrackedFeature};
 use crate::nms::OccupancyNms;
 use crate::occupancy::OccupancyGrid;
 use crate::pyramid::{Pyramid, PyramidScratch};
@@ -90,14 +90,7 @@ impl TrackMeta {
             fine_cell: fine_cell_index(feature, img_w, img_h, cell_size),
             coarse_tile: tile_index(feature, tile_cols.max(1), tile_rows.max(1), img_w, img_h)
                 .min(u16::MAX as usize) as u16,
-            reservoir_score: reservoir_score(
-                feature,
-                age,
-                0.0,
-                lbp_distance,
-                img_w,
-                img_h,
-            ),
+            reservoir_score: reservoir_score(feature, age, 0.0, lbp_distance, img_w, img_h),
         }
     }
 
@@ -227,7 +220,12 @@ fn border_penalty(feature: &Feature, img_w: usize, img_h: usize, margin: f32) ->
     }
     let right = (img_w as f32 - 1.0 - feature.x).max(0.0);
     let bottom = (img_h as f32 - 1.0 - feature.y).max(0.0);
-    let dist = feature.x.max(0.0).min(feature.y.max(0.0)).min(right).min(bottom);
+    let dist = feature
+        .x
+        .max(0.0)
+        .min(feature.y.max(0.0))
+        .min(right)
+        .min(bottom);
     ((margin - dist) / margin).clamp(0.0, 1.0)
 }
 
@@ -566,19 +564,38 @@ pub struct TimingStats {
 }
 
 impl TimingStats {
-    pub fn histeq_ms(&self) -> f32 { (self.histeq * 1000.0) as f32 }
-    pub fn pyramid_ms(&self) -> f32 { (self.pyramid * 1000.0) as f32 }
-    pub fn klt_ms(&self) -> f32 { (self.klt * 1000.0) as f32 }
-    pub fn ransac_ms(&self) -> f32 { (self.ransac * 1000.0) as f32 }
-    pub fn detect_ms(&self) -> f32 { (self.detect * 1000.0) as f32 }
-    pub fn total_ms(&self) -> f32 { (self.total * 1000.0) as f32 }
+    pub fn histeq_ms(&self) -> f32 {
+        (self.histeq * 1000.0) as f32
+    }
+    pub fn pyramid_ms(&self) -> f32 {
+        (self.pyramid * 1000.0) as f32
+    }
+    pub fn klt_ms(&self) -> f32 {
+        (self.klt * 1000.0) as f32
+    }
+    pub fn ransac_ms(&self) -> f32 {
+        (self.ransac * 1000.0) as f32
+    }
+    pub fn detect_ms(&self) -> f32 {
+        (self.detect * 1000.0) as f32
+    }
+    pub fn total_ms(&self) -> f32 {
+        (self.total * 1000.0) as f32
+    }
 }
 
 impl std::fmt::Display for TimingStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "histeq:{:.1} pyr:{:.1} klt:{:.1} ransac:{:.1} det:{:.1} total:{:.1}ms",
-            self.histeq_ms(), self.pyramid_ms(), self.klt_ms(),
-            self.ransac_ms(), self.detect_ms(), self.total_ms())
+        write!(
+            f,
+            "histeq:{:.1} pyr:{:.1} klt:{:.1} ransac:{:.1} det:{:.1} total:{:.1}ms",
+            self.histeq_ms(),
+            self.pyramid_ms(),
+            self.klt_ms(),
+            self.ransac_ms(),
+            self.detect_ms(),
+            self.total_ms()
+        )
     }
 }
 
@@ -616,8 +633,18 @@ impl Frontend {
         };
         Frontend {
             config,
-            prev_pyramid: Pyramid { levels: Vec::new(), u8_levels: Vec::new(), padded_levels: Vec::new(), pad_border },
-            curr_pyramid: Pyramid { levels: Vec::new(), u8_levels: Vec::new(), padded_levels: Vec::new(), pad_border },
+            prev_pyramid: Pyramid {
+                levels: Vec::new(),
+                u8_levels: Vec::new(),
+                padded_levels: Vec::new(),
+                pad_border,
+            },
+            curr_pyramid: Pyramid {
+                levels: Vec::new(),
+                u8_levels: Vec::new(),
+                padded_levels: Vec::new(),
+                pad_border,
+            },
             pyr_scratch,
             histeq_buf: Image::new(img_w, img_h),
             has_prev: false,
@@ -646,13 +673,19 @@ impl Frontend {
         let t_total = Instant::now();
         let mut timing = TimingStats::default();
 
-        // Step 0: Histogram equalization (brightness normalization).
+        // Step 0: Histogram equalization LUT (brightness normalization).
+        // The actual remap is fused into pyramid level 0 construction.
         let t0 = Instant::now();
-        let input = if self.config.histeq != HistEqMethod::None {
-            histeq::apply_histeq_into(image, self.config.histeq, &mut self.histeq_buf);
-            &self.histeq_buf
-        } else {
-            image
+        let histeq_lut = match self.config.histeq {
+            HistEqMethod::Global => Some(histeq::equalize_histogram_lut(image)),
+            HistEqMethod::None => None,
+            HistEqMethod::Clahe {
+                tile_size,
+                clip_limit,
+            } => {
+                histeq::equalize_clahe_into(image, tile_size, clip_limit, &mut self.histeq_buf);
+                None
+            }
         };
         timing.histeq = t0.elapsed().as_secs_f64();
 
@@ -660,12 +693,24 @@ impl Frontend {
         // Swap: what was curr becomes prev, then rebuild curr.
         let t0 = Instant::now();
         std::mem::swap(&mut self.prev_pyramid, &mut self.curr_pyramid);
-        self.curr_pyramid.build_reuse(
-            input,
+        let (pyr_src, pyr_lut) = if histeq_lut.is_some() {
+            (image, histeq_lut.as_ref())
+        } else if self.config.histeq != HistEqMethod::None {
+            (&self.histeq_buf, None)
+        } else {
+            (image, None)
+        };
+        self.curr_pyramid.build_reuse_lut(
+            pyr_src,
             self.config.pyramid_levels,
             &mut self.pyr_scratch,
+            pyr_lut,
         );
         timing.pyramid = t0.elapsed().as_secs_f64();
+
+        // After pyramid construction, u8_levels[0] holds the (possibly
+        // LUT-remapped) input image. Use it for detection below.
+        let input = self.curr_pyramid.u8_level(0);
 
         let mut stats = FrameStats {
             tracked: 0,
@@ -756,27 +801,31 @@ impl Frontend {
                     if self.features.len() >= 8 {
                         // Build correspondences: prev_features -> current features.
                         // Match by ID (both lists may differ if features were lost).
-                        let corrs: Vec<(usize, Correspondence)> = self.features.iter()
+                        let corrs: Vec<(usize, Correspondence)> = self
+                            .features
+                            .iter()
                             .enumerate()
                             .filter_map(|(idx, f)| {
-                                self.prev_features.iter()
+                                self.prev_features
+                                    .iter()
                                     .find(|pf| pf.id == f.id)
                                     .map(|pf| {
-                                        let (x1, y1) = cam.normalize_undistorted(
-                                            pf.x as f64, pf.y as f64);
-                                        let (x2, y2) = cam.normalize_undistorted(
-                                            f.x as f64, f.y as f64);
+                                        let (x1, y1) =
+                                            cam.normalize_undistorted(pf.x as f64, pf.y as f64);
+                                        let (x2, y2) =
+                                            cam.normalize_undistorted(f.x as f64, f.y as f64);
                                         (idx, Correspondence { x1, y1, x2, y2 })
                                     })
                             })
                             .collect();
 
                         if corrs.len() >= 8 {
-                            let corr_only: Vec<Correspondence> = corrs.iter()
-                                .map(|(_, c)| *c).collect();
+                            let corr_only: Vec<Correspondence> =
+                                corrs.iter().map(|(_, c)| *c).collect();
 
                             if let Some(result) = essential::estimate_essential_ransac(
-                                &corr_only, &self.config.ransac
+                                &corr_only,
+                                &self.config.ransac,
                             ) {
                                 // Remove outlier features.
                                 let mut inlier_features = Vec::new();
@@ -792,8 +841,10 @@ impl Frontend {
                                     }
                                 }
                                 // Also keep features that had no prev match (new this frame).
-                                let matched_ids: Vec<u64> = corrs.iter()
-                                    .map(|(idx, _)| self.features[*idx].id).collect();
+                                let matched_ids: Vec<u64> = corrs
+                                    .iter()
+                                    .map(|(idx, _)| self.features[*idx].id)
+                                    .collect();
                                 for (idx, f) in self.features.iter().enumerate() {
                                     if !matched_ids.contains(&f.id) {
                                         inlier_features.push(f.clone());
@@ -852,10 +903,8 @@ impl Frontend {
             // Saves the mask allocation AND skips ~14% of FAST computation.
             let new_features = match self.config.detector {
                 DetectorType::Fast => {
-                    let det = FastDetector::new(
-                        self.config.fast_threshold,
-                        self.config.fast_arc_length,
-                    );
+                    let det =
+                        FastDetector::new(self.config.fast_threshold, self.config.fast_arc_length);
                     det.detect_unoccupied(
                         input,
                         self.grid.grid_cells(),
@@ -989,7 +1038,8 @@ impl Frontend {
 
         self.features.truncate(write);
         self.track_meta.truncate(write);
-        self.prev_features.retain(|feature| !ids.contains(&feature.id));
+        self.prev_features
+            .retain(|feature| !ids.contains(&feature.id));
 
         self.grid.clear();
         for feature in &self.features {
@@ -1001,10 +1051,16 @@ impl Frontend {
 
     /// Get the last histogram-equalized input image, if preprocessing is enabled.
     pub fn preprocessed_image(&self) -> Option<&Image<u8>> {
-        if self.config.histeq == HistEqMethod::None {
-            None
-        } else {
-            Some(&self.histeq_buf)
+        match self.config.histeq {
+            HistEqMethod::None => None,
+            HistEqMethod::Global => {
+                if self.curr_pyramid.has_u8_levels() {
+                    Some(self.curr_pyramid.u8_level(0))
+                } else {
+                    None
+                }
+            }
+            _ => Some(&self.histeq_buf),
         }
     }
 
@@ -1074,10 +1130,7 @@ mod tests {
 
     #[test]
     fn test_tile_deficit_selection_fills_empty_tile_before_row_major_candidate() {
-        let candidates = vec![
-            feature(10.0, 10.0, 100.0),
-            feature(70.0, 10.0, 10.0),
-        ];
+        let candidates = vec![feature(10.0, 10.0, 100.0), feature(70.0, 10.0, 10.0)];
         let existing = vec![feature(12.0, 12.0, 1.0)];
 
         let selected = select_by_tile_deficit(&candidates, &existing, 1, 2, 100, 50, 2, 1);
@@ -1159,7 +1212,11 @@ mod tests {
         let ids_f2: Vec<u64> = f2.iter().map(|f| f.id).collect();
 
         // Tracked features should retain their IDs from frame 1.
-        let persisted: Vec<u64> = ids_f2.iter().filter(|id| ids_f1.contains(id)).cloned().collect();
+        let persisted: Vec<u64> = ids_f2
+            .iter()
+            .filter(|id| ids_f1.contains(id))
+            .cloned()
+            .collect();
         assert!(
             !persisted.is_empty(),
             "some feature IDs should persist across frames"
@@ -1202,13 +1259,17 @@ mod tests {
         let ids_f1: Vec<u64> = frontend.process(&img1).0.iter().map(|f| f.id).collect();
         frontend.process(&img2);
 
-        let persisted: Vec<&TrackMeta> = frontend.track_meta().iter()
+        let persisted: Vec<&TrackMeta> = frontend
+            .track_meta()
+            .iter()
             .filter(|m| ids_f1.contains(&m.id))
             .collect();
 
         assert!(!persisted.is_empty(), "expected some persisted tracks");
         assert!(persisted.iter().all(|m| m.age >= 2));
-        assert!(persisted.iter().all(|m| m.klt_quality > 0.0 && m.klt_quality <= 1.0));
+        assert!(persisted
+            .iter()
+            .all(|m| m.klt_quality > 0.0 && m.klt_quality <= 1.0));
     }
 
     #[test]
@@ -1258,7 +1319,9 @@ mod tests {
             .collect();
 
         assert!(!persisted.is_empty(), "expected some persisted tracks");
-        assert!(persisted.iter().all(|m| m.klt_quality > 0.0 && m.klt_quality <= 1.0));
+        assert!(persisted
+            .iter()
+            .all(|m| m.klt_quality > 0.0 && m.klt_quality <= 1.0));
     }
 
     #[test]
@@ -1275,7 +1338,9 @@ mod tests {
         let ids_f1: Vec<u64> = frontend.process(&img1).0.iter().map(|f| f.id).collect();
         frontend.process(&img2);
 
-        let new_tracks: Vec<&TrackMeta> = frontend.track_meta().iter()
+        let new_tracks: Vec<&TrackMeta> = frontend
+            .track_meta()
+            .iter()
             .filter(|m| !ids_f1.contains(&m.id))
             .collect();
 
@@ -1300,7 +1365,10 @@ mod tests {
         let weak = reservoir_score(&f, 1, 0.1, 0, 100, 100);
         let strong = reservoir_score(&f, 10, 0.9, 0, 100, 100);
 
-        assert!(strong > weak, "age and KLT quality should improve reservoir score");
+        assert!(
+            strong > weak,
+            "age and KLT quality should improve reservoir score"
+        );
     }
 
     #[test]
@@ -1317,7 +1385,10 @@ mod tests {
         frontend.process(&img1);
         frontend.process(&img2);
 
-        assert!(frontend.track_meta().iter().all(|m| m.reservoir_score.is_finite()));
+        assert!(frontend
+            .track_meta()
+            .iter()
+            .all(|m| m.reservoir_score.is_finite()));
     }
 
     #[test]
@@ -1359,7 +1430,10 @@ mod tests {
         let pruned = prune_low_reservoir_score(&mut features, &mut meta, 0.0);
 
         assert_eq!(pruned, 1);
-        assert_eq!(features.iter().map(|f| f.id).collect::<Vec<_>>(), vec![1, 3]);
+        assert_eq!(
+            features.iter().map(|f| f.id).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
         assert_eq!(meta.iter().map(|m| m.id).collect::<Vec<_>>(), vec![1, 3]);
     }
 
@@ -1386,7 +1460,10 @@ mod tests {
         let pruned = prune_overfull_tiles(&mut features, &mut meta, 4, 100, 100, 2, 1);
 
         assert_eq!(pruned, 1);
-        assert_eq!(features.iter().map(|f| f.id).collect::<Vec<_>>(), vec![2, 3, 4]);
+        assert_eq!(
+            features.iter().map(|f| f.id).collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
         assert_eq!(meta.iter().map(|m| m.id).collect::<Vec<_>>(), vec![2, 3, 4]);
     }
 
@@ -1435,8 +1512,14 @@ mod tests {
         frontend.process(&img1);
         let (_, stats) = frontend.process(&img2);
 
-        assert!(stats.rejected > 0, "score pruning should reject tracked points");
-        assert!(stats.new_detections > 0, "pruned tracks should free replenishment slots");
+        assert!(
+            stats.rejected > 0,
+            "score pruning should reject tracked points"
+        );
+        assert!(
+            stats.new_detections > 0,
+            "pruned tracks should free replenishment slots"
+        );
         assert_eq!(frontend.features().len(), frontend.track_meta().len());
         for (feature, meta) in frontend.features().iter().zip(frontend.track_meta()) {
             assert_eq!(feature.id, meta.id);
@@ -1485,9 +1568,7 @@ mod tests {
 
     #[test]
     fn test_three_frame_sequence() {
-        let frames: Vec<Image<u8>> = (0..3)
-            .map(|i| make_scene(160, 120, i * 2, i))
-            .collect();
+        let frames: Vec<Image<u8>> = (0..3).map(|i| make_scene(160, 120, i * 2, i)).collect();
 
         let config = FrontendConfig {
             max_features: 30,
@@ -1559,7 +1640,10 @@ mod tests {
         assert_eq!(removed, 1);
         assert_eq!(frontend.features().len(), before - 1);
         assert_eq!(frontend.features().len(), frontend.track_meta().len());
-        assert!(frontend.features().iter().all(|feature| feature.id != drop_id));
+        assert!(frontend
+            .features()
+            .iter()
+            .all(|feature| feature.id != drop_id));
         assert!(frontend.track_meta().iter().all(|meta| meta.id != drop_id));
     }
 
@@ -1620,7 +1704,10 @@ mod tests {
         let (_, stats) = frontend.process(&img2);
 
         assert_eq!(stats.rejected, 0, "soft LBP policy should not hard-reject");
-        assert!(stats.tracked > 0, "soft LBP policy should keep tracked reservoir points");
+        assert!(
+            stats.tracked > 0,
+            "soft LBP policy should keep tracked reservoir points"
+        );
     }
 
     #[test]
@@ -1642,7 +1729,10 @@ mod tests {
         }
         let (_, stats) = frontend.process(&img2);
 
-        assert!(stats.rejected > 0, "hard LBP policy should reject mismatched descriptors");
+        assert!(
+            stats.rejected > 0,
+            "hard LBP policy should reject mismatched descriptors"
+        );
     }
 
     #[test]
@@ -1668,7 +1758,10 @@ mod tests {
 
         frontend.process(&img1);
         let (_, stats) = frontend.process(&img2_bright);
-        assert!(stats.tracked > 0, "histEq should help track across brightness change");
+        assert!(
+            stats.tracked > 0,
+            "histEq should help track across brightness change"
+        );
     }
 
     #[test]
@@ -1677,7 +1770,10 @@ mod tests {
         let img2 = make_scene(160, 120, 2, 1);
 
         let config = FrontendConfig {
-            histeq: HistEqMethod::Clahe { tile_size: 32, clip_limit: 2.0 },
+            histeq: HistEqMethod::Clahe {
+                tile_size: 32,
+                clip_limit: 2.0,
+            },
             max_features: 30,
             ..Default::default()
         };
@@ -1694,26 +1790,38 @@ mod tests {
 // ---------------------------------------------------------------------------
 
 const CIRCLE_OFFSETS_F: [(f32, f32); 16] = [
-    ( 0.0, -3.0), ( 1.0, -3.0), ( 2.0, -2.0), ( 3.0, -1.0),
-    ( 3.0,  0.0), ( 3.0,  1.0), ( 2.0,  2.0), ( 1.0,  3.0),
-    ( 0.0,  3.0), (-1.0,  3.0), (-2.0,  2.0), (-3.0,  1.0),
-    (-3.0,  0.0), (-3.0, -1.0), (-2.0, -2.0), (-1.0, -3.0),
+    (0.0, -3.0),
+    (1.0, -3.0),
+    (2.0, -2.0),
+    (3.0, -1.0),
+    (3.0, 0.0),
+    (3.0, 1.0),
+    (2.0, 2.0),
+    (1.0, 3.0),
+    (0.0, 3.0),
+    (-1.0, 3.0),
+    (-2.0, 2.0),
+    (-3.0, 1.0),
+    (-3.0, 0.0),
+    (-3.0, -1.0),
+    (-2.0, -2.0),
+    (-1.0, -3.0),
 ];
 
 /// Compute the rotation-invariant LBP at a fractional position.
 fn compute_lbp_at(img: &Image<f32>, x: f32, y: f32) -> u16 {
     use crate::image::interpolate_bilinear;
-    
+
     let center = interpolate_bilinear(img, x, y);
     let mut lbp: u16 = 0;
-    
+
     for (i, &(dx, dy)) in CIRCLE_OFFSETS_F.iter().enumerate() {
         let val = interpolate_bilinear(img, x + dx, y + dy);
         if val >= center {
             lbp |= 1 << i;
         }
     }
-    
+
     compute_min_rotation(lbp)
 }
 
