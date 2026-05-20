@@ -181,8 +181,7 @@ impl Pyramid {
             self.padded_levels.truncate(num_levels);
         }
 
-        // Level 0 u8: copy of original image (contiguous, stride == width).
-        // When a LUT is provided, apply it during the copy (fused histeq).
+        // Level 0 u8: copy src → u8_levels[0], applying LUT if provided.
         {
             let sw = src.width();
             let sh = src.height();
@@ -213,22 +212,16 @@ impl Pyramid {
             }
         }
 
-        // Level 0: u8 → f32 (no blur). When a LUT was applied, read from
-        // u8_levels[0] (already remapped) instead of src.
-        let level0_src = if lut.is_some() {
-            &self.u8_levels[0]
-        } else {
-            src
-        };
+        // Level 0 f32: convert from u8_levels[0] (already LUT-remapped if applicable).
         if self.pad_border > 0 {
             to_f32_image_u8_into_padded(
-                level0_src,
+                &self.u8_levels[0],
                 Some(&mut self.levels[0]),
                 &mut self.padded_levels[0],
                 self.pad_border,
             );
         } else {
-            to_f32_image_u8_into(level0_src, &mut self.levels[0]);
+            to_f32_image_u8_into(&self.u8_levels[0], &mut self.levels[0]);
         }
 
         if num_levels < 2 {
