@@ -748,7 +748,7 @@ impl Frontend {
                 // Filter features in-place: keep only successfully tracked.
                 // Avoids allocating a second Vec.
                 let mut write = 0;
-                let curr_img = &self.curr_pyramid.levels[0];
+                let curr_img = self.curr_pyramid.u8_level(0);
 
                 for i in 0..self.track_results.len() {
                     if self.track_results[i].status == TrackStatus::Tracked {
@@ -942,7 +942,7 @@ impl Frontend {
             );
 
             // Step 5: Add new features with unique IDs.
-            let curr_img = &self.curr_pyramid.levels[0];
+            let curr_img = self.curr_pyramid.u8_level(0);
             for f in &selected {
                 // Ensure every feature has a valid LBP descriptor for later verification.
                 // FAST already provides this, but Harris/others might leave it as 0.
@@ -1789,35 +1789,66 @@ mod tests {
 // LBP Helpers
 // ---------------------------------------------------------------------------
 
-const CIRCLE_OFFSETS_F: [(f32, f32); 16] = [
-    (0.0, -3.0),
-    (1.0, -3.0),
-    (2.0, -2.0),
-    (3.0, -1.0),
-    (3.0, 0.0),
-    (3.0, 1.0),
-    (2.0, 2.0),
-    (1.0, 3.0),
-    (0.0, 3.0),
-    (-1.0, 3.0),
-    (-2.0, 2.0),
-    (-3.0, 1.0),
-    (-3.0, 0.0),
-    (-3.0, -1.0),
-    (-2.0, -2.0),
-    (-1.0, -3.0),
+const CIRCLE_OFFSETS: [(i32, i32); 16] = [
+    (0, -3),
+    (1, -3),
+    (2, -2),
+    (3, -1),
+    (3, 0),
+    (3, 1),
+    (2, 2),
+    (1, 3),
+    (0, 3),
+    (-1, 3),
+    (-2, 2),
+    (-3, 1),
+    (-3, 0),
+    (-3, -1),
+    (-2, -2),
+    (-1, -3),
 ];
 
-/// Compute the rotation-invariant LBP at a fractional position.
-fn compute_lbp_at(img: &Image<f32>, x: f32, y: f32) -> u16 {
-    use crate::image::interpolate_bilinear;
+/// Compute the rotation-invariant LBP at a fractional position using u8 image.
+///
+/// All circle offsets are integers, so every sample shares the same fractional
+/// part (fx, fy) as the center. Precompute bilinear weights once, then do 17
+/// unchecked u8 lookups with fixed-point interpolation.
+fn compute_lbp_at(img: &Image<u8>, x: f32, y: f32) -> u16 {
+    let w = img.width();
+    let h = img.height();
+    let stride = img.stride();
+    let data = img.as_slice();
 
-    let center = interpolate_bilinear(img, x, y);
+    let x0 = x as usize;
+    let y0 = y as usize;
+    let fx = x - x0 as f32;
+    let fy = y - y0 as f32;
+
+    // Fixed-point weights (8-bit fraction, total = 256).
+    let w00 = ((1.0 - fx) * (1.0 - fy) * 256.0) as u32;
+    let w10 = (fx * (1.0 - fy) * 256.0) as u32;
+    let w01 = ((1.0 - fx) * fy * 256.0) as u32;
+    let w11 = (fx * fy * 256.0) as u32;
+
+    let bilerp = |px: usize, py: usize| -> u32 {
+        let x1 = if px + 1 < w { px + 1 } else { px };
+        let y1 = if py + 1 < h { py + 1 } else { py };
+        unsafe {
+            let p00 = *data.get_unchecked(py * stride + px) as u32;
+            let p10 = *data.get_unchecked(py * stride + x1) as u32;
+            let p01 = *data.get_unchecked(y1 * stride + px) as u32;
+            let p11 = *data.get_unchecked(y1 * stride + x1) as u32;
+            w00 * p00 + w10 * p10 + w01 * p01 + w11 * p11
+        }
+    };
+
+    let center = bilerp(x0, y0);
     let mut lbp: u16 = 0;
 
-    for (i, &(dx, dy)) in CIRCLE_OFFSETS_F.iter().enumerate() {
-        let val = interpolate_bilinear(img, x + dx, y + dy);
-        if val >= center {
+    for (i, &(dx, dy)) in CIRCLE_OFFSETS.iter().enumerate() {
+        let px = (x0 as i32 + dx) as usize;
+        let py = (y0 as i32 + dy) as usize;
+        if bilerp(px, py) >= center {
             lbp |= 1 << i;
         }
     }
