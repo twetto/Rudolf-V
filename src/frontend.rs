@@ -387,8 +387,9 @@ pub(crate) fn select_by_tile_deficit(
     for bucket in &mut buckets {
         bucket.sort_by(|a, b| {
             b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
+                .total_cmp(&a.score)
+                .then_with(|| a.y.total_cmp(&b.y))
+                .then_with(|| a.x.total_cmp(&b.x))
         });
     }
 
@@ -405,8 +406,7 @@ pub(crate) fn select_by_tile_deficit(
                     .then_with(|| {
                         buckets[a][bucket_pos[a]]
                             .score
-                            .partial_cmp(&buckets[b][bucket_pos[b]].score)
-                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .total_cmp(&buckets[b][bucket_pos[b]].score)
                     })
                     .then_with(|| b.cmp(&a))
             });

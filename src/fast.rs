@@ -148,7 +148,7 @@ impl FastDetector {
 
         #[cfg(feature = "parallel")]
         {
-            return (3..(h - 3))
+            let mut features: Vec<_> = (3..(h - 3))
                 .into_par_iter()
                 .flat_map(|y| {
                     let mut row_features = Vec::new();
@@ -171,6 +171,12 @@ impl FastDetector {
                     row_features
                 })
                 .collect();
+            features.sort_by(|a, b| {
+                a.y.total_cmp(&b.y)
+                    .then_with(|| a.x.total_cmp(&b.x))
+                    .then_with(|| b.score.total_cmp(&a.score))
+            });
+            return features;
         }
 
         #[cfg(not(feature = "parallel"))]

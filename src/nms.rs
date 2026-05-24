@@ -70,7 +70,12 @@ impl OccupancyNms {
                     grid[cell] = Some(i);
                 }
                 Some(prev_i) => {
-                    if feat.score > features[prev_i].score {
+                    let prev = &features[prev_i];
+                    let better = feat.score > prev.score
+                        || (feat.score == prev.score
+                            && (feat.y, feat.x).partial_cmp(&(prev.y, prev.x))
+                                == Some(std::cmp::Ordering::Less));
+                    if better {
                         grid[cell] = Some(i);
                     }
                 }
