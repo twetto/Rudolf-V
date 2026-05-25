@@ -757,7 +757,10 @@ impl Frontend {
 
                         // LBP verification (occlusion/drift detection).
                         if self.config.lbp_verification_enabled {
-                            let new_desc = compute_lbp_at(curr_img, feat.x, feat.y);
+                            let Some(new_desc) = compute_lbp_at(curr_img, feat.x, feat.y) else {
+                                stats.rejected += 1;
+                                continue;
+                            };
                             let dist = (new_desc ^ feat.descriptor).count_ones();
                             lbp_distance = dist.min(u16::MAX as u32) as u16;
                             if self.config.lbp_policy == LbpPolicy::HardReject
@@ -947,7 +950,7 @@ impl Frontend {
                 // Ensure every feature has a valid LBP descriptor for later verification.
                 // FAST already provides this, but Harris/others might leave it as 0.
                 let descriptor = if f.descriptor == 0 {
-                    compute_lbp_at(curr_img, f.x, f.y)
+                    compute_lbp_at(curr_img, f.x, f.y).unwrap_or(0)
                 } else {
                     f.descriptor
                 };
@@ -1813,14 +1816,22 @@ const CIRCLE_OFFSETS: [(i32, i32); 16] = [
 /// All circle offsets are integers, so every sample shares the same fractional
 /// part (fx, fy) as the center. Precompute bilinear weights once, then do 17
 /// unchecked u8 lookups with fixed-point interpolation.
-fn compute_lbp_at(img: &Image<u8>, x: f32, y: f32) -> u16 {
+fn compute_lbp_at(img: &Image<u8>, x: f32, y: f32) -> Option<u16> {
     let w = img.width();
     let h = img.height();
     let stride = img.stride();
     let data = img.as_slice();
 
+    if !x.is_finite() || !y.is_finite() {
+        return None;
+    }
+
     let x0 = x as usize;
     let y0 = y as usize;
+    if x0 < 3 || y0 < 3 || x0 + 4 >= w || y0 + 4 >= h {
+        return None;
+    }
+
     let fx = x - x0 as f32;
     let fy = y - y0 as f32;
 
@@ -1853,7 +1864,7 @@ fn compute_lbp_at(img: &Image<u8>, x: f32, y: f32) -> u16 {
         }
     }
 
-    compute_min_rotation(lbp)
+    Some(compute_min_rotation(lbp))
 }
 
 /// Compute the rotation-invariant LBP by finding the minimum value

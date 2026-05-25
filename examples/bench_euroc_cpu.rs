@@ -16,11 +16,13 @@
 //     RUDOLF_KLT       — "fa" / "ic"           (default: ic)
 
 use rudolf_v::camera::CameraIntrinsics;
-use rudolf_v::frontend::{Frontend, FrontendConfig, DetectorType, FrameStats};
+use rudolf_v::frontend::{DetectorType, FrameStats, Frontend, FrontendConfig, LbpPolicy};
 use rudolf_v::histeq::HistEqMethod;
 use rudolf_v::image::Image;
 use rudolf_v::klt::LkMethod;
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -72,7 +74,10 @@ fn load_camera(data_dir: &std::path::Path) -> Option<CameraIntrinsics> {
 // ---------------------------------------------------------------------------
 
 fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn env_histeq() -> HistEqMethod {
@@ -100,7 +105,10 @@ fn main() {
         std::process::exit(1);
     }
     let data_dir = PathBuf::from(&args[1]);
-    let max_frames: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
+    let max_frames: usize = args
+        .get(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(usize::MAX);
 
     // Discover and load images.
     let image_files = list_euroc_images(&data_dir);
@@ -112,21 +120,29 @@ fn main() {
         .map(|f| load_grayscale(f))
         .collect();
 
-    println!("Resolution: {}×{}, {num_frames} frames loaded",
-        frames[0].width(), frames[0].height());
+    println!(
+        "Resolution: {}×{}, {num_frames} frames loaded",
+        frames[0].width(),
+        frames[0].height()
+    );
 
     // Config from env vars.
     let max_features = env_usize("RUDOLF_FEATURES", 200);
-    let klt_window   = env_usize("RUDOLF_WINDOW", 7);
-    let pyr_levels   = env_usize("RUDOLF_LEVELS", 3);
-    let cell_size    = env_usize("RUDOLF_CELL", 32);
-    let histeq       = env_histeq();
-    let klt_method   = env_klt_method();
-    let camera       = load_camera(&data_dir);
+    let klt_window = env_usize("RUDOLF_WINDOW", 7);
+    let pyr_levels = env_usize("RUDOLF_LEVELS", 3);
+    let cell_size = env_usize("RUDOLF_CELL", 32);
+    let histeq = env_histeq();
+    let klt_method = env_klt_method();
+    let camera = load_camera(&data_dir);
+
+    let fast_threshold: u8 = std::env::var("RUDOLF_FAST_THRESH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
 
     let config = FrontendConfig {
         detector: DetectorType::Fast,
-        fast_threshold: 40,
+        fast_threshold,
         fast_arc_length: 9,
         max_features,
         cell_size,
@@ -138,11 +154,14 @@ fn main() {
         klt_method,
         histeq,
         camera,
+        lbp_policy: LbpPolicy::HardReject,
         ..FrontendConfig::default()
     };
 
-    println!("Config: features={max_features} cell={cell_size} levels={pyr_levels} \
-              window={klt_window} histeq={histeq:?} klt={klt_method:?}");
+    println!(
+        "Config: features={max_features} cell={cell_size} levels={pyr_levels} \
+              window={klt_window} histeq={histeq:?} klt={klt_method:?}"
+    );
 
     let w = frames[0].width();
     let h = frames[0].height();
@@ -166,7 +185,7 @@ fn main() {
     // Re-create frontend for clean state.
     let config2 = FrontendConfig {
         detector: DetectorType::Fast,
-        fast_threshold: 40,
+        fast_threshold,
         fast_arc_length: 9,
         max_features,
         cell_size,
@@ -178,46 +197,78 @@ fn main() {
         klt_method,
         histeq: env_histeq(),
         camera: load_camera(&data_dir),
+        lbp_policy: LbpPolicy::HardReject,
         ..FrontendConfig::default()
     };
     frontend = Frontend::new(config2, w, h);
 
+    let mut run_hasher = DefaultHasher::new();
     for (i, frame) in frames.iter().enumerate() {
-        let (_features, stats) = frontend.process(frame);
+        let (features, stats) = frontend.process(frame);
 
-        eprintln!("{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
-            i, stats.tracked, stats.lost, stats.rejected, stats.new_detections, stats.total,
-            stats.timing.histeq_ms(), stats.timing.pyramid_ms(), stats.timing.klt_ms(),
-            stats.timing.ransac_ms(), stats.timing.detect_ms(), stats.timing.total_ms());
+        // Accumulate determinism hash over all features every frame.
+        (features.len() as u64).hash(&mut run_hasher);
+        for feat in features {
+            feat.id.hash(&mut run_hasher);
+            feat.x.to_bits().hash(&mut run_hasher);
+            feat.y.to_bits().hash(&mut run_hasher);
+            feat.score.to_bits().hash(&mut run_hasher);
+            feat.descriptor.hash(&mut run_hasher);
+        }
+
+        eprintln!(
+            "{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
+            i,
+            stats.tracked,
+            stats.lost,
+            stats.rejected,
+            stats.new_detections,
+            stats.total,
+            stats.timing.histeq_ms(),
+            stats.timing.pyramid_ms(),
+            stats.timing.klt_ms(),
+            stats.timing.ransac_ms(),
+            stats.timing.detect_ms(),
+            stats.timing.total_ms()
+        );
 
         all_stats.push(stats);
     }
+    let determinism_hash = run_hasher.finish();
 
     let elapsed = t_run.elapsed().as_secs_f64();
     let fps = num_frames as f64 / elapsed;
 
     // Summary table.
     println!("═══════════════════════════════════════════════════════════════════");
-    println!("  Rudolf-V CPU Benchmark — {} frames in {:.2}s ({:.1} FPS)",
-        num_frames, elapsed, fps);
+    println!(
+        "  Rudolf-V CPU Benchmark — {} frames in {:.2}s ({:.1} FPS)",
+        num_frames, elapsed, fps
+    );
     println!("═══════════════════════════════════════════════════════════════════");
     println!();
 
     // Per-stage statistics.
     let stages: [(&str, Box<dyn Fn(&FrameStats) -> f32>); 5] = [
-        ("histeq",  Box::new(|s: &FrameStats| s.timing.histeq_ms())),
+        ("histeq", Box::new(|s: &FrameStats| s.timing.histeq_ms())),
         ("pyramid", Box::new(|s: &FrameStats| s.timing.pyramid_ms())),
-        ("klt",     Box::new(|s: &FrameStats| s.timing.klt_ms())),
-        ("ransac",  Box::new(|s: &FrameStats| s.timing.ransac_ms())),
-        ("detect",  Box::new(|s: &FrameStats| s.timing.detect_ms())),
+        ("klt", Box::new(|s: &FrameStats| s.timing.klt_ms())),
+        ("ransac", Box::new(|s: &FrameStats| s.timing.ransac_ms())),
+        ("detect", Box::new(|s: &FrameStats| s.timing.detect_ms())),
     ];
 
-    println!("  {:16} {:>8} {:>8} {:>8} {:>8}", "Stage", "Mean", "Min", "Max", "Median");
-    println!("  {:16} {:>8} {:>8} {:>8} {:>8}", "─────", "────", "───", "───", "──────");
+    println!(
+        "  {:16} {:>8} {:>8} {:>8} {:>8}",
+        "Stage", "Mean", "Min", "Max", "Median"
+    );
+    println!(
+        "  {:16} {:>8} {:>8} {:>8} {:>8}",
+        "─────", "────", "───", "───", "──────"
+    );
 
     let mut total_mean = 0.0f32;
-    let mut total_min  = f32::MAX;
-    let mut total_max  = 0.0f32;
+    let mut total_min = f32::MAX;
+    let mut total_max = 0.0f32;
     let mut total_vals: Vec<f32> = all_stats.iter().map(|s| s.timing.total_ms()).collect();
     total_vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
@@ -228,23 +279,33 @@ fn main() {
         let min = vals[0];
         let max = *vals.last().unwrap();
         let median = vals[vals.len() / 2];
-        println!("  {:16} {:>7.2}ms {:>7.2}ms {:>7.2}ms {:>7.2}ms",
-            name, mean, min, max, median);
+        println!(
+            "  {:16} {:>7.2}ms {:>7.2}ms {:>7.2}ms {:>7.2}ms",
+            name, mean, min, max, median
+        );
 
-        if *name != "histeq" { // Track non-histeq for total reference.
+        if *name != "histeq" {
+            // Track non-histeq for total reference.
             total_mean += mean;
         }
     }
 
     let t_mean: f32 = total_vals.iter().sum::<f32>() / total_vals.len() as f32;
-    let t_min  = total_vals[0];
-    let t_max  = *total_vals.last().unwrap();
-    let t_med  = total_vals[total_vals.len() / 2];
+    let t_min = total_vals[0];
+    let t_max = *total_vals.last().unwrap();
+    let t_med = total_vals[total_vals.len() / 2];
 
-    println!("  {:16} {:>8} {:>8} {:>8} {:>8}", "", "────", "───", "───", "──────");
-    println!("  {:16} {:>7.2}ms {:>7.2}ms {:>7.2}ms {:>7.2}ms",
-        "TOTAL", t_mean, t_min, t_max, t_med);
+    println!(
+        "  {:16} {:>8} {:>8} {:>8} {:>8}",
+        "", "────", "───", "───", "──────"
+    );
+    println!(
+        "  {:16} {:>7.2}ms {:>7.2}ms {:>7.2}ms {:>7.2}ms",
+        "TOTAL", t_mean, t_min, t_max, t_med
+    );
 
+    println!();
+    println!("  Determinism hash: {:016x}", determinism_hash);
     println!();
     println!("  Per-frame CSV written to stderr. Redirect with:");
     println!("    cargo run --example bench_euroc_cpu --release -- <path> 2>bench.csv");
