@@ -18,4 +18,5 @@ pub mod nms;
 pub mod occupancy;
 pub mod frontend;
 pub mod pyramid;
+pub mod stereo;
 pub mod gpu;

@@ -1052,6 +1052,10 @@ impl Frontend {
         before - write
     }
 
+    pub fn current_pyramid(&self) -> &Pyramid {
+        &self.curr_pyramid
+    }
+
     /// Get the last histogram-equalized input image, if preprocessing is enabled.
     pub fn preprocessed_image(&self) -> Option<&Image<u8>> {
         match self.config.histeq {
