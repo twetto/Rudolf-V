@@ -1,7 +1,7 @@
 use crate::camera::StereoRig;
 use crate::fast::Feature;
 use crate::histeq::{self, HistEqMethod};
-use crate::image::{interpolate_bilinear_unchecked, Image};
+use crate::image::Image;
 use crate::klt::bilerp_ptr;
 use crate::pyramid::{Pyramid, PyramidScratch};
 
@@ -33,6 +33,220 @@ fn bilerp_key(x: f64, y: f64) -> BilerpKey {
         w01: one_fx * fy,
         w11: fx * fy,
     }
+}
+
+#[inline(always)]
+unsafe fn accumulate_stereo_row_scalar(
+    r0: *const f32,
+    r1: *const f32,
+    ix0: usize,
+    count: usize,
+    k: BilerpKey,
+    t: &[f32],
+    tx: &[f32],
+    ty: &[f32],
+) -> (f64, f64) {
+    let mut s_txr = 0.0f64;
+    let mut s_tyr = 0.0f64;
+    for lx in 0..count {
+        let ix = ix0 + lx;
+        let i_cam1 = bilerp_ptr(r0, r1, ix, k.w00, k.w10, k.w01, k.w11);
+        let r = (i_cam1 - *t.get_unchecked(lx)) as f64;
+        s_txr += *tx.get_unchecked(lx) as f64 * r;
+        s_tyr += *ty.get_unchecked(lx) as f64 * r;
+    }
+    (s_txr, s_tyr)
+}
+
+#[inline(always)]
+unsafe fn residual_stereo_row_scalar(
+    c0_r0: *const f32,
+    c0_r1: *const f32,
+    c1_r0: *const f32,
+    c1_r1: *const f32,
+    cam0_ix0: usize,
+    cam1_ix0: usize,
+    count: usize,
+    k0: BilerpKey,
+    k1: BilerpKey,
+) -> f64 {
+    let mut sum = 0.0f64;
+    for lx in 0..count {
+        let i0 = bilerp_ptr(c0_r0, c0_r1, cam0_ix0 + lx, k0.w00, k0.w10, k0.w01, k0.w11);
+        let i1 = bilerp_ptr(c1_r0, c1_r1, cam1_ix0 + lx, k1.w00, k1.w10, k1.w01, k1.w11);
+        sum += (i1 - i0).abs() as f64;
+    }
+    sum
+}
+
+#[inline(always)]
+unsafe fn residual_stereo_row(
+    c0_r0: *const f32,
+    c0_r1: *const f32,
+    c1_r0: *const f32,
+    c1_r1: *const f32,
+    cam0_ix0: usize,
+    cam1_ix0: usize,
+    count: usize,
+    k0: BilerpKey,
+    k1: BilerpKey,
+) -> f64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return residual_stereo_row_avx2(
+                c0_r0, c0_r1, c1_r0, c1_r1, cam0_ix0, cam1_ix0, count, k0, k1,
+            );
+        }
+    }
+    residual_stereo_row_scalar(
+        c0_r0, c0_r1, c1_r0, c1_r1, cam0_ix0, cam1_ix0, count, k0, k1,
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn residual_stereo_row_avx2(
+    c0_r0: *const f32,
+    c0_r1: *const f32,
+    c1_r0: *const f32,
+    c1_r1: *const f32,
+    cam0_ix0: usize,
+    cam1_ix0: usize,
+    count: usize,
+    k0: BilerpKey,
+    k1: BilerpKey,
+) -> f64 {
+    use std::arch::x86_64::*;
+
+    let mut vsum = _mm256_setzero_ps();
+    let sign_mask = _mm256_set1_ps(-0.0);
+    let k0_w00 = _mm256_set1_ps(k0.w00);
+    let k0_w10 = _mm256_set1_ps(k0.w10);
+    let k0_w01 = _mm256_set1_ps(k0.w01);
+    let k0_w11 = _mm256_set1_ps(k0.w11);
+    let k1_w00 = _mm256_set1_ps(k1.w00);
+    let k1_w10 = _mm256_set1_ps(k1.w10);
+    let k1_w01 = _mm256_set1_ps(k1.w01);
+    let k1_w11 = _mm256_set1_ps(k1.w11);
+
+    let chunks = count / 8;
+    for c in 0..chunks {
+        let off = c * 8;
+        let c0_ix = cam0_ix0 + off;
+        let c1_ix = cam1_ix0 + off;
+
+        let c0_p00 = _mm256_loadu_ps(c0_r0.add(c0_ix));
+        let c0_p10 = _mm256_loadu_ps(c0_r0.add(c0_ix + 1));
+        let c0_p01 = _mm256_loadu_ps(c0_r1.add(c0_ix));
+        let c0_p11 = _mm256_loadu_ps(c0_r1.add(c0_ix + 1));
+        let mut i0 = _mm256_mul_ps(c0_p00, k0_w00);
+        i0 = _mm256_fmadd_ps(c0_p10, k0_w10, i0);
+        i0 = _mm256_fmadd_ps(c0_p01, k0_w01, i0);
+        i0 = _mm256_fmadd_ps(c0_p11, k0_w11, i0);
+
+        let c1_p00 = _mm256_loadu_ps(c1_r0.add(c1_ix));
+        let c1_p10 = _mm256_loadu_ps(c1_r0.add(c1_ix + 1));
+        let c1_p01 = _mm256_loadu_ps(c1_r1.add(c1_ix));
+        let c1_p11 = _mm256_loadu_ps(c1_r1.add(c1_ix + 1));
+        let mut i1 = _mm256_mul_ps(c1_p00, k1_w00);
+        i1 = _mm256_fmadd_ps(c1_p10, k1_w10, i1);
+        i1 = _mm256_fmadd_ps(c1_p01, k1_w01, i1);
+        i1 = _mm256_fmadd_ps(c1_p11, k1_w11, i1);
+
+        let diff = _mm256_sub_ps(i1, i0);
+        vsum = _mm256_add_ps(vsum, _mm256_andnot_ps(sign_mask, diff));
+    }
+
+    let mut lanes = [0.0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), vsum);
+    let mut sum = lanes.iter().sum::<f32>() as f64;
+
+    for lx in (chunks * 8)..count {
+        let i0 = bilerp_ptr(c0_r0, c0_r1, cam0_ix0 + lx, k0.w00, k0.w10, k0.w01, k0.w11);
+        let i1 = bilerp_ptr(c1_r0, c1_r1, cam1_ix0 + lx, k1.w00, k1.w10, k1.w01, k1.w11);
+        sum += (i1 - i0).abs() as f64;
+    }
+    sum
+}
+
+#[inline(always)]
+unsafe fn accumulate_stereo_row(
+    r0: *const f32,
+    r1: *const f32,
+    ix0: usize,
+    count: usize,
+    k: BilerpKey,
+    t: &[f32],
+    tx: &[f32],
+    ty: &[f32],
+) -> (f64, f64) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return accumulate_stereo_row_avx2(r0, r1, ix0, count, k, t, tx, ty);
+        }
+    }
+    accumulate_stereo_row_scalar(r0, r1, ix0, count, k, t, tx, ty)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn accumulate_stereo_row_avx2(
+    r0: *const f32,
+    r1: *const f32,
+    ix0: usize,
+    count: usize,
+    k: BilerpKey,
+    t: &[f32],
+    tx: &[f32],
+    ty: &[f32],
+) -> (f64, f64) {
+    use std::arch::x86_64::*;
+
+    let mut vxr = _mm256_setzero_ps();
+    let mut vyr = _mm256_setzero_ps();
+    let vw00 = _mm256_set1_ps(k.w00);
+    let vw10 = _mm256_set1_ps(k.w10);
+    let vw01 = _mm256_set1_ps(k.w01);
+    let vw11 = _mm256_set1_ps(k.w11);
+
+    let chunks = count / 8;
+    for c in 0..chunks {
+        let off = c * 8;
+        let ix = ix0 + off;
+        let p00 = _mm256_loadu_ps(r0.add(ix));
+        let p10 = _mm256_loadu_ps(r0.add(ix + 1));
+        let p01 = _mm256_loadu_ps(r1.add(ix));
+        let p11 = _mm256_loadu_ps(r1.add(ix + 1));
+        let mut w = _mm256_mul_ps(p00, vw00);
+        w = _mm256_fmadd_ps(p10, vw10, w);
+        w = _mm256_fmadd_ps(p01, vw01, w);
+        w = _mm256_fmadd_ps(p11, vw11, w);
+
+        let vt = _mm256_loadu_ps(t.as_ptr().add(off));
+        let vr = _mm256_sub_ps(w, vt);
+        let vtx = _mm256_loadu_ps(tx.as_ptr().add(off));
+        let vty = _mm256_loadu_ps(ty.as_ptr().add(off));
+        vxr = _mm256_fmadd_ps(vtx, vr, vxr);
+        vyr = _mm256_fmadd_ps(vty, vr, vyr);
+    }
+
+    let mut txr_lanes = [0.0f32; 8];
+    let mut tyr_lanes = [0.0f32; 8];
+    _mm256_storeu_ps(txr_lanes.as_mut_ptr(), vxr);
+    _mm256_storeu_ps(tyr_lanes.as_mut_ptr(), vyr);
+    let mut s_txr = txr_lanes.iter().sum::<f32>() as f64;
+    let mut s_tyr = tyr_lanes.iter().sum::<f32>() as f64;
+
+    for lx in (chunks * 8)..count {
+        let ix = ix0 + lx;
+        let i_cam1 = bilerp_ptr(r0, r1, ix, k.w00, k.w10, k.w01, k.w11);
+        let r = (i_cam1 - *t.get_unchecked(lx)) as f64;
+        s_txr += *tx.get_unchecked(lx) as f64 * r;
+        s_tyr += *ty.get_unchecked(lx) as f64 * r;
+    }
+    (s_txr, s_tyr)
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +326,10 @@ pub struct StereoMatcher {
     cam1_pyramid: Pyramid,
     pyr_scratch: PyramidScratch,
     histeq_buf: Image<u8>,
+    t_ext: [f32; MAX_EXT_PIXELS],
+    t: [f32; MAX_INNER_PIXELS],
+    tx: [f32; MAX_INNER_PIXELS],
+    ty: [f32; MAX_INNER_PIXELS],
 }
 
 impl StereoMatcher {
@@ -131,6 +349,10 @@ impl StereoMatcher {
             cam1_pyramid,
             pyr_scratch,
             histeq_buf: Image::new(img_w, img_h),
+            t_ext: [0.0; MAX_EXT_PIXELS],
+            t: [0.0; MAX_INNER_PIXELS],
+            tx: [0.0; MAX_INNER_PIXELS],
+            ty: [0.0; MAX_INNER_PIXELS],
         }
     }
 
@@ -167,7 +389,7 @@ impl StereoMatcher {
     }
 
     fn propagate_knn(
-        &self,
+        &mut self,
         matches: &mut [StereoMatch],
         features: &[Feature],
         cam0_pyramid: &Pyramid,
@@ -323,7 +545,7 @@ impl StereoMatcher {
         best_rho
     }
 
-    fn match_one(&self, feat: &Feature, cam0_pyramid: &Pyramid) -> StereoMatch {
+    fn match_one(&mut self, feat: &Feature, cam0_pyramid: &Pyramid) -> StereoMatch {
         let (bx, by) = self
             .rig
             .cam0
@@ -342,7 +564,7 @@ impl StereoMatcher {
     }
 
     fn match_one_with_init(
-        &self,
+        &mut self,
         feat: &Feature,
         cam0_pyramid: &Pyramid,
         init_rho: f64,
@@ -390,10 +612,6 @@ impl StereoMatcher {
         // staying inside the coarse-to-fine basin keeps convergence well-behaved.
         let inner_side = 2 * half as usize;
         let ext_side = inner_side + 2;
-        let mut t_ext = [0.0f32; MAX_EXT_PIXELS];
-        let mut t = [0.0f32; MAX_INNER_PIXELS];
-        let mut tx = [0.0f32; MAX_INNER_PIXELS];
-        let mut ty = [0.0f32; MAX_INNER_PIXELS];
 
         for level in (0..n_levels).rev() {
             let scale = 1.0 / (1usize << level) as f64;
@@ -426,7 +644,7 @@ impl StereoMatcher {
                     for ex in 0..ext_side {
                         let dx = ex as isize - half - 1;
                         let ix = (k0.x0 + dx) as usize;
-                        t_ext[ey * ext_side + ex] =
+                        self.t_ext[ey * ext_side + ex] =
                             bilerp_ptr(r0, r1, ix, k0.w00, k0.w10, k0.w01, k0.w11);
                     }
                 }
@@ -437,10 +655,23 @@ impl StereoMatcher {
                 for ix in 0..inner_side {
                     let e = (iy + 1) * ext_side + (ix + 1);
                     let inner_idx = iy * inner_side + ix;
-                    t[inner_idx] = t_ext[e];
-                    tx[inner_idx] = 0.5 * (t_ext[e + 1] - t_ext[e - 1]);
-                    ty[inner_idx] = 0.5 * (t_ext[e + ext_side] - t_ext[e - ext_side]);
+                    self.t[inner_idx] = self.t_ext[e];
+                    self.tx[inner_idx] = 0.5 * (self.t_ext[e + 1] - self.t_ext[e - 1]);
+                    self.ty[inner_idx] =
+                        0.5 * (self.t_ext[e + ext_side] - self.t_ext[e - ext_side]);
                 }
+            }
+
+            let n_patch = inner_side * inner_side;
+            let mut s_tx2 = 0.0f64;
+            let mut s_txty = 0.0f64;
+            let mut s_ty2 = 0.0f64;
+            for i in 0..n_patch {
+                let txi = self.tx[i] as f64;
+                let tyi = self.ty[i] as f64;
+                s_tx2 += txi * txi;
+                s_txty += txi * tyi;
+                s_ty2 += tyi * tyi;
             }
 
             for _ in 0..self.config.max_iterations {
@@ -482,33 +713,30 @@ impl StereoMatcher {
                 let k1 = bilerp_key(u1_s, v1_s);
                 let mut s_txr = 0.0f64;
                 let mut s_tyr = 0.0f64;
-                let mut s_tx2 = 0.0f64;
-                let mut s_txty = 0.0f64;
-                let mut s_ty2 = 0.0f64;
                 let mut n_valid = 0usize;
 
-                let mut p_idx = 0usize;
-                for dy in -half..half {
+                for row in 0..inner_side {
+                    let dy = row as isize - half;
                     let cam1_y = (k1.y0 + dy) as usize;
                     // SAFETY: u1_s ± half within cam1 bounds per check above.
                     unsafe {
                         let c1_r0 = cam1_img.row_ptr(cam1_y);
                         let c1_r1 = cam1_img.row_ptr(cam1_y + 1);
-                        for dx in -half..half {
-                            let ix = (k1.x0 + dx) as usize;
-                            let i_cam1 =
-                                bilerp_ptr(c1_r0, c1_r1, ix, k1.w00, k1.w10, k1.w01, k1.w11);
-                            let r = (i_cam1 - t[p_idx]) as f64;
-                            let txi = tx[p_idx] as f64;
-                            let tyi = ty[p_idx] as f64;
-                            s_txr += txi * r;
-                            s_tyr += tyi * r;
-                            s_tx2 += txi * txi;
-                            s_txty += txi * tyi;
-                            s_ty2 += tyi * tyi;
-                            n_valid += 1;
-                            p_idx += 1;
-                        }
+                        let row_start = row * inner_side;
+                        let ix0 = (k1.x0 - half) as usize;
+                        let (row_txr, row_tyr) = accumulate_stereo_row(
+                            c1_r0,
+                            c1_r1,
+                            ix0,
+                            inner_side,
+                            k1,
+                            &self.t[row_start..row_start + inner_side],
+                            &self.tx[row_start..row_start + inner_side],
+                            &self.ty[row_start..row_start + inner_side],
+                        );
+                        s_txr += row_txr;
+                        s_tyr += row_tyr;
+                        n_valid += inner_side;
                     }
                 }
 
@@ -554,31 +782,32 @@ impl StereoMatcher {
             return fail;
         }
 
+        let k0 = bilerp_key(feat.x as f64, feat.y as f64);
+        let k1 = bilerp_key(u1, v1);
         let mut residual_sum = 0.0f64;
-        let mut n = 0usize;
-        for dy in -half..half {
-            for dx in -half..half {
-                // SAFETY: feat ± half and (u1, v1) ± half validated against level-0 dims above.
-                let (i0, i1) = unsafe {
-                    (
-                        interpolate_bilinear_unchecked(
-                            cam0_l0,
-                            feat.x + dx as f32,
-                            feat.y + dy as f32,
-                        ),
-                        interpolate_bilinear_unchecked(
-                            cam1_l0,
-                            u1 as f32 + dx as f32,
-                            v1 as f32 + dy as f32,
-                        ),
-                    )
-                };
-                residual_sum += (i1 - i0).abs() as f64;
-                n += 1;
+        let inner_side = 2 * half as usize;
+        for row in 0..inner_side {
+            let dy = row as isize - half;
+            let cam0_y = (k0.y0 + dy) as usize;
+            let cam1_y = (k1.y0 + dy) as usize;
+            // SAFETY: feat ± half and (u1, v1) ± half validated against level-0 dims above.
+            unsafe {
+                residual_sum += residual_stereo_row(
+                    cam0_l0.row_ptr(cam0_y),
+                    cam0_l0.row_ptr(cam0_y + 1),
+                    cam1_l0.row_ptr(cam1_y),
+                    cam1_l0.row_ptr(cam1_y + 1),
+                    (k0.x0 - half) as usize,
+                    (k1.x0 - half) as usize,
+                    inner_side,
+                    k0,
+                    k1,
+                );
             }
         }
-        let mean_residual = if n > 0 {
-            (residual_sum / n as f64) as f32
+        let n_patch = inner_side * inner_side;
+        let mean_residual = if n_patch > 0 {
+            (residual_sum / n_patch as f64) as f32
         } else {
             f32::INFINITY
         };
