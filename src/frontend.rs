@@ -478,10 +478,15 @@ pub struct FrontendConfig {
     /// Stabilizes brightness across frames when auto-exposure is active.
     pub histeq: HistEqMethod,
     /// Camera intrinsics for geometric verification (optional).
-    /// If set, RANSAC outlier rejection is applied after KLT tracking.
+    /// If set and `enable_internal_ransac` is true, RANSAC outlier rejection
+    /// is applied after KLT tracking.
     pub camera: Option<CameraIntrinsics>,
     /// RANSAC configuration for essential matrix estimation.
     pub ransac: RansacConfig,
+    /// Run the built-in cam0 essential-matrix RANSAC inside `process()`.
+    /// Set to false when an external joint RANSAC (e.g. rigid 3D-3D over
+    /// stereo correspondences) will be applied via `retain_features_by_id`.
+    pub enable_internal_ransac: bool,
 }
 
 impl Default for FrontendConfig {
@@ -513,6 +518,7 @@ impl Default for FrontendConfig {
             histeq: HistEqMethod::None,
             camera: None,
             ransac: RansacConfig::default(),
+            enable_internal_ransac: true,
         }
     }
 }
@@ -800,63 +806,65 @@ impl Frontend {
                 // Step 2b: Geometric verification (essential matrix RANSAC).
                 let t0 = Instant::now();
                 // Reject outlier tracks that are geometrically inconsistent.
-                if let Some(ref cam) = self.config.camera {
-                    if self.features.len() >= 8 {
-                        // Build correspondences: prev_features -> current features.
-                        // Match by ID (both lists may differ if features were lost).
-                        let corrs: Vec<(usize, Correspondence)> = self
-                            .features
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(idx, f)| {
-                                self.prev_features
-                                    .iter()
-                                    .find(|pf| pf.id == f.id)
-                                    .map(|pf| {
-                                        let (x1, y1) =
-                                            cam.normalize_undistorted(pf.x as f64, pf.y as f64);
-                                        let (x2, y2) =
-                                            cam.normalize_undistorted(f.x as f64, f.y as f64);
-                                        (idx, Correspondence { x1, y1, x2, y2 })
-                                    })
-                            })
-                            .collect();
+                if self.config.enable_internal_ransac {
+                    if let Some(ref cam) = self.config.camera {
+                        if self.features.len() >= 8 {
+                            // Build correspondences: prev_features -> current features.
+                            // Match by ID (both lists may differ if features were lost).
+                            let corrs: Vec<(usize, Correspondence)> = self
+                                .features
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(idx, f)| {
+                                    self.prev_features
+                                        .iter()
+                                        .find(|pf| pf.id == f.id)
+                                        .map(|pf| {
+                                            let (x1, y1) =
+                                                cam.normalize_undistorted(pf.x as f64, pf.y as f64);
+                                            let (x2, y2) =
+                                                cam.normalize_undistorted(f.x as f64, f.y as f64);
+                                            (idx, Correspondence { x1, y1, x2, y2 })
+                                        })
+                                })
+                                .collect();
 
-                        if corrs.len() >= 8 {
-                            let corr_only: Vec<Correspondence> =
-                                corrs.iter().map(|(_, c)| *c).collect();
+                            if corrs.len() >= 8 {
+                                let corr_only: Vec<Correspondence> =
+                                    corrs.iter().map(|(_, c)| *c).collect();
 
-                            if let Some(result) = essential::estimate_essential_ransac(
-                                &corr_only,
-                                &self.config.ransac,
-                            ) {
-                                // Remove outlier features.
-                                let mut inlier_features = Vec::new();
-                                let mut inlier_meta = Vec::new();
-                                let mut ransac_rejected = 0usize;
-                                for (ci, (feat_idx, _)) in corrs.iter().enumerate() {
-                                    if result.inliers[ci] {
-                                        inlier_features.push(self.features[*feat_idx].clone());
-                                        inlier_meta.push(self.track_meta[*feat_idx].clone());
-                                    } else {
-                                        ransac_rejected += 1;
-                                        stats.rejected += 1;
+                                if let Some(result) = essential::estimate_essential_ransac(
+                                    &corr_only,
+                                    &self.config.ransac,
+                                ) {
+                                    // Remove outlier features.
+                                    let mut inlier_features = Vec::new();
+                                    let mut inlier_meta = Vec::new();
+                                    let mut ransac_rejected = 0usize;
+                                    for (ci, (feat_idx, _)) in corrs.iter().enumerate() {
+                                        if result.inliers[ci] {
+                                            inlier_features.push(self.features[*feat_idx].clone());
+                                            inlier_meta.push(self.track_meta[*feat_idx].clone());
+                                        } else {
+                                            ransac_rejected += 1;
+                                            stats.rejected += 1;
+                                        }
                                     }
-                                }
-                                // Also keep features that had no prev match (new this frame).
-                                let matched_ids: Vec<u64> = corrs
-                                    .iter()
-                                    .map(|(idx, _)| self.features[*idx].id)
-                                    .collect();
-                                for (idx, f) in self.features.iter().enumerate() {
-                                    if !matched_ids.contains(&f.id) {
-                                        inlier_features.push(f.clone());
-                                        inlier_meta.push(self.track_meta[idx].clone());
+                                    // Also keep features that had no prev match (new this frame).
+                                    let matched_ids: Vec<u64> = corrs
+                                        .iter()
+                                        .map(|(idx, _)| self.features[*idx].id)
+                                        .collect();
+                                    for (idx, f) in self.features.iter().enumerate() {
+                                        if !matched_ids.contains(&f.id) {
+                                            inlier_features.push(f.clone());
+                                            inlier_meta.push(self.track_meta[idx].clone());
+                                        }
                                     }
+                                    stats.tracked = stats.tracked.saturating_sub(ransac_rejected);
+                                    self.features = inlier_features;
+                                    self.track_meta = inlier_meta;
                                 }
-                                stats.tracked = stats.tracked.saturating_sub(ransac_rejected);
-                                self.features = inlier_features;
-                                self.track_meta = inlier_meta;
                             }
                         }
                     }

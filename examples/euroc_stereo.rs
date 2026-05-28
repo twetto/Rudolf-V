@@ -13,9 +13,11 @@ use rudolf_v::frontend::{DetectorType, Frontend, FrontendConfig, LbpPolicy};
 use rudolf_v::histeq::{self, HistEqMethod};
 use rudolf_v::image::Image;
 use rudolf_v::klt::LkMethod;
+use rudolf_v::rigid_ransac::{self, Correspondence3d, Rigid3dRansacConfig};
 use rudolf_v::stereo::{StereoConfig, StereoMatch, StereoMatcher};
 
 use minifb::{Key, Window, WindowOptions};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -124,6 +126,9 @@ fn main() {
         histeq: HistEqMethod::Global,
         camera,
         lbp_policy: LbpPolicy::HardReject,
+        // Defer outlier rejection to the joint 3D-3D RANSAC over stereo pairs
+        // below — it has more constraint than cam0-only essential-matrix.
+        enable_internal_ransac: false,
         ..FrontendConfig::default()
     };
 
@@ -132,8 +137,8 @@ fn main() {
     let stereo_config = StereoConfig {
         pyramid_levels: 3,
         patch_half_size: 4,
-        max_iterations: 5,
-        n_search_candidates: 7,
+        max_iterations: 30,
+        n_search_candidates: 0,
         histeq: HistEqMethod::Global,
         ..StereoConfig::default()
     };
@@ -170,6 +175,9 @@ fn main() {
     let mut total_stereo_ms = 0.0f64;
     let mut processed_frames = 0usize;
 
+    let rigid_cfg = Rigid3dRansacConfig::default();
+    let mut prev_3d: HashMap<u64, [f64; 3]> = HashMap::new();
+
     for i in 0..num_frames {
         if !window.is_open() || window.is_key_down(Key::Escape) || window.is_key_down(Key::Q) {
             break;
@@ -181,7 +189,52 @@ fn main() {
 
         let t0 = Instant::now();
         let cam0_pyramid = frontend.current_pyramid();
-        let matches = matcher.match_features(&cam1_frames[i], &features, cam0_pyramid);
+        let mut matches = matcher.match_features(&cam1_frames[i], &features, cam0_pyramid);
+
+        // Joint 3D-3D RANSAC over IDs that co-exist in prev and curr stereo matches.
+        let rig = matcher.rig();
+        let mut curr_3d: HashMap<u64, [f64; 3]> = HashMap::new();
+        for (feat, m) in features.iter().zip(matches.iter()) {
+            if let Some(p) = m.point_cam0(rig, feat) {
+                curr_3d.insert(feat.id, p);
+            }
+        }
+        let mut corrs_with_id: Vec<(u64, Correspondence3d)> = Vec::new();
+        for (&id, &p_curr) in curr_3d.iter() {
+            if let Some(&p_prev) = prev_3d.get(&id) {
+                corrs_with_id.push((
+                    id,
+                    Correspondence3d {
+                        p1: p_prev,
+                        p2: p_curr,
+                    },
+                ));
+            }
+        }
+        let mut outlier_ids: Vec<u64> = Vec::new();
+        if corrs_with_id.len() >= 3 {
+            let corrs_only: Vec<Correspondence3d> = corrs_with_id.iter().map(|(_, c)| *c).collect();
+            if let Some(result) = rigid_ransac::estimate_rigid_ransac(&corrs_only, &rigid_cfg) {
+                for ((id, _), &is_in) in corrs_with_id.iter().zip(result.inliers.iter()) {
+                    if !is_in {
+                        outlier_ids.push(*id);
+                    }
+                }
+            }
+        }
+        if !outlier_ids.is_empty() {
+            frontend.drop_tracks(&outlier_ids);
+            for m in matches.iter_mut() {
+                if outlier_ids.contains(&m.id) {
+                    m.matched = false;
+                }
+            }
+            for id in &outlier_ids {
+                curr_3d.remove(id);
+            }
+        }
+        prev_3d = curr_3d;
+
         let stereo_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         let matched: Vec<_> = matches.iter().filter(|m| m.matched).collect();

@@ -17,6 +17,10 @@ pub struct StereoConfig {
     pub huber_delta: f64,
     pub histeq: HistEqMethod,
     pub n_search_candidates: usize,
+    /// Number of image-space nearest neighbors to seed retries with after the
+    /// initial pass (PatchMatch-style propagation). Only failed features are
+    /// retried; 0 disables the propagation pass.
+    pub knn_propagation: usize,
 }
 
 impl Default for StereoConfig {
@@ -33,6 +37,7 @@ impl Default for StereoConfig {
             huber_delta: 5.0,
             histeq: HistEqMethod::None,
             n_search_candidates: 7,
+            knn_propagation: 5,
         }
     }
 }
@@ -45,6 +50,20 @@ pub struct StereoMatch {
     pub inv_depth: f32,
     pub residual: f32,
     pub matched: bool,
+}
+
+impl StereoMatch {
+    /// Recover the 3D position of this match in cam0's frame from the
+    /// feature's pixel coordinates and the rig's cam0 intrinsics.
+    /// Returns None for failed or non-positive-depth matches.
+    pub fn point_cam0(&self, rig: &StereoRig, feat: &Feature) -> Option<[f64; 3]> {
+        if !self.matched || self.inv_depth <= 0.0 {
+            return None;
+        }
+        let (bx, by) = rig.cam0.normalize_undistorted(feat.x as f64, feat.y as f64);
+        let rho = self.inv_depth as f64;
+        Some([bx / rho, by / rho, 1.0 / rho])
+    }
 }
 
 pub struct StereoMatcher {
@@ -95,10 +114,68 @@ impl StereoMatcher {
 
         self.build_gradients();
 
-        cam0_features
+        let mut matches: Vec<StereoMatch> = cam0_features
             .iter()
             .map(|feat| self.match_one(feat, cam0_pyramid))
-            .collect()
+            .collect();
+
+        if self.config.knn_propagation > 0 {
+            self.propagate_knn(&mut matches, cam0_features, cam0_pyramid);
+        }
+
+        matches
+    }
+
+    fn propagate_knn(
+        &self,
+        matches: &mut [StereoMatch],
+        features: &[Feature],
+        cam0_pyramid: &Pyramid,
+    ) {
+        let k = self.config.knn_propagation;
+        let valid: Vec<usize> = matches
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.matched)
+            .map(|(i, _)| i)
+            .collect();
+        if valid.is_empty() {
+            return;
+        }
+
+        // Rank neighbors by dist² / score: a strong-response neighbor pulls in
+        // slightly farther than a close mediocre one. Score is FAST arc-sum, so
+        // always non-negative; clamp to >= 1 to avoid divide-by-zero / domination.
+        let mut ranked: Vec<(f32, usize)> = Vec::with_capacity(valid.len());
+        for i in 0..features.len() {
+            if matches[i].matched {
+                continue;
+            }
+            let feat = &features[i];
+            ranked.clear();
+            for &j in &valid {
+                let dx = features[j].x - feat.x;
+                let dy = features[j].y - feat.y;
+                let dist_sq = dx * dx + dy * dy;
+                let score = features[j].score.max(1.0);
+                ranked.push((dist_sq / score, j));
+            }
+            let kk = k.min(ranked.len());
+            if ranked.len() > kk {
+                ranked.select_nth_unstable_by(kk, |a, b| a.0.partial_cmp(&b.0).unwrap());
+                ranked.truncate(kk);
+            }
+
+            let mut best = matches[i].clone();
+            for &(_, j) in &ranked {
+                let init_rho = matches[j].inv_depth as f64;
+                let candidate = self.match_one_with_init(feat, cam0_pyramid, init_rho);
+                if candidate.matched && (!best.matched || candidate.residual < best.residual) {
+                    best = candidate;
+                }
+            }
+            matches[i] = best;
+        }
     }
 
     fn build_gradients(&mut self) {
@@ -235,6 +312,29 @@ impl StereoMatcher {
     }
 
     fn match_one(&self, feat: &Feature, cam0_pyramid: &Pyramid) -> StereoMatch {
+        let (bx, by) = self
+            .rig
+            .cam0
+            .normalize_undistorted(feat.x as f64, feat.y as f64);
+        let bearing = [bx, by, 1.0];
+        let (search_img, search_pad) = self.cam0_level(cam0_pyramid, 0);
+        let init_rho = self.search_initial_rho(
+            bearing,
+            feat,
+            search_img,
+            search_pad,
+            self.cam1_pyramid.level(0),
+            1.0,
+        );
+        self.match_one_with_init(feat, cam0_pyramid, init_rho)
+    }
+
+    fn match_one_with_init(
+        &self,
+        feat: &Feature,
+        cam0_pyramid: &Pyramid,
+        init_rho: f64,
+    ) -> StereoMatch {
         let fail = StereoMatch {
             id: feat.id,
             u1: 0.0,
@@ -269,15 +369,7 @@ impl StereoMatcher {
             return fail;
         }
 
-        let (search_img, search_pad) = self.cam0_level(cam0_pyramid, 0);
-        let mut rho = self.search_initial_rho(
-            bearing,
-            feat,
-            search_img,
-            search_pad,
-            self.cam1_pyramid.level(0),
-            1.0,
-        );
+        let mut rho = init_rho.clamp(rho_min, rho_max);
 
         for level in (0..n_levels).rev() {
             let scale = 1.0 / (1usize << level) as f64;

@@ -4,19 +4,20 @@
 // Reference: Nagy, Foehn, Scaramuzza — "Faster than FAST: GPU-Accelerated
 // Frontend for High-Speed VIO" (IROS 2020)
 
-pub mod image;
 pub mod camera;
 pub mod convert;
 pub mod convolution;
 pub mod essential;
 pub mod fast;
+pub mod frontend;
+pub mod gpu;
 pub mod gradient;
 pub mod harris;
 pub mod histeq;
+pub mod image;
 pub mod klt;
 pub mod nms;
 pub mod occupancy;
-pub mod frontend;
 pub mod pyramid;
+pub mod rigid_ransac;
 pub mod stereo;
-pub mod gpu;
