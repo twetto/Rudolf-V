@@ -281,12 +281,7 @@ impl StereoMatcher {
                     let i0 = bilerp_ptr(c0_r0, c0_r1, cam0_ix, k0.w00, k0.w10, k0.w01, k0.w11);
                     let i1 = bilerp_ptr(c1_r0, c1_r1, cam1_ix, k1.w00, k1.w10, k1.w01, k1.w11);
                     let r = (i1 - i0) as f64;
-                    let ar = r.abs();
-                    cost += if ar <= self.config.huber_delta {
-                        0.5 * r * r
-                    } else {
-                        self.config.huber_delta * (ar - 0.5 * self.config.huber_delta)
-                    };
+                    cost += 0.5 * r * r;
                 }
             }
         }
@@ -504,19 +499,13 @@ impl StereoMatcher {
                             let i_cam1 =
                                 bilerp_ptr(c1_r0, c1_r1, ix, k1.w00, k1.w10, k1.w01, k1.w11);
                             let r = (i_cam1 - t[p_idx]) as f64;
-                            let ar = r.abs();
-                            let w = if ar <= self.config.huber_delta {
-                                1.0
-                            } else {
-                                self.config.huber_delta / ar
-                            };
                             let txi = tx[p_idx] as f64;
                             let tyi = ty[p_idx] as f64;
-                            s_txr += w * txi * r;
-                            s_tyr += w * tyi * r;
-                            s_tx2 += w * txi * txi;
-                            s_txty += w * txi * tyi;
-                            s_ty2 += w * tyi * tyi;
+                            s_txr += txi * r;
+                            s_tyr += tyi * r;
+                            s_tx2 += txi * txi;
+                            s_txty += txi * tyi;
+                            s_ty2 += tyi * tyi;
                             n_valid += 1;
                             p_idx += 1;
                         }
