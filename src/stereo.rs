@@ -36,6 +36,113 @@ fn bilerp_key(x: f64, y: f64) -> BilerpKey {
 }
 
 #[inline(always)]
+fn bearing_norm(bearing: [f64; 3]) -> f64 {
+    (bearing[0] * bearing[0] + bearing[1] * bearing[1] + bearing[2] * bearing[2]).sqrt()
+}
+
+#[inline(always)]
+fn unit_bearing_and_norm(bearing: [f64; 3]) -> ([f64; 3], f64) {
+    let norm = bearing_norm(bearing);
+    (
+        [bearing[0] / norm, bearing[1] / norm, bearing[2] / norm],
+        norm,
+    )
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+enum StereoDepthParametrization {
+    InvDepth,
+    InvRange,
+    LogRange,
+}
+
+const MATCH_DEPTH_PARAM: StereoDepthParametrization = StereoDepthParametrization::LogRange;
+
+#[inline(always)]
+fn inv_depth_to_range(inv_depth: f64, bearing_norm: f64) -> f64 {
+    bearing_norm / inv_depth
+}
+
+#[inline(always)]
+fn range_to_inv_depth(range: f64, bearing_norm: f64) -> f64 {
+    bearing_norm / range
+}
+
+#[inline(always)]
+fn range_to_depth_param(param: StereoDepthParametrization, range: f64, bearing_norm: f64) -> f64 {
+    match param {
+        StereoDepthParametrization::InvDepth => range_to_inv_depth(range, bearing_norm),
+        StereoDepthParametrization::InvRange => 1.0 / range,
+        StereoDepthParametrization::LogRange => range.ln(),
+    }
+}
+
+#[inline(always)]
+fn depth_param_to_range(param: StereoDepthParametrization, value: f64, bearing_norm: f64) -> f64 {
+    match param {
+        StereoDepthParametrization::InvDepth => inv_depth_to_range(value, bearing_norm),
+        StereoDepthParametrization::InvRange => 1.0 / value,
+        StereoDepthParametrization::LogRange => value.exp(),
+    }
+}
+
+#[inline(always)]
+fn inv_depth_to_depth_param(
+    param: StereoDepthParametrization,
+    inv_depth: f64,
+    bearing_norm: f64,
+) -> f64 {
+    range_to_depth_param(
+        param,
+        inv_depth_to_range(inv_depth, bearing_norm),
+        bearing_norm,
+    )
+}
+
+#[inline(always)]
+fn depth_param_to_inv_depth(
+    param: StereoDepthParametrization,
+    value: f64,
+    bearing_norm: f64,
+) -> f64 {
+    range_to_inv_depth(
+        depth_param_to_range(param, value, bearing_norm),
+        bearing_norm,
+    )
+}
+
+#[inline(always)]
+fn depth_param_bounds(
+    param: StereoDepthParametrization,
+    min_inv_depth: f64,
+    max_inv_depth: f64,
+    bearing_norm: f64,
+) -> (f64, f64) {
+    let near = inv_depth_to_depth_param(param, max_inv_depth, bearing_norm);
+    let far = inv_depth_to_depth_param(param, min_inv_depth, bearing_norm);
+    if near < far {
+        (near, far)
+    } else {
+        (far, near)
+    }
+}
+
+#[inline(always)]
+fn range_derivative_wrt_depth_param(
+    param: StereoDepthParametrization,
+    value: f64,
+    range: f64,
+    bearing_norm: f64,
+) -> f64 {
+    match param {
+        StereoDepthParametrization::InvDepth => -bearing_norm / (value * value),
+        StereoDepthParametrization::InvRange => -1.0 / (value * value),
+        StereoDepthParametrization::LogRange => range,
+    }
+}
+
+#[inline(always)]
 unsafe fn accumulate_stereo_row_scalar(
     r0: *const f32,
     r1: *const f32,
@@ -274,7 +381,7 @@ impl Default for StereoConfig {
             pyramid_levels: 3,
             patch_half_size: 4,
             max_iterations: 5,
-            convergence_eps: 1e-3,
+            convergence_eps: 3e-3,
             min_inv_depth: 0.01,
             max_inv_depth: 5.0,
             init_inv_depth: 1.0 / 3.0,
@@ -404,6 +511,18 @@ impl StereoMatcher {
         if valid.is_empty() {
             return;
         }
+        let mut cached_depth_params = vec![0.0f64; features.len()];
+        for &i in &valid {
+            let (nx, ny) = self
+                .rig
+                .cam0
+                .normalize_undistorted(features[i].x as f64, features[i].y as f64);
+            cached_depth_params[i] = inv_depth_to_depth_param(
+                MATCH_DEPTH_PARAM,
+                matches[i].inv_depth as f64,
+                bearing_norm([nx, ny, 1.0]),
+            );
+        }
 
         // Rank neighbors by dist² / score: a strong-response neighbor pulls in
         // slightly farther than a close mediocre one. Score is FAST arc-sum, so
@@ -430,8 +549,8 @@ impl StereoMatcher {
 
             let mut best = matches[i].clone();
             for &(_, j) in &ranked {
-                let init_rho = matches[j].inv_depth as f64;
-                let candidate = self.match_one_with_init(feat, cam0_pyramid, init_rho);
+                let init_depth_param = cached_depth_params[j];
+                let candidate = self.match_one_with_init(feat, cam0_pyramid, init_depth_param);
                 if candidate.matched && (!best.matched || candidate.residual < best.residual) {
                     best = candidate;
                 }
@@ -456,8 +575,8 @@ impl StereoMatcher {
 
     fn patch_cost(
         &self,
-        bearing: [f64; 3],
-        rho: f64,
+        unit_bearing: [f64; 3],
+        range: f64,
         feat: &Feature,
         cam0_img: &Image<f32>,
         cam0_pad: f64,
@@ -465,7 +584,11 @@ impl StereoMatcher {
         scale: f64,
     ) -> Option<f64> {
         let half = self.config.patch_half_size as isize;
-        let p_cam0 = [bearing[0] / rho, bearing[1] / rho, bearing[2] / rho];
+        let p_cam0 = [
+            unit_bearing[0] * range,
+            unit_bearing[1] * range,
+            unit_bearing[2] * range,
+        ];
         let p_cam1 = self.rig.transform_point(p_cam0);
         let (u1_full, v1_full) = self.rig.cam1.project_point(p_cam1)?;
         let u1_s = u1_full * scale;
@@ -510,21 +633,29 @@ impl StereoMatcher {
         Some(cost)
     }
 
-    fn search_initial_rho(
+    fn search_initial_depth_param(
         &self,
-        bearing: [f64; 3],
+        unit_bearing: [f64; 3],
+        bearing_norm: f64,
         feat: &Feature,
         cam0_img: &Image<f32>,
         cam0_pad: f64,
         cam1_img: &Image<f32>,
         scale: f64,
     ) -> f64 {
-        let n = self.config.n_search_candidates.max(1);
-        let rho_min = self.config.min_inv_depth;
-        let rho_max = self.config.max_inv_depth;
-        let log_min = rho_min.ln();
-        let log_max = rho_max.ln();
-        let mut best_rho = self.config.init_inv_depth;
+        let init_depth_param =
+            inv_depth_to_depth_param(MATCH_DEPTH_PARAM, self.config.init_inv_depth, bearing_norm);
+        let n = self.config.n_search_candidates;
+        if n == 0 {
+            return init_depth_param;
+        }
+        let (param_min, param_max) = depth_param_bounds(
+            MATCH_DEPTH_PARAM,
+            self.config.min_inv_depth,
+            self.config.max_inv_depth,
+            bearing_norm,
+        );
+        let mut best_depth_param = init_depth_param.clamp(param_min, param_max);
         let mut best_cost = f64::INFINITY;
         for i in 0..n {
             let a = if n > 1 {
@@ -532,17 +663,24 @@ impl StereoMatcher {
             } else {
                 0.5
             };
-            let rho = (log_min + (log_max - log_min) * a).exp();
-            if let Some(cost) =
-                self.patch_cost(bearing, rho, feat, cam0_img, cam0_pad, cam1_img, scale)
-            {
+            let depth_param = param_min + (param_max - param_min) * a;
+            let range = depth_param_to_range(MATCH_DEPTH_PARAM, depth_param, bearing_norm);
+            if let Some(cost) = self.patch_cost(
+                unit_bearing,
+                range,
+                feat,
+                cam0_img,
+                cam0_pad,
+                cam1_img,
+                scale,
+            ) {
                 if cost < best_cost {
                     best_cost = cost;
-                    best_rho = rho;
+                    best_depth_param = depth_param;
                 }
             }
         }
-        best_rho
+        best_depth_param
     }
 
     fn match_one(&mut self, feat: &Feature, cam0_pyramid: &Pyramid) -> StereoMatch {
@@ -551,23 +689,25 @@ impl StereoMatcher {
             .cam0
             .normalize_undistorted(feat.x as f64, feat.y as f64);
         let bearing = [bx, by, 1.0];
+        let (unit_bearing, norm) = unit_bearing_and_norm(bearing);
         let (search_img, search_pad) = self.cam0_level(cam0_pyramid, 0);
-        let init_rho = self.search_initial_rho(
-            bearing,
+        let init_depth_param = self.search_initial_depth_param(
+            unit_bearing,
+            norm,
             feat,
             search_img,
             search_pad,
             self.cam1_pyramid.level(0),
             1.0,
         );
-        self.match_one_with_init(feat, cam0_pyramid, init_rho)
+        self.match_one_with_init(feat, cam0_pyramid, init_depth_param)
     }
 
     fn match_one_with_init(
         &mut self,
         feat: &Feature,
         cam0_pyramid: &Pyramid,
-        init_rho: f64,
+        init_depth_param: f64,
     ) -> StereoMatch {
         let fail = StereoMatch {
             id: feat.id,
@@ -583,9 +723,14 @@ impl StereoMatcher {
             .cam0
             .normalize_undistorted(feat.x as f64, feat.y as f64);
         let bearing = [bx, by, 1.0];
+        let (unit_bearing, norm) = unit_bearing_and_norm(bearing);
 
-        let rho_min = self.config.min_inv_depth;
-        let rho_max = self.config.max_inv_depth;
+        let (depth_param_min, depth_param_max) = depth_param_bounds(
+            MATCH_DEPTH_PARAM,
+            self.config.min_inv_depth,
+            self.config.max_inv_depth,
+            norm,
+        );
         let half = self.config.patch_half_size as isize;
 
         let n_levels = self
@@ -603,12 +748,12 @@ impl StereoMatcher {
             return fail;
         }
 
-        let mut rho = init_rho.clamp(rho_min, rho_max);
+        let mut depth_param = init_depth_param.clamp(depth_param_min, depth_param_max);
 
         // Inverse-compositional GN: precompute the template (cam0) patch and its
         // gradients once per level, then each iteration only samples cam1 at the
-        // warped position. The warp Jacobian (du/dρ, dv/dρ) is still re-evaluated
-        // at the current ρ — strict IC for projective warps is approximate, but
+        // warped position. The warp Jacobian is still re-evaluated at the current
+        // depth parameter — strict IC for projective warps is approximate, but
         // staying inside the coarse-to-fine basin keeps convergence well-behaved.
         let inner_side = 2 * half as usize;
         let ext_side = inner_side + 2;
@@ -675,10 +820,15 @@ impl StereoMatcher {
             }
 
             for _ in 0..self.config.max_iterations {
-                if rho <= 0.0 {
+                let range = depth_param_to_range(MATCH_DEPTH_PARAM, depth_param, norm);
+                if range <= 0.0 {
                     return fail;
                 }
-                let p_cam0 = [bearing[0] / rho, bearing[1] / rho, bearing[2] / rho];
+                let p_cam0 = [
+                    unit_bearing[0] * range,
+                    unit_bearing[1] * range,
+                    unit_bearing[2] * range,
+                ];
                 let p_cam1 = self.rig.transform_point(p_cam0);
                 let Some((u1_full, v1_full)) = self.rig.cam1.project_point(p_cam1) else {
                     return fail;
@@ -694,20 +844,21 @@ impl StereoMatcher {
                     return fail;
                 }
 
-                let rho_sq = rho * rho;
-                let db_drho = self.rig.rotate([
-                    -bearing[0] / rho_sq,
-                    -bearing[1] / rho_sq,
-                    -bearing[2] / rho_sq,
+                let drange_dparam =
+                    range_derivative_wrt_depth_param(MATCH_DEPTH_PARAM, depth_param, range, norm);
+                let db_dparam = self.rig.rotate([
+                    unit_bearing[0] * drange_dparam,
+                    unit_bearing[1] * drange_dparam,
+                    unit_bearing[2] * drange_dparam,
                 ]);
                 let j_proj = self.rig.cam1.projection_jacobian(p_cam1);
-                let du_drho = (j_proj[0][0] * db_drho[0]
-                    + j_proj[0][1] * db_drho[1]
-                    + j_proj[0][2] * db_drho[2])
+                let du_dparam = (j_proj[0][0] * db_dparam[0]
+                    + j_proj[0][1] * db_dparam[1]
+                    + j_proj[0][2] * db_dparam[2])
                     * scale;
-                let dv_drho = (j_proj[1][0] * db_drho[0]
-                    + j_proj[1][1] * db_drho[1]
-                    + j_proj[1][2] * db_drho[2])
+                let dv_dparam = (j_proj[1][0] * db_dparam[0]
+                    + j_proj[1][1] * db_dparam[1]
+                    + j_proj[1][2] * db_dparam[2])
                     * scale;
 
                 let k1 = bilerp_key(u1_s, v1_s);
@@ -740,28 +891,34 @@ impl StereoMatcher {
                     }
                 }
 
-                let grad_sum = du_drho * s_txr + dv_drho * s_tyr;
-                let hess_sum = du_drho * du_drho * s_tx2
-                    + 2.0 * du_drho * dv_drho * s_txty
-                    + dv_drho * dv_drho * s_ty2;
+                let grad_sum = du_dparam * s_txr + dv_dparam * s_tyr;
+                let hess_sum = du_dparam * du_dparam * s_tx2
+                    + 2.0 * du_dparam * dv_dparam * s_txty
+                    + dv_dparam * dv_dparam * s_ty2;
 
                 if hess_sum < 1e-12 || n_valid == 0 {
                     return fail;
                 }
 
-                let delta_rho = -grad_sum / hess_sum;
-                rho = (rho + delta_rho).clamp(rho_min, rho_max);
+                let delta_depth_param = -grad_sum / hess_sum;
+                depth_param =
+                    (depth_param + delta_depth_param).clamp(depth_param_min, depth_param_max);
 
-                if delta_rho.abs() < self.config.convergence_eps {
+                if delta_depth_param.abs() < self.config.convergence_eps {
                     break;
                 }
             }
         }
 
-        if rho <= 0.0 {
+        let range = depth_param_to_range(MATCH_DEPTH_PARAM, depth_param, norm);
+        if range <= 0.0 {
             return fail;
         }
-        let p_cam0 = [bearing[0] / rho, bearing[1] / rho, bearing[2] / rho];
+        let p_cam0 = [
+            unit_bearing[0] * range,
+            unit_bearing[1] * range,
+            unit_bearing[2] * range,
+        ];
         let p_cam1 = self.rig.transform_point(p_cam0);
         let Some((u1, v1)) = self.rig.cam1.project_point(p_cam1) else {
             return fail;
@@ -816,7 +973,7 @@ impl StereoMatcher {
             id: feat.id,
             u1: u1 as f32,
             v1: v1 as f32,
-            inv_depth: rho as f32,
+            inv_depth: depth_param_to_inv_depth(MATCH_DEPTH_PARAM, depth_param, norm) as f32,
             residual: mean_residual,
             matched: mean_residual <= self.config.max_residual,
         }
