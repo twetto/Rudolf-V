@@ -1442,7 +1442,7 @@ fn mean_abs_patch_residual(
 /// # Safety
 /// Caller must ensure `ix + 1` is a valid offset from both `r0` and `r1`.
 #[inline(always)]
-unsafe fn bilerp_ptr(
+pub(crate) unsafe fn bilerp_ptr(
     r0: *const f32,
     r1: *const f32,
     ix: usize,

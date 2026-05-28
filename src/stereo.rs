@@ -1,8 +1,39 @@
 use crate::camera::StereoRig;
 use crate::fast::Feature;
 use crate::histeq::{self, HistEqMethod};
-use crate::image::{interpolate_bilinear, Image};
+use crate::image::{interpolate_bilinear_unchecked, Image};
+use crate::klt::bilerp_ptr;
 use crate::pyramid::{Pyramid, PyramidScratch};
+
+/// Precomputed bilinear corner weights and base integer coords for a (x, y)
+/// sample whose fractional part is shared across an entire patch sweep.
+#[derive(Clone, Copy)]
+struct BilerpKey {
+    x0: isize,
+    y0: isize,
+    w00: f32,
+    w10: f32,
+    w01: f32,
+    w11: f32,
+}
+
+#[inline(always)]
+fn bilerp_key(x: f64, y: f64) -> BilerpKey {
+    let x0 = x as isize;
+    let y0 = y as isize;
+    let fx = (x - x0 as f64) as f32;
+    let fy = (y - y0 as f64) as f32;
+    let one_fx = 1.0 - fx;
+    let one_fy = 1.0 - fy;
+    BilerpKey {
+        x0,
+        y0,
+        w00: one_fx * one_fy,
+        w10: fx * one_fy,
+        w01: one_fx * fy,
+        w11: fx * fy,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct StereoConfig {
@@ -66,18 +97,31 @@ impl StereoMatch {
     }
 }
 
+/// Maximum supported patch_half_size in StereoConfig. Template buffers are
+/// stack-allocated using these caps so the matcher avoids per-feature heap
+/// traffic; bumping these allocates more stack per `match_one_with_init` call.
+const MAX_PATCH_HALF: usize = 8;
+const MAX_INNER_SIDE: usize = 2 * MAX_PATCH_HALF;
+const MAX_INNER_PIXELS: usize = MAX_INNER_SIDE * MAX_INNER_SIDE;
+const MAX_EXT_SIDE: usize = MAX_INNER_SIDE + 2;
+const MAX_EXT_PIXELS: usize = MAX_EXT_SIDE * MAX_EXT_SIDE;
+
 pub struct StereoMatcher {
     rig: StereoRig,
     config: StereoConfig,
     cam1_pyramid: Pyramid,
     pyr_scratch: PyramidScratch,
     histeq_buf: Image<u8>,
-    grad_x: Vec<Image<f32>>,
-    grad_y: Vec<Image<f32>>,
 }
 
 impl StereoMatcher {
     pub fn new(rig: StereoRig, config: StereoConfig, img_w: usize, img_h: usize) -> Self {
+        assert!(
+            config.patch_half_size <= MAX_PATCH_HALF,
+            "patch_half_size {} exceeds MAX_PATCH_HALF {}",
+            config.patch_half_size,
+            MAX_PATCH_HALF,
+        );
         let cam1_pyramid =
             Pyramid::build(&Image::<u8>::new(img_w, img_h), config.pyramid_levels, 1.0);
         let pyr_scratch = PyramidScratch::new(img_w, img_h, 1.0);
@@ -87,8 +131,6 @@ impl StereoMatcher {
             cam1_pyramid,
             pyr_scratch,
             histeq_buf: Image::new(img_w, img_h),
-            grad_x: Vec::new(),
-            grad_y: Vec::new(),
         }
     }
 
@@ -111,8 +153,6 @@ impl StereoMatcher {
 
         self.cam1_pyramid
             .build_reuse(src, self.config.pyramid_levels, &mut self.pyr_scratch);
-
-        self.build_gradients();
 
         let mut matches: Vec<StereoMatch> = cam0_features
             .iter()
@@ -178,38 +218,6 @@ impl StereoMatcher {
         }
     }
 
-    fn build_gradients(&mut self) {
-        let n = self.cam1_pyramid.num_levels();
-        self.grad_x.resize_with(n, || Image::new(1, 1));
-        self.grad_y.resize_with(n, || Image::new(1, 1));
-        self.grad_x.truncate(n);
-        self.grad_y.truncate(n);
-
-        for level in 0..n {
-            let img = self.cam1_pyramid.level(level);
-            let w = img.width();
-            let h = img.height();
-            let mut gx = vec![0.0f32; w * h];
-            let mut gy = vec![0.0f32; w * h];
-            if w >= 3 {
-                for y in 0..h {
-                    for x in 1..w - 1 {
-                        gx[y * w + x] = 0.5 * (img.get(x + 1, y) - img.get(x - 1, y));
-                    }
-                }
-            }
-            if h >= 3 {
-                for y in 1..h - 1 {
-                    for x in 0..w {
-                        gy[y * w + x] = 0.5 * (img.get(x, y + 1) - img.get(x, y - 1));
-                    }
-                }
-            }
-            self.grad_x[level] = Image::from_vec(w, h, gx);
-            self.grad_y[level] = Image::from_vec(w, h, gy);
-        }
-    }
-
     fn cam0_level<'a>(&self, cam0_pyramid: &'a Pyramid, level: usize) -> (&'a Image<f32>, f64) {
         if level == 0 {
             return (cam0_pyramid.level(0), 0.0);
@@ -247,30 +255,39 @@ impl StereoMatcher {
             || v1_s - half as f64 <= 0.0
             || u1_s + half as f64 >= (cam1_img.width() - 1) as f64
             || v1_s + half as f64 >= (cam1_img.height() - 1) as f64
+            || u0_s - half as f64 <= 0.0
+            || v0_s - half as f64 <= 0.0
+            || u0_s + half as f64 >= (cam0_img.width() - 1) as f64
+            || v0_s + half as f64 >= (cam0_img.height() - 1) as f64
         {
             return None;
         }
 
+        let k0 = bilerp_key(u0_s, v0_s);
+        let k1 = bilerp_key(u1_s, v1_s);
         let mut cost = 0.0f64;
         for dy in -half..half {
-            for dx in -half..half {
-                let i0 = interpolate_bilinear(
-                    cam0_img,
-                    (u0_s + dx as f64) as f32,
-                    (v0_s + dy as f64) as f32,
-                );
-                let i1 = interpolate_bilinear(
-                    cam1_img,
-                    (u1_s + dx as f64) as f32,
-                    (v1_s + dy as f64) as f32,
-                );
-                let r = (i1 - i0) as f64;
-                let ar = r.abs();
-                cost += if ar <= self.config.huber_delta {
-                    0.5 * r * r
-                } else {
-                    self.config.huber_delta * (ar - 0.5 * self.config.huber_delta)
-                };
+            // SAFETY: u*_s ± half are inside [0, w-1] / [0, h-1] per the bounds check above.
+            let cam0_y = (k0.y0 + dy) as usize;
+            let cam1_y = (k1.y0 + dy) as usize;
+            unsafe {
+                let c0_r0 = cam0_img.row_ptr(cam0_y);
+                let c0_r1 = cam0_img.row_ptr(cam0_y + 1);
+                let c1_r0 = cam1_img.row_ptr(cam1_y);
+                let c1_r1 = cam1_img.row_ptr(cam1_y + 1);
+                for dx in -half..half {
+                    let cam0_ix = (k0.x0 + dx) as usize;
+                    let cam1_ix = (k1.x0 + dx) as usize;
+                    let i0 = bilerp_ptr(c0_r0, c0_r1, cam0_ix, k0.w00, k0.w10, k0.w01, k0.w11);
+                    let i1 = bilerp_ptr(c1_r0, c1_r1, cam1_ix, k1.w00, k1.w10, k1.w01, k1.w11);
+                    let r = (i1 - i0) as f64;
+                    let ar = r.abs();
+                    cost += if ar <= self.config.huber_delta {
+                        0.5 * r * r
+                    } else {
+                        self.config.huber_delta * (ar - 0.5 * self.config.huber_delta)
+                    };
+                }
             }
         }
         Some(cost)
@@ -371,22 +388,64 @@ impl StereoMatcher {
 
         let mut rho = init_rho.clamp(rho_min, rho_max);
 
+        // Inverse-compositional GN: precompute the template (cam0) patch and its
+        // gradients once per level, then each iteration only samples cam1 at the
+        // warped position. The warp Jacobian (du/dρ, dv/dρ) is still re-evaluated
+        // at the current ρ — strict IC for projective warps is approximate, but
+        // staying inside the coarse-to-fine basin keeps convergence well-behaved.
+        let inner_side = 2 * half as usize;
+        let ext_side = inner_side + 2;
+        let mut t_ext = [0.0f32; MAX_EXT_PIXELS];
+        let mut t = [0.0f32; MAX_INNER_PIXELS];
+        let mut tx = [0.0f32; MAX_INNER_PIXELS];
+        let mut ty = [0.0f32; MAX_INNER_PIXELS];
+
         for level in (0..n_levels).rev() {
             let scale = 1.0 / (1usize << level) as f64;
             let (cam0_img, cam0_pad) = self.cam0_level(cam0_pyramid, level);
             let cam1_img = self.cam1_pyramid.level(level);
-            let gx_img = &self.grad_x[level];
-            let gy_img = &self.grad_y[level];
 
             let u0_s = feat.x as f64 * scale + cam0_pad;
             let v0_s = feat.y as f64 * scale + cam0_pad;
 
-            if u0_s - half as f64 <= 0.0
-                || v0_s - half as f64 <= 0.0
-                || u0_s + half as f64 >= (cam0_img.width() - 1) as f64
-                || v0_s + half as f64 >= (cam0_img.height() - 1) as f64
+            // Bounds: we sample a (2*half + 2) × (2*half + 2) extended patch on
+            // cam0 to get central-difference gradients for the inner 8×8 patch.
+            let half_ext = half as f64 + 1.0;
+            if u0_s - half_ext <= 0.0
+                || v0_s - half_ext <= 0.0
+                || u0_s + half_ext >= (cam0_img.width() - 1) as f64
+                || v0_s + half_ext >= (cam0_img.height() - 1) as f64
             {
                 return fail;
+            }
+
+            // Sample the extended cam0 patch once.
+            let k0 = bilerp_key(u0_s, v0_s);
+            for ey in 0..ext_side {
+                let dy = ey as isize - half - 1;
+                let cam0_y = (k0.y0 + dy) as usize;
+                // SAFETY: row + 1 in bounds per the (half + 1) check above.
+                unsafe {
+                    let r0 = cam0_img.row_ptr(cam0_y);
+                    let r1 = cam0_img.row_ptr(cam0_y + 1);
+                    for ex in 0..ext_side {
+                        let dx = ex as isize - half - 1;
+                        let ix = (k0.x0 + dx) as usize;
+                        t_ext[ey * ext_side + ex] =
+                            bilerp_ptr(r0, r1, ix, k0.w00, k0.w10, k0.w01, k0.w11);
+                    }
+                }
+            }
+
+            // Extract template + central-difference gradients for the inner patch.
+            for iy in 0..inner_side {
+                for ix in 0..inner_side {
+                    let e = (iy + 1) * ext_side + (ix + 1);
+                    let inner_idx = iy * inner_side + ix;
+                    t[inner_idx] = t_ext[e];
+                    tx[inner_idx] = 0.5 * (t_ext[e + 1] - t_ext[e - 1]);
+                    ty[inner_idx] = 0.5 * (t_ext[e + ext_side] - t_ext[e - ext_side]);
+                }
             }
 
             for _ in 0..self.config.max_iterations {
@@ -425,35 +484,49 @@ impl StereoMatcher {
                     + j_proj[1][2] * db_drho[2])
                     * scale;
 
-                let mut grad_sum = 0.0f64;
-                let mut hess_sum = 0.0f64;
+                let k1 = bilerp_key(u1_s, v1_s);
+                let mut s_txr = 0.0f64;
+                let mut s_tyr = 0.0f64;
+                let mut s_tx2 = 0.0f64;
+                let mut s_txty = 0.0f64;
+                let mut s_ty2 = 0.0f64;
                 let mut n_valid = 0usize;
 
+                let mut p_idx = 0usize;
                 for dy in -half..half {
-                    for dx in -half..half {
-                        let cx = u0_s + dx as f64;
-                        let cy = v0_s + dy as f64;
-                        let rx = u1_s + dx as f64;
-                        let ry = v1_s + dy as f64;
-
-                        let i_cam0 = interpolate_bilinear(cam0_img, cx as f32, cy as f32);
-                        let i_cam1 = interpolate_bilinear(cam1_img, rx as f32, ry as f32);
-                        let gx = interpolate_bilinear(gx_img, rx as f32, ry as f32);
-                        let gy = interpolate_bilinear(gy_img, rx as f32, ry as f32);
-
-                        let jac = gx as f64 * du_drho + gy as f64 * dv_drho;
-                        let r = i_cam1 as f64 - i_cam0 as f64;
-                        let ar = r.abs();
-                        let weight = if ar <= self.config.huber_delta {
-                            1.0
-                        } else {
-                            self.config.huber_delta / ar
-                        };
-                        grad_sum += weight * jac * r;
-                        hess_sum += weight * jac * jac;
-                        n_valid += 1;
+                    let cam1_y = (k1.y0 + dy) as usize;
+                    // SAFETY: u1_s ± half within cam1 bounds per check above.
+                    unsafe {
+                        let c1_r0 = cam1_img.row_ptr(cam1_y);
+                        let c1_r1 = cam1_img.row_ptr(cam1_y + 1);
+                        for dx in -half..half {
+                            let ix = (k1.x0 + dx) as usize;
+                            let i_cam1 =
+                                bilerp_ptr(c1_r0, c1_r1, ix, k1.w00, k1.w10, k1.w01, k1.w11);
+                            let r = (i_cam1 - t[p_idx]) as f64;
+                            let ar = r.abs();
+                            let w = if ar <= self.config.huber_delta {
+                                1.0
+                            } else {
+                                self.config.huber_delta / ar
+                            };
+                            let txi = tx[p_idx] as f64;
+                            let tyi = ty[p_idx] as f64;
+                            s_txr += w * txi * r;
+                            s_tyr += w * tyi * r;
+                            s_tx2 += w * txi * txi;
+                            s_txty += w * txi * tyi;
+                            s_ty2 += w * tyi * tyi;
+                            n_valid += 1;
+                            p_idx += 1;
+                        }
                     }
                 }
+
+                let grad_sum = du_drho * s_txr + dv_drho * s_tyr;
+                let hess_sum = du_drho * du_drho * s_tx2
+                    + 2.0 * du_drho * dv_drho * s_txty
+                    + dv_drho * dv_drho * s_ty2;
 
                 if hess_sum < 1e-12 || n_valid == 0 {
                     return fail;
@@ -496,9 +569,21 @@ impl StereoMatcher {
         let mut n = 0usize;
         for dy in -half..half {
             for dx in -half..half {
-                let i0 = interpolate_bilinear(cam0_l0, feat.x + dx as f32, feat.y + dy as f32);
-                let i1 =
-                    interpolate_bilinear(cam1_l0, u1 as f32 + dx as f32, v1 as f32 + dy as f32);
+                // SAFETY: feat ± half and (u1, v1) ± half validated against level-0 dims above.
+                let (i0, i1) = unsafe {
+                    (
+                        interpolate_bilinear_unchecked(
+                            cam0_l0,
+                            feat.x + dx as f32,
+                            feat.y + dy as f32,
+                        ),
+                        interpolate_bilinear_unchecked(
+                            cam1_l0,
+                            u1 as f32 + dx as f32,
+                            v1 as f32 + dy as f32,
+                        ),
+                    )
+                };
                 residual_sum += (i1 - i0).abs() as f64;
                 n += 1;
             }
@@ -524,6 +609,7 @@ impl StereoMatcher {
 mod tests {
     use super::*;
     use crate::camera::CameraIntrinsics;
+    use crate::image::interpolate_bilinear;
 
     fn make_stereo_rig_simple() -> StereoRig {
         let cam0 = CameraIntrinsics::new(500.0, 500.0, 320.0, 240.0, 640, 480);
