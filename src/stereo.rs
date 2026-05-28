@@ -5,6 +5,9 @@ use crate::image::Image;
 use crate::klt::bilerp_ptr;
 use crate::pyramid::{Pyramid, PyramidScratch};
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 /// Precomputed bilinear corner weights and base integer coords for a (x, y)
 /// sample whose fractional part is shared across an entire patch sweep.
 #[derive(Clone, Copy)]
@@ -433,10 +436,6 @@ pub struct StereoMatcher {
     cam1_pyramid: Pyramid,
     pyr_scratch: PyramidScratch,
     histeq_buf: Image<u8>,
-    t_ext: [f32; MAX_EXT_PIXELS],
-    t: [f32; MAX_INNER_PIXELS],
-    tx: [f32; MAX_INNER_PIXELS],
-    ty: [f32; MAX_INNER_PIXELS],
 }
 
 impl StereoMatcher {
@@ -456,10 +455,6 @@ impl StereoMatcher {
             cam1_pyramid,
             pyr_scratch,
             histeq_buf: Image::new(img_w, img_h),
-            t_ext: [0.0; MAX_EXT_PIXELS],
-            t: [0.0; MAX_INNER_PIXELS],
-            tx: [0.0; MAX_INNER_PIXELS],
-            ty: [0.0; MAX_INNER_PIXELS],
         }
     }
 
@@ -473,30 +468,42 @@ impl StereoMatcher {
         cam0_features: &[Feature],
         cam0_pyramid: &Pyramid,
     ) -> Vec<StereoMatch> {
-        let src = if self.config.histeq == HistEqMethod::None {
-            cam1_image
-        } else {
-            histeq::apply_histeq_into(cam1_image, self.config.histeq, &mut self.histeq_buf);
-            &self.histeq_buf
-        };
+        {
+            let src = if self.config.histeq == HistEqMethod::None {
+                cam1_image
+            } else {
+                histeq::apply_histeq_into(cam1_image, self.config.histeq, &mut self.histeq_buf);
+                &self.histeq_buf
+            };
+            self.cam1_pyramid
+                .build_reuse(src, self.config.pyramid_levels, &mut self.pyr_scratch);
+        }
 
-        self.cam1_pyramid
-            .build_reuse(src, self.config.pyramid_levels, &mut self.pyr_scratch);
+        // No more mutation needed; reborrow as shared so per-feature work can
+        // run in parallel without aliasing.
+        let this: &Self = &*self;
 
+        #[cfg(feature = "parallel")]
         let mut matches: Vec<StereoMatch> = cam0_features
-            .iter()
-            .map(|feat| self.match_one(feat, cam0_pyramid))
+            .par_iter()
+            .map(|feat| this.match_one(feat, cam0_pyramid))
             .collect();
 
-        if self.config.knn_propagation > 0 {
-            self.propagate_knn(&mut matches, cam0_features, cam0_pyramid);
+        #[cfg(not(feature = "parallel"))]
+        let mut matches: Vec<StereoMatch> = cam0_features
+            .iter()
+            .map(|feat| this.match_one(feat, cam0_pyramid))
+            .collect();
+
+        if this.config.knn_propagation > 0 {
+            this.propagate_knn(&mut matches, cam0_features, cam0_pyramid);
         }
 
         matches
     }
 
     fn propagate_knn(
-        &mut self,
+        &self,
         matches: &mut [StereoMatch],
         features: &[Feature],
         cam0_pyramid: &Pyramid,
@@ -527,13 +534,11 @@ impl StereoMatcher {
         // Rank neighbors by dist² / score: a strong-response neighbor pulls in
         // slightly farther than a close mediocre one. Score is FAST arc-sum, so
         // always non-negative; clamp to >= 1 to avoid divide-by-zero / domination.
-        let mut ranked: Vec<(f32, usize)> = Vec::with_capacity(valid.len());
-        for i in 0..features.len() {
-            if matches[i].matched {
-                continue;
-            }
+        let failed: Vec<usize> = (0..features.len()).filter(|&i| !matches[i].matched).collect();
+
+        let compute_update = |&i: &usize| -> (usize, StereoMatch) {
             let feat = &features[i];
-            ranked.clear();
+            let mut ranked: Vec<(f32, usize)> = Vec::with_capacity(valid.len());
             for &j in &valid {
                 let dx = features[j].x - feat.x;
                 let dy = features[j].y - feat.y;
@@ -555,7 +560,17 @@ impl StereoMatcher {
                     best = candidate;
                 }
             }
-            matches[i] = best;
+            (i, best)
+        };
+
+        #[cfg(feature = "parallel")]
+        let updates: Vec<(usize, StereoMatch)> = failed.par_iter().map(compute_update).collect();
+
+        #[cfg(not(feature = "parallel"))]
+        let updates: Vec<(usize, StereoMatch)> = failed.iter().map(compute_update).collect();
+
+        for (i, m) in updates {
+            matches[i] = m;
         }
     }
 
@@ -683,7 +698,7 @@ impl StereoMatcher {
         best_depth_param
     }
 
-    fn match_one(&mut self, feat: &Feature, cam0_pyramid: &Pyramid) -> StereoMatch {
+    fn match_one(&self, feat: &Feature, cam0_pyramid: &Pyramid) -> StereoMatch {
         let (bx, by) = self
             .rig
             .cam0
@@ -704,11 +719,17 @@ impl StereoMatcher {
     }
 
     fn match_one_with_init(
-        &mut self,
+        &self,
         feat: &Feature,
         cam0_pyramid: &Pyramid,
         init_depth_param: f64,
     ) -> StereoMatch {
+        // Per-call stack scratch — small (~4 KB) and avoids aliasing across
+        // rayon worker threads when the `parallel` feature is enabled.
+        let mut t_ext = [0.0f32; MAX_EXT_PIXELS];
+        let mut t = [0.0f32; MAX_INNER_PIXELS];
+        let mut tx = [0.0f32; MAX_INNER_PIXELS];
+        let mut ty = [0.0f32; MAX_INNER_PIXELS];
         let fail = StereoMatch {
             id: feat.id,
             u1: 0.0,
@@ -789,7 +810,7 @@ impl StereoMatcher {
                     for ex in 0..ext_side {
                         let dx = ex as isize - half - 1;
                         let ix = (k0.x0 + dx) as usize;
-                        self.t_ext[ey * ext_side + ex] =
+                        t_ext[ey * ext_side + ex] =
                             bilerp_ptr(r0, r1, ix, k0.w00, k0.w10, k0.w01, k0.w11);
                     }
                 }
@@ -800,10 +821,9 @@ impl StereoMatcher {
                 for ix in 0..inner_side {
                     let e = (iy + 1) * ext_side + (ix + 1);
                     let inner_idx = iy * inner_side + ix;
-                    self.t[inner_idx] = self.t_ext[e];
-                    self.tx[inner_idx] = 0.5 * (self.t_ext[e + 1] - self.t_ext[e - 1]);
-                    self.ty[inner_idx] =
-                        0.5 * (self.t_ext[e + ext_side] - self.t_ext[e - ext_side]);
+                    t[inner_idx] = t_ext[e];
+                    tx[inner_idx] = 0.5 * (t_ext[e + 1] - t_ext[e - 1]);
+                    ty[inner_idx] = 0.5 * (t_ext[e + ext_side] - t_ext[e - ext_side]);
                 }
             }
 
@@ -812,8 +832,8 @@ impl StereoMatcher {
             let mut s_txty = 0.0f64;
             let mut s_ty2 = 0.0f64;
             for i in 0..n_patch {
-                let txi = self.tx[i] as f64;
-                let tyi = self.ty[i] as f64;
+                let txi = tx[i] as f64;
+                let tyi = ty[i] as f64;
                 s_tx2 += txi * txi;
                 s_txty += txi * tyi;
                 s_ty2 += tyi * tyi;
@@ -881,9 +901,9 @@ impl StereoMatcher {
                             ix0,
                             inner_side,
                             k1,
-                            &self.t[row_start..row_start + inner_side],
-                            &self.tx[row_start..row_start + inner_side],
-                            &self.ty[row_start..row_start + inner_side],
+                            &t[row_start..row_start + inner_side],
+                            &tx[row_start..row_start + inner_side],
+                            &ty[row_start..row_start + inner_side],
                         );
                         s_txr += row_txr;
                         s_tyr += row_tyr;
