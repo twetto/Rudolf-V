@@ -6,6 +6,12 @@
 // Usage:
 //     cargo run --example euroc_stereo --release -- /path/to/V2_01_easy
 //     cargo run --example euroc_stereo --release -- /path/to/V2_01_easy 200
+//
+// Env vars:
+//     RUDOLF_DETECTOR    — "fast" / "shi-tomasi" / "harris" (default: fast)
+//     RUDOLF_FAST_THRESH — FAST threshold              (default: 20)
+//     RUDOLF_SHI_THRESH  — Shi-Tomasi floor            (default: 0)
+//     RUDOLF_SHI_BLOCK   — Shi-Tomasi tensor half-size (default: 2)
 
 use rudolf_v::camera::{CameraIntrinsics, StereoRig};
 use rudolf_v::fast::Feature;
@@ -52,6 +58,33 @@ fn list_euroc_images(cam_dir: &Path) -> Vec<PathBuf> {
         .collect();
     files.sort();
     files
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_detector() -> DetectorType {
+    match std::env::var("RUDOLF_DETECTOR")
+        .unwrap_or_else(|_| "fast".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "shi" | "shi-tomasi" | "shitomasi" | "st" => DetectorType::ShiTomasi,
+        "harris" => DetectorType::Harris,
+        _ => DetectorType::Fast,
+    }
+}
+
+fn detector_label(detector: DetectorType) -> &'static str {
+    match detector {
+        DetectorType::Fast => "fast",
+        DetectorType::ShiTomasi => "shi-tomasi",
+        DetectorType::Harris => "harris",
+    }
 }
 
 fn main() {
@@ -111,10 +144,28 @@ fn main() {
 
     let camera = Some(CameraIntrinsics::from_euroc_yaml(&cam0_dir.join("sensor.yaml")).unwrap());
 
+    let detector = env_detector();
+    let fast_threshold: u8 = std::env::var("RUDOLF_FAST_THRESH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    let shi_tomasi_threshold = std::env::var("RUDOLF_SHI_THRESH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0);
+    let shi_tomasi_block_size = env_usize("RUDOLF_SHI_BLOCK", 2);
+
+    println!(
+        "Frontend detector: {} (fast_thresh={fast_threshold} shi_thresh={shi_tomasi_threshold:.1} shi_block={shi_tomasi_block_size})\n",
+        detector_label(detector)
+    );
+
     let frontend_config = FrontendConfig {
-        detector: DetectorType::Fast,
-        fast_threshold: 20,
+        detector,
+        fast_threshold,
         fast_arc_length: 9,
+        shi_tomasi_threshold,
+        shi_tomasi_block_size,
         max_features: 200,
         cell_size: 32,
         pyramid_levels: 3,

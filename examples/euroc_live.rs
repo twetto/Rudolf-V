@@ -264,9 +264,9 @@ fn main() {
         if window.is_key_pressed(Key::D, minifb::KeyRepeat::No) {
             let next = match frontend.detector() {
                 DetectorType::Fast => DetectorType::ShiTomasi,
-                DetectorType::ShiTomasi => DetectorType::Fast,
-                // DetectorType::Harris => DetectorType::Fast,
-                DetectorType::Harris => DetectorType::Harris,
+                // DetectorType::ShiTomasi => DetectorType::Fast,
+                DetectorType::ShiTomasi => DetectorType::Harris,
+                DetectorType::Harris => DetectorType::Fast,
             };
             frontend.set_detector(next);
             println!("Detector: {}", detector_label(next));
