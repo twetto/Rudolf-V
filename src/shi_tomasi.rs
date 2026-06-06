@@ -995,6 +995,31 @@ fn collect_row_5(
         debug_assert!(cell_idx < cell_winners.len());
         let winner = unsafe { cell_winners.get_unchecked_mut(cell_idx) };
 
+        #[cfg(target_arch = "x86_64")]
+        {
+            let min_score = winner
+                .as_ref()
+                .map_or(threshold, |prev| prev.score.max(threshold));
+            if x_start + 8 <= x_end && std::arch::is_x86_feature_detected!("avx2") {
+                if let Some((score, x)) = unsafe {
+                    collect_cell_5_avx2(
+                        x_start, x_end, row0, row1, row2, row3, row4, k0, k1, k2, k3, k4, tmp_xx,
+                        tmp_yy, tmp_xy, min_score,
+                    )
+                } {
+                    *winner = Some(Feature {
+                        x: x as f32,
+                        y: y as f32,
+                        score,
+                        level: 0,
+                        id: 0,
+                        descriptor: 0,
+                    });
+                }
+                continue;
+            }
+        }
+
         for x in x_start..x_end {
             let i0 = row0 + x;
             let i1 = row1 + x;
@@ -1043,6 +1068,161 @@ fn collect_row_5(
             }
         }
     }
+}
+
+#[cfg(all(target_arch = "x86_64", not(feature = "parallel")))]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn collect_cell_5_avx2(
+    x_start: usize,
+    x_end: usize,
+    row0: usize,
+    row1: usize,
+    row2: usize,
+    row3: usize,
+    row4: usize,
+    k0: f32,
+    k1: f32,
+    k2: f32,
+    k3: f32,
+    k4: f32,
+    tmp_xx: &[f32],
+    tmp_yy: &[f32],
+    tmp_xy: &[f32],
+    min_score: f32,
+) -> Option<(f32, usize)> {
+    use std::arch::x86_64::*;
+
+    let xx_ptr = tmp_xx.as_ptr();
+    let yy_ptr = tmp_yy.as_ptr();
+    let xy_ptr = tmp_xy.as_ptr();
+
+    let k0v = _mm256_set1_ps(k0);
+    let k1v = _mm256_set1_ps(k1);
+    let k2v = _mm256_set1_ps(k2);
+    let k3v = _mm256_set1_ps(k3);
+    let k4v = _mm256_set1_ps(k4);
+    let four = _mm256_set1_ps(4.0);
+    let half = _mm256_set1_ps(0.5);
+    let zero = _mm256_setzero_ps();
+
+    let mut best_score = _mm256_set1_ps(min_score);
+    let mut best_x = _mm256_set1_epi32(-1);
+    let lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+
+    let mut x = x_start;
+    while x + 8 <= x_end {
+        let base_x = _mm256_add_epi32(_mm256_set1_epi32(x as i32), lane);
+
+        let xx = {
+            let a0 = _mm256_loadu_ps(xx_ptr.add(row0 + x));
+            let a1 = _mm256_loadu_ps(xx_ptr.add(row1 + x));
+            let a2 = _mm256_loadu_ps(xx_ptr.add(row2 + x));
+            let a3 = _mm256_loadu_ps(xx_ptr.add(row3 + x));
+            let a4 = _mm256_loadu_ps(xx_ptr.add(row4 + x));
+            _mm256_add_ps(
+                _mm256_add_ps(_mm256_mul_ps(a0, k0v), _mm256_mul_ps(a1, k1v)),
+                _mm256_add_ps(
+                    _mm256_mul_ps(a2, k2v),
+                    _mm256_add_ps(_mm256_mul_ps(a3, k3v), _mm256_mul_ps(a4, k4v)),
+                ),
+            )
+        };
+        let yy = {
+            let a0 = _mm256_loadu_ps(yy_ptr.add(row0 + x));
+            let a1 = _mm256_loadu_ps(yy_ptr.add(row1 + x));
+            let a2 = _mm256_loadu_ps(yy_ptr.add(row2 + x));
+            let a3 = _mm256_loadu_ps(yy_ptr.add(row3 + x));
+            let a4 = _mm256_loadu_ps(yy_ptr.add(row4 + x));
+            _mm256_add_ps(
+                _mm256_add_ps(_mm256_mul_ps(a0, k0v), _mm256_mul_ps(a1, k1v)),
+                _mm256_add_ps(
+                    _mm256_mul_ps(a2, k2v),
+                    _mm256_add_ps(_mm256_mul_ps(a3, k3v), _mm256_mul_ps(a4, k4v)),
+                ),
+            )
+        };
+        let xy = {
+            let a0 = _mm256_loadu_ps(xy_ptr.add(row0 + x));
+            let a1 = _mm256_loadu_ps(xy_ptr.add(row1 + x));
+            let a2 = _mm256_loadu_ps(xy_ptr.add(row2 + x));
+            let a3 = _mm256_loadu_ps(xy_ptr.add(row3 + x));
+            let a4 = _mm256_loadu_ps(xy_ptr.add(row4 + x));
+            _mm256_add_ps(
+                _mm256_add_ps(_mm256_mul_ps(a0, k0v), _mm256_mul_ps(a1, k1v)),
+                _mm256_add_ps(
+                    _mm256_mul_ps(a2, k2v),
+                    _mm256_add_ps(_mm256_mul_ps(a3, k3v), _mm256_mul_ps(a4, k4v)),
+                ),
+            )
+        };
+
+        let trace = _mm256_add_ps(xx, yy);
+        let diff = _mm256_sub_ps(xx, yy);
+        let discr = _mm256_sqrt_ps(_mm256_max_ps(
+            _mm256_add_ps(
+                _mm256_mul_ps(diff, diff),
+                _mm256_mul_ps(four, _mm256_mul_ps(xy, xy)),
+            ),
+            zero,
+        ));
+        let score = _mm256_mul_ps(half, _mm256_sub_ps(trace, discr));
+        let replace = _mm256_cmp_ps(score, best_score, _CMP_GT_OQ);
+
+        best_score = _mm256_blendv_ps(best_score, score, replace);
+        best_x = _mm256_castps_si256(_mm256_blendv_ps(
+            _mm256_castsi256_ps(best_x),
+            _mm256_castsi256_ps(base_x),
+            replace,
+        ));
+
+        x += 8;
+    }
+
+    let mut scores = [0.0f32; 8];
+    let mut xs = [0i32; 8];
+    _mm256_storeu_ps(scores.as_mut_ptr(), best_score);
+    _mm256_storeu_si256(xs.as_mut_ptr() as *mut __m256i, best_x);
+
+    let mut out_score = min_score;
+    let mut out_x = usize::MAX;
+    for lane in 0..8 {
+        if xs[lane] >= 0 && scores[lane] > out_score {
+            out_score = scores[lane];
+            out_x = xs[lane] as usize;
+        }
+    }
+
+    while x < x_end {
+        let i0 = row0 + x;
+        let i1 = row1 + x;
+        let i2 = row2 + x;
+        let i3 = row3 + x;
+        let i4 = row4 + x;
+        let xx = *tmp_xx.get_unchecked(i0) * k0
+            + *tmp_xx.get_unchecked(i1) * k1
+            + *tmp_xx.get_unchecked(i2) * k2
+            + *tmp_xx.get_unchecked(i3) * k3
+            + *tmp_xx.get_unchecked(i4) * k4;
+        let yy = *tmp_yy.get_unchecked(i0) * k0
+            + *tmp_yy.get_unchecked(i1) * k1
+            + *tmp_yy.get_unchecked(i2) * k2
+            + *tmp_yy.get_unchecked(i3) * k3
+            + *tmp_yy.get_unchecked(i4) * k4;
+        let xy = *tmp_xy.get_unchecked(i0) * k0
+            + *tmp_xy.get_unchecked(i1) * k1
+            + *tmp_xy.get_unchecked(i2) * k2
+            + *tmp_xy.get_unchecked(i3) * k3
+            + *tmp_xy.get_unchecked(i4) * k4;
+        let score = min_eigenvalue_2x2(xx, yy, xy);
+        if score > out_score {
+            out_score = score;
+            out_x = x;
+        }
+        x += 1;
+    }
+
+    (out_x != usize::MAX).then_some((out_score, out_x))
 }
 
 fn blur_tensor_cols_collect(
