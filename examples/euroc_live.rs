@@ -15,10 +15,11 @@
 //   +/-    — speed up/slow down
 //   T      — toggle track trails
 //   F      — toggle flow arrows
+//   D      — toggle FAST / Shi-Tomasi detector
 
 use rudolf_v::camera::CameraIntrinsics;
 use rudolf_v::essential::RansacConfig;
-use rudolf_v::frontend::{Frontend, FrontendConfig, TrackMeta, LbpPolicy};
+use rudolf_v::frontend::{DetectorType, Frontend, FrontendConfig, TrackMeta};
 use rudolf_v::histeq::HistEqMethod;
 use rudolf_v::image::Image;
 use rudolf_v::klt::LkMethod;
@@ -69,6 +70,14 @@ impl MetaView {
             MetaView::KltQuality => "klt-quality",
             MetaView::LbpDistance => "lbp-distance",
         }
+    }
+}
+
+fn detector_label(detector: DetectorType) -> &'static str {
+    match detector {
+        DetectorType::Fast => "FAST",
+        DetectorType::ShiTomasi => "Shi-Tomasi",
+        DetectorType::Harris => "Harris",
     }
 }
 
@@ -210,7 +219,7 @@ fn main() {
     let mut last_frame_time = Instant::now();
 
     println!(
-        "\nControls: Space=pause, S=step, Q/Esc=quit, +/-=speed, T=trails, F=flow, H=histeq, M=metadata\n"
+        "\nControls: Space=pause, S=step, Q/Esc=quit, +/-=speed, T=trails, F=flow, H=histeq, D=detector, M=metadata\n"
     );
 
     while window.is_open() && !window.is_key_down(Key::Escape) && !window.is_key_down(Key::Q) {
@@ -238,7 +247,8 @@ fn main() {
             let next = match frontend.histeq() {
                 HistEqMethod::None => HistEqMethod::Global,
                 HistEqMethod::Global => HistEqMethod::Clahe {
-                    tile_size: 64,
+                    // tile_size: 64,
+                    tile_size: 256,
                     clip_limit: 4.0,
                 },
                 HistEqMethod::Clahe { .. } => HistEqMethod::None,
@@ -250,6 +260,16 @@ fn main() {
                 HistEqMethod::Clahe { .. } => "CLAHE",
             };
             println!("HistEq: {}", label);
+        }
+        if window.is_key_pressed(Key::D, minifb::KeyRepeat::No) {
+            let next = match frontend.detector() {
+                DetectorType::Fast => DetectorType::ShiTomasi,
+                DetectorType::ShiTomasi => DetectorType::Fast,
+                // DetectorType::Harris => DetectorType::Fast,
+                DetectorType::Harris => DetectorType::Harris,
+            };
+            frontend.set_detector(next);
+            println!("Detector: {}", detector_label(next));
         }
         if window.is_key_pressed(Key::Equal, minifb::KeyRepeat::No)
             || window.is_key_pressed(Key::NumPadPlus, minifb::KeyRepeat::No)
@@ -372,8 +392,9 @@ fn main() {
             draw_rect(&mut fb, win_w, win_h, 0, 0, win_w, 14, 0x222222);
             // Simple: just print to stdout since bitmap text is painful.
             print!(
-                "\r{:5}: trk={:<3} lost={:<3} rej={:<3} new={:<3} tot={:<3} | score={:.2} klt={:.2} lbp={:.1}/{:<2} view={} | {}  ",
+                "\r{:5}: det={} trk={:<3} lost={:<3} rej={:<3} new={:<3} tot={:<3} | score={:.2} klt={:.2} lbp={:.1}/{:<2} view={} | {}  ",
                 frame_idx,
+                detector_label(frontend.detector()),
                 stats.tracked,
                 stats.lost,
                 stats.rejected,

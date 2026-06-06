@@ -14,6 +14,10 @@
 //     RUDOLF_CELL      — occupancy cell size   (default: 32)
 //     RUDOLF_HISTEQ    — "none" / "standard"   (default: none)
 //     RUDOLF_KLT       — "fa" / "ic"           (default: ic)
+//     RUDOLF_DETECTOR  — "fast" / "shi-tomasi" / "harris" (default: fast)
+//     RUDOLF_FAST_THRESH       — FAST threshold             (default: 20)
+//     RUDOLF_SHI_THRESH        — Shi-Tomasi floor           (default: 0)
+//     RUDOLF_SHI_BLOCK         — Shi-Tomasi tensor half-size(default: 2)
 
 use rudolf_v::camera::CameraIntrinsics;
 use rudolf_v::frontend::{DetectorType, FrameStats, Frontend, FrontendConfig, LbpPolicy};
@@ -94,6 +98,26 @@ fn env_klt_method() -> LkMethod {
     }
 }
 
+fn env_detector() -> DetectorType {
+    match std::env::var("RUDOLF_DETECTOR")
+        .unwrap_or_else(|_| "fast".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "shi" | "shi-tomasi" | "shitomasi" | "st" => DetectorType::ShiTomasi,
+        "harris" => DetectorType::Harris,
+        _ => DetectorType::Fast,
+    }
+}
+
+fn detector_label(detector: DetectorType) -> &'static str {
+    match detector {
+        DetectorType::Fast => "fast",
+        DetectorType::ShiTomasi => "shi-tomasi",
+        DetectorType::Harris => "harris",
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -133,17 +157,25 @@ fn main() {
     let cell_size = env_usize("RUDOLF_CELL", 32);
     let histeq = env_histeq();
     let klt_method = env_klt_method();
+    let detector = env_detector();
     let camera = load_camera(&data_dir);
 
     let fast_threshold: u8 = std::env::var("RUDOLF_FAST_THRESH")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(20);
+    let shi_tomasi_threshold = std::env::var("RUDOLF_SHI_THRESH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0);
+    let shi_tomasi_block_size = env_usize("RUDOLF_SHI_BLOCK", 2);
 
     let config = FrontendConfig {
-        detector: DetectorType::Fast,
+        detector,
         fast_threshold,
         fast_arc_length: 9,
+        shi_tomasi_threshold,
+        shi_tomasi_block_size,
         max_features,
         cell_size,
         pyramid_levels: pyr_levels,
@@ -159,13 +191,15 @@ fn main() {
     };
 
     println!(
-        "Config: features={max_features} cell={cell_size} levels={pyr_levels} \
-              window={klt_window} histeq={histeq:?} klt={klt_method:?}"
+        "Config: detector={} features={max_features} cell={cell_size} levels={pyr_levels} \
+              window={klt_window} histeq={histeq:?} klt={klt_method:?} \
+              fast_thresh={fast_threshold} shi_thresh={shi_tomasi_threshold:.1} shi_block={shi_tomasi_block_size}",
+        detector_label(detector)
     );
 
     let w = frames[0].width();
     let h = frames[0].height();
-    let mut frontend = Frontend::new(config, w, h);
+    let mut frontend = Frontend::new(config.clone(), w, h);
 
     // Warmup.
     let warmup = 5.min(num_frames);
@@ -183,24 +217,7 @@ fn main() {
     let t_run = Instant::now();
 
     // Re-create frontend for clean state.
-    let config2 = FrontendConfig {
-        detector: DetectorType::Fast,
-        fast_threshold,
-        fast_arc_length: 9,
-        max_features,
-        cell_size,
-        pyramid_levels: pyr_levels,
-        pyramid_sigma: 1.0,
-        klt_window,
-        klt_max_iter: 30,
-        klt_epsilon: 0.01,
-        klt_method,
-        histeq: env_histeq(),
-        camera: load_camera(&data_dir),
-        lbp_policy: LbpPolicy::HardReject,
-        ..FrontendConfig::default()
-    };
-    frontend = Frontend::new(config2, w, h);
+    frontend = Frontend::new(config, w, h);
 
     let mut run_hasher = DefaultHasher::new();
     for (i, frame) in frames.iter().enumerate() {
@@ -266,9 +283,6 @@ fn main() {
         "─────", "────", "───", "───", "──────"
     );
 
-    let mut total_mean = 0.0f32;
-    let mut total_min = f32::MAX;
-    let mut total_max = 0.0f32;
     let mut total_vals: Vec<f32> = all_stats.iter().map(|s| s.timing.total_ms()).collect();
     total_vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
@@ -283,11 +297,6 @@ fn main() {
             "  {:16} {:>7.2}ms {:>7.2}ms {:>7.2}ms {:>7.2}ms",
             name, mean, min, max, median
         );
-
-        if *name != "histeq" {
-            // Track non-histeq for total reference.
-            total_mean += mean;
-        }
     }
 
     let t_mean: f32 = total_vals.iter().sum::<f32>() / total_vals.len() as f32;

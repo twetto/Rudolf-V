@@ -45,8 +45,12 @@ fn five_frame_sequence() {
 
         println!(
             "Frame {i}: tracked={}, lost={}, new={}, total={}, cells={}/{}",
-            stats.tracked, stats.lost, stats.new_detections,
-            stats.total, stats.occupied_cells, stats.total_cells,
+            stats.tracked,
+            stats.lost,
+            stats.new_detections,
+            stats.total,
+            stats.occupied_cells,
+            stats.total_cells,
         );
 
         if i == 0 {
@@ -125,6 +129,26 @@ fn harris_frontend_works() {
     frontend.process(&img1);
     let (_, stats) = frontend.process(&img2);
     assert!(stats.tracked > 0, "Harris frontend should track: {stats:?}");
+}
+
+#[test]
+fn shi_tomasi_frontend_works() {
+    let config = FrontendConfig {
+        detector: DetectorType::ShiTomasi,
+        max_features: 30,
+        ..Default::default()
+    };
+    let mut frontend = Frontend::new(config, 160, 120);
+
+    let img1 = make_scene(0, 0);
+    let img2 = make_scene(2, 1);
+
+    frontend.process(&img1);
+    let (_, stats) = frontend.process(&img2);
+    assert!(
+        stats.tracked > 0,
+        "Shi-Tomasi frontend should track: {stats:?}"
+    );
 }
 
 #[test]

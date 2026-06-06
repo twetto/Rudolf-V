@@ -31,12 +31,14 @@ use crate::klt::{KltScratch, KltTracker, LkMethod, TrackStatus, TrackedFeature};
 use crate::nms::OccupancyNms;
 use crate::occupancy::OccupancyGrid;
 use crate::pyramid::{Pyramid, PyramidScratch};
+use crate::shi_tomasi::{ShiTomasiDetector, ShiTomasiScratch};
 
 /// Which corner detector to use.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DetectorType {
     Fast,
     Harris,
+    ShiTomasi,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,6 +148,12 @@ impl Detector for FastDetector {
 impl Detector for HarrisDetector {
     fn detect(&self, image: &Image<u8>) -> Vec<Feature> {
         HarrisDetector::detect(self, image)
+    }
+}
+
+impl Detector for ShiTomasiDetector {
+    fn detect(&self, image: &Image<u8>) -> Vec<Feature> {
+        ShiTomasiDetector::detect(self, image)
     }
 }
 
@@ -438,6 +446,13 @@ pub struct FrontendConfig {
     pub harris_threshold: f32,
     /// Harris block size.
     pub harris_block_size: usize,
+    /// Shi-Tomasi minimum eigenvalue floor.
+    ///
+    /// This should usually stay near zero. Occupancy NMS and coarse tile
+    /// top-N selection decide which weak texture regions get represented.
+    pub shi_tomasi_threshold: f32,
+    /// Shi-Tomasi structure tensor block size.
+    pub shi_tomasi_block_size: usize,
     /// Reservoir capacity: maximum number of tracked features.
     pub max_features: usize,
     /// Occupancy grid / NMS cell size in pixels.
@@ -499,6 +514,8 @@ impl Default for FrontendConfig {
             harris_k: 0.04,
             harris_threshold: 1e6,
             harris_block_size: 2,
+            shi_tomasi_threshold: 0.0,
+            shi_tomasi_block_size: 2,
             max_features: 200,
             cell_size: 16,
             coarse_tile_cols: 8,
@@ -548,6 +565,8 @@ pub struct Frontend {
     track_results: Vec<TrackedFeature>,
     /// Scratch buffers for KLT IC precompute + iteration (avoids per-feature alloc).
     klt_scratch: KltScratch,
+    /// Scratch buffers for dense Shi-Tomasi detection.
+    shi_tomasi_scratch: ShiTomasiScratch,
     /// Next feature ID to assign. Monotonically increasing.
     next_id: u64,
     /// Occupancy grid for spatial distribution.
@@ -632,6 +651,7 @@ impl Frontend {
         let grid = OccupancyGrid::new(img_w, img_h, config.cell_size);
         let pyr_scratch = PyramidScratch::new(img_w, img_h, config.pyramid_sigma);
         let klt_scratch = KltScratch::new(config.klt_window);
+        let shi_tomasi_scratch = ShiTomasiScratch::new(img_w, img_h);
         let pad_border = if config.klt_method == LkMethod::InverseCompositional {
             config.klt_window + 2
         } else {
@@ -659,6 +679,7 @@ impl Frontend {
             prev_features: Vec::new(),
             track_results: Vec::new(),
             klt_scratch,
+            shi_tomasi_scratch,
             next_id: 1,
             grid,
             img_w,
@@ -936,6 +957,22 @@ impl Frontend {
                         .filter(|f| !self.grid.is_occupied(f.x, f.y))
                         .collect()
                 }
+                DetectorType::ShiTomasi => {
+                    // Dense score image + post-filter path. The expensive
+                    // part is embarrassingly parallel and maps cleanly to GPU:
+                    // tensor products, separable blur, per-pixel min eigenvalue.
+                    let det = ShiTomasiDetector::new(
+                        self.config.shi_tomasi_threshold,
+                        self.config.shi_tomasi_block_size,
+                    );
+                    det.detect_unoccupied_cell_nms(
+                        input,
+                        self.grid.grid_cells(),
+                        self.grid.grid_cols(),
+                        self.grid.cell_size(),
+                        &mut self.shi_tomasi_scratch,
+                    )
+                }
             };
 
             // NMS on new detections only, then take up to slots_available.
@@ -1102,6 +1139,19 @@ impl Frontend {
     /// Change the histogram equalization method at runtime.
     pub fn set_histeq(&mut self, method: HistEqMethod) {
         self.config.histeq = method;
+    }
+
+    /// Get the active feature detector used for new detections.
+    pub fn detector(&self) -> DetectorType {
+        self.config.detector
+    }
+
+    /// Change the detector used for replenishing tracks.
+    ///
+    /// Existing tracks are not dropped; the new detector is used the next time
+    /// `process()` needs to add new features.
+    pub fn set_detector(&mut self, detector: DetectorType) {
+        self.config.detector = detector;
     }
 }
 
