@@ -898,44 +898,83 @@ fn collect_row_5_cell_row(
     let row3 = (y + 1) * w;
     let row4 = (y + 2) * w;
 
-    for x in border..(w - border) {
-        let cell_col = x / cell_size;
-        if cell_col >= row_winners.len() {
-            continue;
-        }
+    let x_limit = w - border;
+    let first_cell_col = border / cell_size;
+    let last_cell_col = x_limit.div_ceil(cell_size).min(row_winners.len());
+    #[cfg(target_arch = "x86_64")]
+    let avx2 = std::arch::is_x86_feature_detected!("avx2");
+
+    for cell_col in first_cell_col..last_cell_col {
         if !grid.is_empty() && cell_col < grid_cols && grid[grid_row + cell_col] {
             continue;
         }
 
-        let i0 = row0 + x;
-        let i1 = row1 + x;
-        let i2 = row2 + x;
-        let i3 = row3 + x;
-        let i4 = row4 + x;
-        let xx =
-            tmp_xx[i0] * k0 + tmp_xx[i1] * k1 + tmp_xx[i2] * k2 + tmp_xx[i3] * k3 + tmp_xx[i4] * k4;
-        let yy =
-            tmp_yy[i0] * k0 + tmp_yy[i1] * k1 + tmp_yy[i2] * k2 + tmp_yy[i3] * k3 + tmp_yy[i4] * k4;
-        let xy =
-            tmp_xy[i0] * k0 + tmp_xy[i1] * k1 + tmp_xy[i2] * k2 + tmp_xy[i3] * k3 + tmp_xy[i4] * k4;
+        let x_start = border.max(cell_col * cell_size);
+        let x_end = x_limit.min((cell_col + 1) * cell_size);
+        let winner = &mut row_winners[cell_col];
 
-        let score = min_eigenvalue_2x2(xx, yy, xy);
-        if score <= threshold {
-            continue;
+        #[cfg(target_arch = "x86_64")]
+        {
+            let min_score = winner
+                .as_ref()
+                .map_or(threshold, |prev| prev.score.max(threshold));
+            if avx2 && x_start + 8 <= x_end {
+                if let Some((score, x)) = unsafe {
+                    collect_cell_5_avx2(
+                        x_start, x_end, row0, row1, row2, row3, row4, k0, k1, k2, k3, k4, tmp_xx,
+                        tmp_yy, tmp_xy, min_score,
+                    )
+                } {
+                    *winner = Some(Feature {
+                        x: x as f32,
+                        y: y as f32,
+                        score,
+                        level: 0,
+                        id: 0,
+                        descriptor: 0,
+                    });
+                }
+                continue;
+            }
         }
 
-        if row_winners[cell_col]
-            .as_ref()
-            .map_or(true, |prev| score > prev.score)
-        {
-            row_winners[cell_col] = Some(Feature {
-                x: x as f32,
-                y: y as f32,
-                score,
-                level: 0,
-                id: 0,
-                descriptor: 0,
-            });
+        for x in x_start..x_end {
+            let i0 = row0 + x;
+            let i1 = row1 + x;
+            let i2 = row2 + x;
+            let i3 = row3 + x;
+            let i4 = row4 + x;
+            let xx = tmp_xx[i0] * k0
+                + tmp_xx[i1] * k1
+                + tmp_xx[i2] * k2
+                + tmp_xx[i3] * k3
+                + tmp_xx[i4] * k4;
+            let yy = tmp_yy[i0] * k0
+                + tmp_yy[i1] * k1
+                + tmp_yy[i2] * k2
+                + tmp_yy[i3] * k3
+                + tmp_yy[i4] * k4;
+            let xy = tmp_xy[i0] * k0
+                + tmp_xy[i1] * k1
+                + tmp_xy[i2] * k2
+                + tmp_xy[i3] * k3
+                + tmp_xy[i4] * k4;
+
+            let score = min_eigenvalue_2x2(xx, yy, xy);
+            if score <= threshold {
+                continue;
+            }
+
+            if winner.as_ref().map_or(true, |prev| score > prev.score) {
+                *winner = Some(Feature {
+                    x: x as f32,
+                    y: y as f32,
+                    score,
+                    level: 0,
+                    id: 0,
+                    descriptor: 0,
+                });
+            }
         }
     }
 }
@@ -983,6 +1022,8 @@ fn collect_row_5(
     let x_limit = w - border;
     let first_cell_col = border / cell_size;
     let last_cell_col = x_limit.div_ceil(cell_size).min(cell_cols);
+    #[cfg(target_arch = "x86_64")]
+    let avx2 = std::arch::is_x86_feature_detected!("avx2");
 
     for cell_col in first_cell_col..last_cell_col {
         if !grid.is_empty() && cell_col < grid_cols && grid[grid_row + cell_col] {
@@ -1000,7 +1041,7 @@ fn collect_row_5(
             let min_score = winner
                 .as_ref()
                 .map_or(threshold, |prev| prev.score.max(threshold));
-            if x_start + 8 <= x_end && std::arch::is_x86_feature_detected!("avx2") {
+            if avx2 && x_start + 8 <= x_end {
                 if let Some((score, x)) = unsafe {
                     collect_cell_5_avx2(
                         x_start, x_end, row0, row1, row2, row3, row4, k0, k1, k2, k3, k4, tmp_xx,
@@ -1070,7 +1111,7 @@ fn collect_row_5(
     }
 }
 
-#[cfg(all(target_arch = "x86_64", not(feature = "parallel")))]
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn collect_cell_5_avx2(
