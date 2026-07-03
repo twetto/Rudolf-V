@@ -99,9 +99,15 @@ pub fn eight_point(correspondences: &[Correspondence]) -> Option<[[f64; 3]; 3]> 
         let (x2, y2) = apply_transform(&t2, c.x2, c.y2);
 
         let a = SVector::<f64, 9>::from_column_slice(&[
-            x2 * x1, x2 * y1, x2,
-            y2 * x1, y2 * y1, y2,
-            x1,      y1,      1.0,
+            x2 * x1,
+            x2 * y1,
+            x2,
+            y2 * x1,
+            y2 * y1,
+            y2,
+            x1,
+            y1,
+            1.0,
         ]);
 
         // Accumulate outer product: M += a * a^T
@@ -188,9 +194,8 @@ pub fn estimate_essential_ransac(
 
         // Sample 8 random correspondences.
         let sample = random_sample_8(&mut rng, n);
-        let sample_corrs: Vec<Correspondence> = sample.iter()
-            .map(|&i| correspondences[i])
-            .collect();
+        let sample_corrs: Vec<Correspondence> =
+            sample.iter().map(|&i| correspondences[i]).collect();
 
         // Estimate E from the 8-point sample.
         let e = match eight_point(&sample_corrs) {
@@ -229,7 +234,8 @@ pub fn estimate_essential_ransac(
     }
 
     // Refit on all inliers for a better estimate.
-    let inlier_corrs: Vec<Correspondence> = correspondences.iter()
+    let inlier_corrs: Vec<Correspondence> = correspondences
+        .iter()
         .zip(best_inliers.iter())
         .filter(|(_, &is_inlier)| is_inlier)
         .map(|(c, _)| *c)
@@ -286,8 +292,7 @@ pub fn sampson_distance(e: &[[f64; 3]; 3], c: &Correspondence) -> f64 {
     // Epipolar constraint: x2^T * E * x1
     let num = dot3(&x2, &ex1);
 
-    let denom = ex1[0] * ex1[0] + ex1[1] * ex1[1]
-              + et_x2[0] * et_x2[0] + et_x2[1] * et_x2[1];
+    let denom = ex1[0] * ex1[0] + ex1[1] * ex1[1] + et_x2[0] * et_x2[0] + et_x2[1] * et_x2[1];
 
     if denom < 1e-30 {
         return f64::MAX;
@@ -303,6 +308,92 @@ pub fn epipolar_error(e: &[[f64; 3]; 3], c: &Correspondence) -> f64 {
     let x2 = [c.x2, c.y2, 1.0];
     let ex1 = mat3_vec3(e, &x1);
     dot3(&x2, &ex1)
+}
+
+/// Essential matrix from a known relative-pose prior: E = [t]x * R, where
+/// (R, t) map previous-frame points into the current frame (x2 ~ R x1 + t).
+/// t is normalized internally (E is scale-free). Returns None when the
+/// baseline is degenerate (||t|| ~ 0): with no translation the epipolar
+/// constraint carries no information, so gating against E is meaningless.
+pub fn essential_from_pose(r: &[[f64; 3]; 3], t: &[f64; 3]) -> Option<[[f64; 3]; 3]> {
+    let norm = (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt();
+    if norm < 1e-9 {
+        return None;
+    }
+    let tn = [t[0] / norm, t[1] / norm, t[2] / norm];
+    let tx = [
+        [0.0, -tn[2], tn[1]],
+        [tn[2], 0.0, -tn[0]],
+        [-tn[1], tn[0], 0.0],
+    ];
+    let mut e = [[0.0f64; 3]; 3];
+    for (i, row) in e.iter_mut().enumerate() {
+        for (j, out) in row.iter_mut().enumerate() {
+            *out = tx[i][0] * r[0][j] + tx[i][1] * r[1][j] + tx[i][2] * r[2][j];
+        }
+    }
+    Some(e)
+}
+
+/// Classify correspondences against a prior essential matrix, with an optional
+/// consensus refit — the hypothesize->consensus->refit loop of
+/// `estimate_essential_ransac`, but with the (externally supplied) prior as the
+/// single hypothesis instead of random 8-point samples. The prior needs no
+/// estimation, so it cannot be corrupted by contamination and does not
+/// degenerate under rotation-dominant motion.
+///
+/// `refine`: refit `eight_point` on the prior's inliers and KEEP THE REFIT ONLY
+/// IF IT INCREASES THE INLIER COUNT. The refit re-estimates E purely from image
+/// data — exactly what degenerates at low parallax — so the guard lets it
+/// polish the prior (e.g. the VIO's translation-direction error) where parallax
+/// supports it, and discards it where it would degrade.
+///
+/// `threshold` is squared Sampson distance in normalized coords (same
+/// units/convention as `RansacConfig::threshold`).
+pub fn epipolar_inliers_with_prior(
+    e_prior: &[[f64; 3]; 3],
+    correspondences: &[Correspondence],
+    threshold: f64,
+    refine: bool,
+) -> EssentialResult {
+    let classify = |e: &[[f64; 3]; 3]| {
+        let inliers: Vec<bool> = correspondences
+            .iter()
+            .map(|c| sampson_distance(e, c) < threshold)
+            .collect();
+        let num = inliers.iter().filter(|&&b| b).count();
+        (inliers, num)
+    };
+    let (inliers, num_inliers) = classify(e_prior);
+
+    if refine && num_inliers >= 8 {
+        let inlier_corrs: Vec<Correspondence> = correspondences
+            .iter()
+            .zip(inliers.iter())
+            .filter(|(_, &keep)| keep)
+            .map(|(c, _)| *c)
+            .collect();
+        if let Some(e_refit) = eight_point(&inlier_corrs) {
+            let (inliers_r, num_r) = classify(&e_refit);
+            if num_r > num_inliers {
+                return EssentialResult {
+                    e: e_refit,
+                    inliers: inliers_r,
+                    num_inliers: num_r,
+                    total: correspondences.len(),
+                    iterations: 1,
+                };
+            }
+        }
+    }
+
+    EssentialResult {
+        e: *e_prior,
+        inliers,
+        num_inliers,
+        total: correspondences.len(),
+        iterations: 0,
+    }
 }
 
 // ============================================================
@@ -324,11 +415,15 @@ fn hartley_transforms(corrs: &[Correspondence]) -> (NormTransform, NormTransform
     let (mut mx1, mut my1) = (0.0, 0.0);
     let (mut mx2, mut my2) = (0.0, 0.0);
     for c in corrs {
-        mx1 += c.x1; my1 += c.y1;
-        mx2 += c.x2; my2 += c.y2;
+        mx1 += c.x1;
+        my1 += c.y1;
+        mx2 += c.x2;
+        my2 += c.y2;
     }
-    mx1 /= n; my1 /= n;
-    mx2 /= n; my2 /= n;
+    mx1 /= n;
+    my1 /= n;
+    mx2 /= n;
+    my2 /= n;
 
     // Mean distances from centroid.
     let mut d1 = 0.0;
@@ -340,12 +435,28 @@ fn hartley_transforms(corrs: &[Correspondence]) -> (NormTransform, NormTransform
     d1 /= n;
     d2 /= n;
 
-    let s1 = if d1 > 1e-15 { std::f64::consts::SQRT_2 / d1 } else { 1.0 };
-    let s2 = if d2 > 1e-15 { std::f64::consts::SQRT_2 / d2 } else { 1.0 };
+    let s1 = if d1 > 1e-15 {
+        std::f64::consts::SQRT_2 / d1
+    } else {
+        1.0
+    };
+    let s2 = if d2 > 1e-15 {
+        std::f64::consts::SQRT_2 / d2
+    } else {
+        1.0
+    };
 
     (
-        NormTransform { tx: mx1, ty: my1, scale: s1 },
-        NormTransform { tx: mx2, ty: my2, scale: s2 },
+        NormTransform {
+            tx: mx1,
+            ty: my1,
+            scale: s1,
+        },
+        NormTransform {
+            tx: mx2,
+            ty: my2,
+            scale: s2,
+        },
     )
 }
 
@@ -496,9 +607,11 @@ mod tests {
         let e = eight_point(&corrs).expect("8-point should succeed");
 
         // With noise, errors should be small but not zero.
-        let mean_err: f64 = corrs.iter()
+        let mean_err: f64 = corrs
+            .iter()
             .map(|c| epipolar_error(&e, c).abs())
-            .sum::<f64>() / corrs.len() as f64;
+            .sum::<f64>()
+            / corrs.len() as f64;
         assert!(mean_err < 1e-3, "mean epipolar error too large: {mean_err}");
     }
 
@@ -509,8 +622,8 @@ mod tests {
 
         // E should be rank 2: det(E) should be ~0.
         let det = e[0][0] * (e[1][1] * e[2][2] - e[1][2] * e[2][1])
-                - e[0][1] * (e[1][0] * e[2][2] - e[1][2] * e[2][0])
-                + e[0][2] * (e[1][0] * e[2][1] - e[1][1] * e[2][0]);
+            - e[0][1] * (e[1][0] * e[2][2] - e[1][2] * e[2][0])
+            + e[0][2] * (e[1][0] * e[2][1] - e[1][1] * e[2][0]);
         assert!(det.abs() < 1e-6, "E should be rank-2, det = {det}");
     }
 
@@ -533,14 +646,14 @@ mod tests {
             ..Default::default()
         };
 
-        let result = estimate_essential_ransac(&corrs, &config)
-            .expect("RANSAC should succeed");
+        let result = estimate_essential_ransac(&corrs, &config).expect("RANSAC should succeed");
 
         // All points should be inliers (no outliers added).
         assert!(
             result.num_inliers >= 25,
             "Expected most inliers, got {}/{}",
-            result.num_inliers, result.total
+            result.num_inliers,
+            result.total
         );
     }
 
@@ -565,20 +678,21 @@ mod tests {
             ..Default::default()
         };
 
-        let result = estimate_essential_ransac(&corrs, &config)
-            .expect("RANSAC should succeed");
+        let result = estimate_essential_ransac(&corrs, &config).expect("RANSAC should succeed");
 
         // Should identify most of the 30 real correspondences as inliers
         // and reject most of the 10 outliers.
         assert!(
             result.num_inliers >= 20,
             "Should find >= 20 inliers, got {}/{}",
-            result.num_inliers, result.total
+            result.num_inliers,
+            result.total
         );
         assert!(
             result.num_inliers <= 35,
             "Too many inliers (outliers not rejected): {}/{}",
-            result.num_inliers, result.total
+            result.num_inliers,
+            result.total
         );
     }
 
@@ -601,5 +715,42 @@ mod tests {
         for (i, &c) in counts.iter().enumerate() {
             assert!(c > 500 && c < 1500, "Bucket {i}: {c} (expected ~1000)");
         }
+    }
+
+    #[test]
+    fn test_essential_from_pose_matches_synthetic_geometry() {
+        // Same geometry as make_synthetic_correspondences: identity rotation,
+        // translation along +x. E from the pose must classify the clean
+        // correspondences as inliers.
+        let corrs = make_synthetic_correspondences(40, 0.0);
+        let r = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        // x2 ~ R x1 + t with the camera moving +x => points shift -x: t = [-0.1, 0, 0]
+        let e = essential_from_pose(&r, &[-0.1, 0.0, 0.0]).unwrap();
+        let res = epipolar_inliers_with_prior(&e, &corrs, 1e-8, false);
+        assert_eq!(res.num_inliers, corrs.len(), "clean points must all pass");
+        // Degenerate baseline -> None.
+        assert!(essential_from_pose(&r, &[0.0, 0.0, 0.0]).is_none());
+    }
+
+    #[test]
+    fn test_epipolar_inliers_with_prior_rejects_outliers_and_guarded_refit() {
+        let mut corrs = make_synthetic_correspondences(60, 1e-5);
+        // Corrupt 10 correspondences hard (simulated bad tracks).
+        for c in corrs.iter_mut().take(10) {
+            c.x2 += 0.05;
+            c.y2 -= 0.03;
+        }
+        let r = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let e = essential_from_pose(&r, &[-0.1, 0.0, 0.0]).unwrap();
+        let res = epipolar_inliers_with_prior(&e, &corrs, 1e-6, false);
+        assert_eq!(res.num_inliers, 50, "exactly the uncorrupted tracks pass");
+        assert!(res.inliers.iter().take(10).all(|&b| !b));
+        // Guarded refit must never do worse than the prior classification.
+        let res_r = epipolar_inliers_with_prior(&e, &corrs, 1e-6, true);
+        assert!(res_r.num_inliers >= res.num_inliers);
+        assert!(
+            res_r.inliers.iter().take(10).all(|&b| !b),
+            "outliers stay out"
+        );
     }
 }

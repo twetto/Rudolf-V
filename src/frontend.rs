@@ -502,6 +502,29 @@ pub struct FrontendConfig {
     /// Set to false when an external joint RANSAC (e.g. rigid 3D-3D over
     /// stereo correspondences) will be applied via `retain_features_by_id`.
     pub enable_internal_ransac: bool,
+    /// Squared-Sampson gate threshold (normalized coords, same convention as
+    /// `RansacConfig::threshold`) for the pose-prior epipolar gate. When a
+    /// prior was supplied via `set_pose_prior` and this is > 0, the gate
+    /// replaces the internal RANSAC for that frame: the predicted essential
+    /// matrix needs no estimation, so it neither degenerates under
+    /// rotation-dominant motion nor fights contamination. 0.0 disables.
+    pub epipolar_gate_threshold: f64,
+    /// Consensus refit for the prior gate: refit `eight_point` on the prior's
+    /// inliers, kept only if it increases the inlier count (guards against
+    /// low-parallax degeneracy). See `essential::epipolar_inliers_with_prior`.
+    pub epipolar_refine: bool,
+    /// Skip the prior gate (RANSAC fallback) when the prior's inter-frame
+    /// translation is below this [same units as the pose, typically meters]:
+    /// at near-zero baseline the translation *direction* — and hence the
+    /// predicted essential matrix — is noise (measured: detonates EuRoC
+    /// MH_02's slow segments). Default 1e-3.
+    pub epipolar_min_baseline: f64,
+    /// Distrust the prior (RANSAC fallback) when the gate would reject more
+    /// than this fraction of correspondences: a healthy prior never indicts
+    /// half the tracks, so mass rejection indicates a bad prior (e.g. a
+    /// diverging VIO) — this breaks the reject->starve->diverge feedback
+    /// loop. Default 0.5.
+    pub epipolar_max_reject_frac: f64,
 }
 
 impl Default for FrontendConfig {
@@ -536,6 +559,10 @@ impl Default for FrontendConfig {
             camera: None,
             ransac: RansacConfig::default(),
             enable_internal_ransac: true,
+            epipolar_gate_threshold: 0.0,
+            epipolar_refine: false,
+            epipolar_min_baseline: 1e-3,
+            epipolar_max_reject_frac: 0.5,
         }
     }
 }
@@ -574,6 +601,9 @@ pub struct Frontend {
     /// Image dimensions (for validation).
     img_w: usize,
     img_h: usize,
+    /// Relative-pose prior (R, t: prev -> curr camera) for the epipolar gate,
+    /// set via `set_pose_prior` before `process()`; consumed by that call.
+    pose_prior: Option<([[f64; 3]; 3], [f64; 3])>,
 }
 
 /// Per-stage timing breakdown from a single `process()` call.
@@ -684,7 +714,16 @@ impl Frontend {
             grid,
             img_w,
             img_h,
+            pose_prior: None,
         }
+    }
+
+    /// Supply a relative-pose prior (R, t: previous -> current camera frame,
+    /// i.e. x_curr ~ R x_prev + t) for the NEXT `process()` call, e.g. the
+    /// VIO's IMU-predicted motion. Enables the epipolar gate when
+    /// `epipolar_gate_threshold > 0`. Consumed by `process()`.
+    pub fn set_pose_prior(&mut self, r: [[f64; 3]; 3], t: [f64; 3]) {
+        self.pose_prior = Some((r, t));
     }
 
     /// Process one frame. Returns the currently tracked feature list
@@ -699,6 +738,9 @@ impl Frontend {
         use std::time::Instant;
         let t_total = Instant::now();
         let mut timing = TimingStats::default();
+        // Consume the pose prior unconditionally: it describes prev->curr of
+        // THIS call only and must never leak into a later frame.
+        let pose_prior = self.pose_prior.take();
 
         // Step 0: Histogram equalization LUT (brightness normalization).
         // The actual remap is fused into pyramid level 0 construction.
@@ -827,7 +869,12 @@ impl Frontend {
                 // Step 2b: Geometric verification (essential matrix RANSAC).
                 let t0 = Instant::now();
                 // Reject outlier tracks that are geometrically inconsistent.
-                if self.config.enable_internal_ransac {
+                // The pose-prior epipolar gate (if a prior was supplied) or the
+                // estimated-E RANSAC produce the same EssentialResult, consumed
+                // by one shared outlier-removal path below.
+                let prior = pose_prior;
+                let use_gate = self.config.epipolar_gate_threshold > 0.0 && prior.is_some();
+                if use_gate || self.config.enable_internal_ransac {
                     if let Some(ref cam) = self.config.camera {
                         if self.features.len() >= 8 {
                             // Build correspondences: prev_features -> current features.
@@ -854,10 +901,47 @@ impl Frontend {
                                 let corr_only: Vec<Correspondence> =
                                     corrs.iter().map(|(_, c)| *c).collect();
 
-                                if let Some(result) = essential::estimate_essential_ransac(
-                                    &corr_only,
-                                    &self.config.ransac,
-                                ) {
+                                // Prior gate first; falls back to estimated
+                                // RANSAC when the prior is untrustworthy:
+                                //  * baseline too small (translation direction,
+                                //    hence E, is noise), or
+                                //  * the gate would reject a mass of tracks (a
+                                //    healthy prior never indicts half of them —
+                                //    breaks the reject->starve->diverge loop).
+                                let gate_result = if use_gate {
+                                    let (r, t) = prior.unwrap();
+                                    let baseline = (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt();
+                                    if baseline >= self.config.epipolar_min_baseline {
+                                        essential::essential_from_pose(&r, &t).and_then(|e| {
+                                            let res = essential::epipolar_inliers_with_prior(
+                                                &e,
+                                                &corr_only,
+                                                self.config.epipolar_gate_threshold,
+                                                self.config.epipolar_refine,
+                                            );
+                                            let reject_frac = 1.0
+                                                - res.num_inliers as f64 / res.total.max(1) as f64;
+                                            (reject_frac <= self.config.epipolar_max_reject_frac)
+                                                .then_some(res)
+                                        })
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
+                                let result_opt = match gate_result {
+                                    Some(res) => Some(res),
+                                    None if self.config.enable_internal_ransac => {
+                                        essential::estimate_essential_ransac(
+                                            &corr_only,
+                                            &self.config.ransac,
+                                        )
+                                    }
+                                    None => None,
+                                };
+
+                                if let Some(result) = result_opt {
                                     // Remove outlier features.
                                     let mut inlier_features = Vec::new();
                                     let mut inlier_meta = Vec::new();
@@ -1127,6 +1211,7 @@ impl Frontend {
         self.features.clear();
         self.track_meta.clear();
         self.prev_features.clear();
+        self.pose_prior = None;
         self.grid.clear();
         // Don't reset next_id — IDs should be globally unique.
     }
