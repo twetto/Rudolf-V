@@ -1,0 +1,76 @@
+name: Frontend visual artifacts
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  euroc-visual-artifacts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+      - name: Generate synthetic EuRoC fixture
+        run: cargo run --release --example make_synthetic_euroc -- target/ci/euroc_synthetic 90
+      - name: Build frontend visualizer
+        run: cargo build --release --example euroc_frontend
+      - name: Run frontend visualizer
+        shell: bash
+        run: |
+          mkdir -p target/ci/euroc_visual
+          cd target/ci/euroc_visual
+          RUDOLF_EXPORT_FRAMES=1 \
+          RUDOLF_EXPECT_FLOW_DX=1 \
+          RUDOLF_EXPECT_FLOW_DY=1 \
+            ../../../target/release/examples/euroc_frontend ../euroc_synthetic 90 | tee stdout.txt
+      - name: Encode frontend video
+        run: |
+          ffmpeg -y -framerate 15 \
+            -i target/ci/euroc_visual/vis_output/frames/frame_%06d.png \
+            -pix_fmt yuv420p \
+            target/ci/euroc_visual/euroc_frontend_tracks.mp4
+      - name: Check frontend artifact stats
+        run: |
+          python - <<'PY'
+          import csv
+          import statistics
+          from pathlib import Path
+
+          stats_path = Path("target/ci/euroc_visual/vis_output/euroc_stats.csv")
+          rows = list(csv.DictReader(stats_path.open(newline="")))
+          tracked_sum = sum(int(row["tracked"]) for row in rows)
+          last_total = int(rows[-1]["total"])
+          print(f"frames={len(rows)} tracked_sum={tracked_sum} last_total={last_total}")
+          if len(rows) != 90 or tracked_sum <= 0 or last_total <= 0:
+              raise SystemExit("frontend artifact run did not produce usable tracks")
+
+          flow_path = Path("target/ci/euroc_visual/vis_output/euroc_flow.csv")
+          flow_rows = list(csv.DictReader(flow_path.open(newline="")))
+          if len(flow_rows) < 30:
+              raise SystemExit(f"not enough tracked flow samples: {len(flow_rows)}")
+          dx = [float(row["dx"]) for row in flow_rows]
+          dy = [float(row["dy"]) for row in flow_rows]
+          err = [float(row["error"]) for row in flow_rows]
+          med_dx = statistics.median(dx)
+          med_dy = statistics.median(dy)
+          med_err = statistics.median(err)
+          print(f"flow_samples={len(flow_rows)} median_dx={med_dx:.3f} median_dy={med_dy:.3f} median_err={med_err:.3f}")
+          if abs(med_dx - 1.0) > 0.35 or abs(med_dy - 1.0) > 0.35 or med_err > 0.5:
+              raise SystemExit("tracked flow does not match synthetic GT motion")
+          PY
+      - name: Upload visual artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: euroc-frontend-visual-artifacts
+          path: |
+            target/ci/euroc_visual/stdout.txt
+            target/ci/euroc_visual/euroc_frontend_tracks.mp4
+            target/ci/euroc_visual/vis_output/euroc_tracks.svg
+            target/ci/euroc_visual/vis_output/euroc_stats.csv
+            target/ci/euroc_visual/vis_output/euroc_flow.csv
+          if-no-files-found: error

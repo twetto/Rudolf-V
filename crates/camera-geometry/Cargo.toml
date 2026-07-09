@@ -1,0 +1,11 @@
+[package]
+name = "camera-geometry"
+version = "0.1.0"
+edition = "2021"
+description = "Calibrated camera projection and unit-bearing geometry"
+
+[dependencies]
+nalgebra = "0.33"
+
+[dev-dependencies]
+approx = "0.5"
