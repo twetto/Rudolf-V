@@ -54,6 +54,102 @@ pub trait CameraModel: Send + Sync {
     }
 }
 
+/// A validated, concrete projection model.
+///
+/// Calibration formats such as Kalibr may store `camera_model` and
+/// `distortion_model` as separate strings. Internally, consumers need a single
+/// projection mapping, because models such as double-sphere do not decompose
+/// into "base camera plus distortion".
+#[derive(Debug, Clone, PartialEq)]
+pub enum CameraProjection {
+    Pinhole(Pinhole),
+    PinholeRadTan(PinholeRadTan),
+    PinholeEquidistant(EquidistantFisheye),
+}
+
+impl CameraProjection {
+    pub fn pinhole(intrinsics: [f64; 4], resolution: [usize; 2]) -> Self {
+        Self::Pinhole(Pinhole::new(intrinsics, resolution))
+    }
+
+    pub fn pinhole_radtan(
+        intrinsics: [f64; 4],
+        distortion: [f64; 4],
+        resolution: [usize; 2],
+    ) -> Self {
+        Self::PinholeRadTan(PinholeRadTan::new(intrinsics, distortion, resolution))
+    }
+
+    pub fn pinhole_equidistant(
+        intrinsics: [f64; 4],
+        distortion: [f64; 4],
+        resolution: [usize; 2],
+    ) -> Self {
+        Self::PinholeEquidistant(EquidistantFisheye::new(intrinsics, distortion, resolution))
+    }
+
+    pub fn from_kalibr_parts(
+        camera_model: &str,
+        distortion_model: Option<&str>,
+        intrinsics: [f64; 4],
+        distortion: &[f64],
+        resolution: [usize; 2],
+    ) -> Result<Self, String> {
+        match (camera_model, distortion_model.unwrap_or("")) {
+            ("pinhole", "" | "none") if distortion.is_empty() => {
+                Ok(Self::pinhole(intrinsics, resolution))
+            }
+            ("pinhole", "radtan" | "radial-tangential") => Ok(Self::pinhole_radtan(
+                intrinsics,
+                array4_from_slice("radtan distortion", distortion)?,
+                resolution,
+            )),
+            ("pinhole", "equidistant") => Ok(Self::pinhole_equidistant(
+                intrinsics,
+                array4_from_slice("equidistant distortion", distortion)?,
+                resolution,
+            )),
+            (camera_model, distortion_model) => Err(format!(
+                "unsupported camera projection camera_model={camera_model}, distortion_model={distortion_model}"
+            )),
+        }
+    }
+}
+
+impl CameraModel for CameraProjection {
+    fn unproject(&self, pixel: Pixel) -> Option<UnitBearing> {
+        match self {
+            Self::Pinhole(camera) => camera.unproject(pixel),
+            Self::PinholeRadTan(camera) => camera.unproject(pixel),
+            Self::PinholeEquidistant(camera) => camera.unproject(pixel),
+        }
+    }
+
+    fn project(&self, point: Vector3<f64>) -> Option<Pixel> {
+        match self {
+            Self::Pinhole(camera) => camera.project(point),
+            Self::PinholeRadTan(camera) => camera.project(point),
+            Self::PinholeEquidistant(camera) => camera.project(point),
+        }
+    }
+
+    fn project_jacobian(&self, point: Vector3<f64>) -> Option<Matrix2x3<f64>> {
+        match self {
+            Self::Pinhole(camera) => camera.project_jacobian(point),
+            Self::PinholeRadTan(camera) => camera.project_jacobian(point),
+            Self::PinholeEquidistant(camera) => camera.project_jacobian(point),
+        }
+    }
+
+    fn image_size(&self) -> [usize; 2] {
+        match self {
+            Self::Pinhole(camera) => camera.image_size(),
+            Self::PinholeRadTan(camera) => camera.image_size(),
+            Self::PinholeEquidistant(camera) => camera.image_size(),
+        }
+    }
+}
+
 fn tangent_basis(bearing: UnitBearing) -> Matrix3x2<f64> {
     let b = bearing.vector();
     let seed = if b.z.abs() < 0.9 {
@@ -401,6 +497,12 @@ fn array4(section: &str, key: &str) -> Result<[f64; 4], String> {
         .map_err(|v: Vec<f64>| format!("{key} expected 4 values, got {}", v.len()))
 }
 
+fn array4_from_slice(name: &str, values: &[f64]) -> Result<[f64; 4], String> {
+    values
+        .try_into()
+        .map_err(|_| format!("{name} expected 4 values, got {}", values.len()))
+}
+
 fn array2(section: &str, key: &str) -> Result<[f64; 2], String> {
     bracket_values(section, key)?
         .try_into()
@@ -510,6 +612,48 @@ mod tests {
         );
         assert_projection_jacobian(&camera, Vector3::new(0.8, -0.6, 1.0));
         assert_tangent_jacobian(&camera, Pixel::new(10.0, 500.0));
+    }
+
+    #[test]
+    fn kalibr_parts_map_to_single_projection_models() {
+        let intrinsics = [500.0, 500.0, 320.0, 240.0];
+        let resolution = [640, 480];
+
+        assert!(matches!(
+            CameraProjection::from_kalibr_parts("pinhole", None, intrinsics, &[], resolution)
+                .unwrap(),
+            CameraProjection::Pinhole(_)
+        ));
+        assert!(matches!(
+            CameraProjection::from_kalibr_parts(
+                "pinhole",
+                Some("radtan"),
+                intrinsics,
+                &[0.1, 0.01, 0.0, 0.0],
+                resolution,
+            )
+            .unwrap(),
+            CameraProjection::PinholeRadTan(_)
+        ));
+        assert!(matches!(
+            CameraProjection::from_kalibr_parts(
+                "pinhole",
+                Some("equidistant"),
+                intrinsics,
+                &[0.1, 0.01, 0.001, 0.0001],
+                resolution,
+            )
+            .unwrap(),
+            CameraProjection::PinholeEquidistant(_)
+        ));
+        assert!(CameraProjection::from_kalibr_parts(
+            "double-sphere",
+            None,
+            intrinsics,
+            &[0.5, 0.6],
+            resolution,
+        )
+        .is_err());
     }
 
     #[test]

@@ -31,6 +31,15 @@ pub struct Correspondence {
     pub y2: f64,
 }
 
+/// A pair of unit-sphere bearing correspondences.
+#[derive(Debug, Clone, Copy)]
+pub struct BearingCorrespondence {
+    /// Unit bearing in previous frame.
+    pub b1: [f64; 3],
+    /// Unit bearing in current frame.
+    pub b2: [f64; 3],
+}
+
 /// Result of essential matrix estimation.
 #[derive(Debug, Clone)]
 pub struct EssentialResult {
@@ -161,6 +170,66 @@ pub fn eight_point(correspondences: &[Correspondence]) -> Option<[[f64; 3]; 3]> 
     Some(result)
 }
 
+/// Estimate the essential matrix from >= 8 unit-bearing correspondences.
+///
+/// Unlike [`eight_point`], this does not apply 2D Hartley normalization because
+/// the inputs are already unit vectors on the viewing sphere. Each row encodes
+/// the homogeneous epipolar constraint `b2^T E b1 = 0`.
+pub fn eight_point_bearings(correspondences: &[BearingCorrespondence]) -> Option<[[f64; 3]; 3]> {
+    if correspondences.len() < 8 {
+        return None;
+    }
+
+    let mut m = SMatrix::<f64, 9, 9>::zeros();
+    for c in correspondences {
+        let [x1, y1, z1] = c.b1;
+        let [x2, y2, z2] = c.b2;
+        let a = SVector::<f64, 9>::from_column_slice(&[
+            x2 * x1,
+            x2 * y1,
+            x2 * z1,
+            y2 * x1,
+            y2 * y1,
+            y2 * z1,
+            z2 * x1,
+            z2 * y1,
+            z2 * z1,
+        ]);
+        m += a * a.transpose();
+    }
+
+    let svd = m.svd(true, true);
+    let v_t = svd.v_t?;
+    let e_vec = v_t.row(8);
+    let mut e = SMatrix::<f64, 3, 3>::zeros();
+    for i in 0..3 {
+        for j in 0..3 {
+            e[(i, j)] = e_vec[i * 3 + j];
+        }
+    }
+
+    let svd_e = e.svd(true, true);
+    let u = svd_e.u?;
+    let v_t = svd_e.v_t?;
+    let s = svd_e.singular_values;
+    let sigma = SMatrix::<f64, 3, 3>::new(s[0], 0.0, 0.0, 0.0, s[1], 0.0, 0.0, 0.0, 0.0);
+    e = u * sigma * v_t;
+
+    let norm = e.norm();
+    if norm < 1e-12 {
+        return None;
+    }
+    e /= norm;
+
+    let mut result = [[0.0f64; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            result[i][j] = e[(i, j)];
+        }
+    }
+    Some(result)
+}
+
 // ============================================================
 // RANSAC
 // ============================================================
@@ -270,6 +339,97 @@ pub fn estimate_essential_ransac(
     }
 }
 
+/// Estimate the essential matrix with RANSAC from unit-bearing correspondences.
+pub fn estimate_essential_ransac_bearings(
+    correspondences: &[BearingCorrespondence],
+    config: &RansacConfig,
+) -> Option<EssentialResult> {
+    let n = correspondences.len();
+    if n < 8 {
+        return None;
+    }
+
+    let mut best_inliers = vec![false; n];
+    let mut best_num_inliers = 0usize;
+    let mut best_e = [[0.0f64; 3]; 3];
+    let mut rng = SimpleRng::new(42);
+    let mut iterations = 0;
+    let mut adaptive_max = config.max_iterations;
+
+    for iter in 0..config.max_iterations {
+        iterations = iter + 1;
+        if iter >= adaptive_max {
+            break;
+        }
+
+        let sample = random_sample_8(&mut rng, n);
+        let sample_corrs: Vec<BearingCorrespondence> =
+            sample.iter().map(|&i| correspondences[i]).collect();
+        let e = match eight_point_bearings(&sample_corrs) {
+            Some(e) => e,
+            None => continue,
+        };
+
+        let mut inliers = vec![false; n];
+        let mut num_inliers = 0;
+        for (i, c) in correspondences.iter().enumerate() {
+            if sampson_distance_bearing(&e, c) < config.threshold {
+                inliers[i] = true;
+                num_inliers += 1;
+            }
+        }
+
+        if num_inliers > best_num_inliers {
+            best_num_inliers = num_inliers;
+            best_inliers = inliers;
+            best_e = e;
+            let w = num_inliers as f64 / n as f64;
+            if w > 0.0 {
+                let p_fail = (1.0 - w.powi(8)).max(1e-15);
+                let k = (1.0 - config.confidence).ln() / p_fail.ln();
+                adaptive_max = (k.ceil() as usize).min(config.max_iterations);
+            }
+        }
+    }
+
+    if best_num_inliers < 8 {
+        return None;
+    }
+
+    let inlier_corrs: Vec<BearingCorrespondence> = correspondences
+        .iter()
+        .zip(best_inliers.iter())
+        .filter(|(_, &is_inlier)| is_inlier)
+        .map(|(c, _)| *c)
+        .collect();
+
+    if let Some(e_refined) = eight_point_bearings(&inlier_corrs) {
+        let mut final_inliers = vec![false; n];
+        let mut final_count = 0;
+        for (i, c) in correspondences.iter().enumerate() {
+            if sampson_distance_bearing(&e_refined, c) < config.threshold {
+                final_inliers[i] = true;
+                final_count += 1;
+            }
+        }
+        Some(EssentialResult {
+            e: e_refined,
+            inliers: final_inliers,
+            num_inliers: final_count,
+            total: n,
+            iterations,
+        })
+    } else {
+        Some(EssentialResult {
+            e: best_e,
+            inliers: best_inliers,
+            num_inliers: best_num_inliers,
+            total: n,
+            iterations,
+        })
+    }
+}
+
 // ============================================================
 // Sampson distance
 // ============================================================
@@ -298,6 +458,18 @@ pub fn sampson_distance(e: &[[f64; 3]; 3], c: &Correspondence) -> f64 {
         return f64::MAX;
     }
 
+    (num * num) / denom
+}
+
+/// Sampson distance for unit-bearing correspondences.
+pub fn sampson_distance_bearing(e: &[[f64; 3]; 3], c: &BearingCorrespondence) -> f64 {
+    let ex1 = mat3_vec3(e, &c.b1);
+    let et_x2 = mat3t_vec3(e, &c.b2);
+    let num = dot3(&c.b2, &ex1);
+    let denom = ex1[0] * ex1[0] + ex1[1] * ex1[1] + et_x2[0] * et_x2[0] + et_x2[1] * et_x2[1];
+    if denom < 1e-30 {
+        return f64::MAX;
+    }
     (num * num) / denom
 }
 
@@ -374,6 +546,53 @@ pub fn epipolar_inliers_with_prior(
             .map(|(c, _)| *c)
             .collect();
         if let Some(e_refit) = eight_point(&inlier_corrs) {
+            let (inliers_r, num_r) = classify(&e_refit);
+            if num_r > num_inliers {
+                return EssentialResult {
+                    e: e_refit,
+                    inliers: inliers_r,
+                    num_inliers: num_r,
+                    total: correspondences.len(),
+                    iterations: 1,
+                };
+            }
+        }
+    }
+
+    EssentialResult {
+        e: *e_prior,
+        inliers,
+        num_inliers,
+        total: correspondences.len(),
+        iterations: 0,
+    }
+}
+
+/// Classify unit-bearing correspondences against a prior essential matrix.
+pub fn epipolar_inliers_with_prior_bearings(
+    e_prior: &[[f64; 3]; 3],
+    correspondences: &[BearingCorrespondence],
+    threshold: f64,
+    refine: bool,
+) -> EssentialResult {
+    let classify = |e: &[[f64; 3]; 3]| {
+        let inliers: Vec<bool> = correspondences
+            .iter()
+            .map(|c| sampson_distance_bearing(e, c) < threshold)
+            .collect();
+        let num = inliers.iter().filter(|&&b| b).count();
+        (inliers, num)
+    };
+    let (inliers, num_inliers) = classify(e_prior);
+
+    if refine && num_inliers >= 8 {
+        let inlier_corrs: Vec<BearingCorrespondence> = correspondences
+            .iter()
+            .zip(inliers.iter())
+            .filter(|(_, &keep)| keep)
+            .map(|(c, _)| *c)
+            .collect();
+        if let Some(e_refit) = eight_point_bearings(&inlier_corrs) {
             let (inliers_r, num_r) = classify(&e_refit);
             if num_r > num_inliers {
                 return EssentialResult {
@@ -587,6 +806,21 @@ mod tests {
         corrs
     }
 
+    fn make_synthetic_bearing_correspondences(n: usize) -> Vec<BearingCorrespondence> {
+        make_synthetic_correspondences(n, 0.0)
+            .into_iter()
+            .map(|c| BearingCorrespondence {
+                b1: normalize3([c.x1, c.y1, 1.0]),
+                b2: normalize3([c.x2, c.y2, 1.0]),
+            })
+            .collect()
+    }
+
+    fn normalize3(v: [f64; 3]) -> [f64; 3] {
+        let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        [v[0] / n, v[1] / n, v[2] / n]
+    }
+
     #[test]
     fn test_eight_point_noiseless() {
         let corrs = make_synthetic_correspondences(20, 0.0);
@@ -693,6 +927,38 @@ mod tests {
             "Too many inliers (outliers not rejected): {}/{}",
             result.num_inliers,
             result.total
+        );
+    }
+
+    #[test]
+    fn test_bearing_ransac_and_prior_gate() {
+        let mut corrs = make_synthetic_bearing_correspondences(40);
+        for c in corrs.iter_mut().take(6) {
+            c.b2 = normalize3([0.6, -0.4, 1.0]);
+        }
+
+        let config = RansacConfig {
+            threshold: 1e-4,
+            max_iterations: 200,
+            ..Default::default()
+        };
+        let result = estimate_essential_ransac_bearings(&corrs, &config)
+            .expect("bearing RANSAC should succeed");
+        assert!(
+            result.num_inliers >= 30,
+            "expected most clean bearing correspondences as inliers, got {}/{}",
+            result.num_inliers,
+            result.total
+        );
+
+        let r = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let e = essential_from_pose(&r, &[-0.1, 0.0, 0.0]).unwrap();
+        let prior = epipolar_inliers_with_prior_bearings(&e, &corrs, 1e-4, false);
+        assert!(
+            prior.num_inliers >= 30,
+            "expected prior gate to keep most bearing inliers, got {}/{}",
+            prior.num_inliers,
+            prior.total
         );
     }
 
