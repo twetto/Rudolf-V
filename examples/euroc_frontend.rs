@@ -82,14 +82,15 @@ fn main() {
 
     // Load camera intrinsics for geometric verification (optional).
     let sensor_yaml = cam0_dir.join("sensor.yaml");
-    let camera = match CameraIntrinsics::from_euroc_yaml(&sensor_yaml) {
+    let camera = match load_camera(&dataset_path, &sensor_yaml, "cam0") {
         Ok(cam) => {
             println!(
-                "Camera: fx={:.1} fy={:.1} cx={:.1} cy={:.1}, {} distortion coeffs",
+                "Camera: fx={:.1} fy={:.1} cx={:.1} cy={:.1}, {:?}, {} distortion coeffs",
                 cam.fx,
                 cam.fy,
                 cam.cx,
                 cam.cy,
+                cam.model,
                 cam.distortion.len()
             );
             Some(cam)
@@ -105,8 +106,9 @@ fn main() {
 
     // Configure frontend.
     let config = FrontendConfig {
-        max_features: 40,
-        cell_size: 128,
+        // Keep this batch/video example aligned with euroc_live.
+        max_features: 200,
+        cell_size: 32,
         pyramid_levels: 4,
         klt_window: 11,
         klt_max_iter: 30,
@@ -218,7 +220,14 @@ fn main() {
         }
 
         if export_frames {
-            let frame = render_frame_overlay(&img, &track_history, i, stats.tracked, stats.total);
+            let frame = render_frame_overlay(
+                &img,
+                &track_history,
+                &seen_ids,
+                i,
+                stats.tracked,
+                stats.total,
+            );
             frame
                 .save(format!("vis_output/frames/frame_{i:06}.png"))
                 .expect("failed to save frame overlay");
@@ -255,6 +264,21 @@ fn main() {
     println!("  Total unique features: {}", track_history.len());
     println!("  Tracks >= 10 frames: {}", long_tracks);
     println!("  Longest track: {} frames", max_track);
+}
+
+fn load_camera(
+    dataset_path: &Path,
+    sensor_yaml: &Path,
+    camera: &str,
+) -> Result<CameraIntrinsics, String> {
+    if sensor_yaml.exists() {
+        return CameraIntrinsics::from_euroc_yaml(sensor_yaml);
+    }
+    let camchain = dataset_path.join("dso").join("camchain.yaml");
+    if camchain.exists() {
+        return CameraIntrinsics::from_kalibr_camchain(&camchain, camera);
+    }
+    CameraIntrinsics::from_euroc_yaml(sensor_yaml)
 }
 
 /// Parse EuRoC data.csv: "#timestamp [ns],filename" → Vec<filename>.
@@ -416,6 +440,7 @@ fn render_tracks(
 fn render_frame_overlay(
     img: &Image<u8>,
     track_history: &[(u64, Vec<(f32, f32)>)],
+    active_ids: &[u64],
     frame_idx: usize,
     tracked: usize,
     total: usize,
@@ -432,7 +457,10 @@ fn render_frame_overlay(
         }
     }
 
-    for (_, points) in track_history {
+    for (id, points) in track_history {
+        if !active_ids.contains(id) {
+            continue;
+        }
         if points.len() < 2 {
             continue;
         }

@@ -65,7 +65,19 @@ impl CameraIntrinsics {
     pub fn from_euroc_yaml(path: &Path) -> Result<Self, String> {
         let content = fs::read_to_string(path)
             .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+        Self::from_yaml_content(&content)
+    }
 
+    /// Parse one camera from a Kalibr camchain file.
+    pub fn from_kalibr_camchain(path: &Path, camera: &str) -> Result<Self, String> {
+        let content = fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+        let section = yaml_section(&content, camera)
+            .ok_or_else(|| format!("camera section {camera}: not found in {}", path.display()))?;
+        Self::from_yaml_content(section)
+    }
+
+    fn from_yaml_content(content: &str) -> Result<Self, String> {
         let intrinsics = parse_bracket_values(&content, "intrinsics:")
             .ok_or_else(|| "intrinsics: line not found".to_string())?;
         if intrinsics.len() != 4 {
@@ -255,6 +267,34 @@ impl StereoRig {
         })
     }
 
+    /// Parse a stereo rig from a Kalibr camchain file.
+    ///
+    /// Kalibr stores `T_cn_cnm1` under `cam1` as the transform from the
+    /// previous camera (`cam0`) to the current camera (`cam1`), matching this
+    /// type's `p_cam1 = R * p_cam0 + t` convention.
+    pub fn from_kalibr_camchain(path: &Path) -> Result<Self, String> {
+        let content = fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+        let cam0 = CameraIntrinsics::from_kalibr_camchain(path, "cam0")?;
+        let cam1 = CameraIntrinsics::from_kalibr_camchain(path, "cam1")?;
+        let cam1_section = yaml_section(&content, "cam1")
+            .ok_or_else(|| format!("camera section cam1: not found in {}", path.display()))?;
+        let t_10 = parse_matrix4_after_key(cam1_section, "T_cn_cnm1:")
+            .ok_or_else(|| format!("T_cn_cnm1: not found in {}", path.display()))?;
+        let r_10 = [
+            [t_10[0][0], t_10[0][1], t_10[0][2]],
+            [t_10[1][0], t_10[1][1], t_10[1][2]],
+            [t_10[2][0], t_10[2][1], t_10[2][2]],
+        ];
+        let t = [t_10[0][3], t_10[1][3], t_10[2][3]];
+        Ok(StereoRig {
+            cam0,
+            cam1,
+            r_10,
+            t_10: t,
+        })
+    }
+
     /// Transform a 3D point from cam0 frame to cam1 frame.
     #[inline]
     pub fn transform_point(&self, p: [f64; 3]) -> [f64; 3] {
@@ -341,6 +381,39 @@ fn parse_bracket_values(content: &str, key: &str) -> Option<Vec<f64>> {
         .filter_map(|s| s.trim().parse::<f64>().ok())
         .collect();
     Some(vals)
+}
+
+fn parse_matrix4_after_key(content: &str, key: &str) -> Option<[[f64; 4]; 4]> {
+    let mut lines = content.lines().skip_while(|line| line.trim() != key);
+    lines.next()?;
+    let mut rows = [[0.0; 4]; 4];
+    for row in &mut rows {
+        let line = lines.next()?.trim();
+        let open = line.find('[')?;
+        let close = line.rfind(']')?;
+        let vals: Vec<f64> = line[open + 1..close]
+            .split(',')
+            .filter_map(|s| s.trim().parse::<f64>().ok())
+            .collect();
+        if vals.len() != 4 {
+            return None;
+        }
+        row.copy_from_slice(&vals);
+    }
+    Some(rows)
+}
+
+fn yaml_section<'a>(content: &'a str, name: &str) -> Option<&'a str> {
+    let marker = format!("{name}:");
+    let start_line = content.lines().position(|line| line.trim_end() == marker)?;
+    let start_byte = content
+        .lines()
+        .take(start_line + 1)
+        .map(|line| line.len() + 1)
+        .sum::<usize>();
+    let tail = &content[start_byte..];
+    let end = tail.find("\ncam").unwrap_or(tail.len());
+    Some(&tail[..end])
 }
 
 fn parse_projection_model(content: &str, distortion: &[f64]) -> Result<DistortionModel, String> {
@@ -651,6 +724,61 @@ mod tests {
             t_10[1][3].abs() < 0.01,
             "EuRoC stereo baseline should be mostly horizontal, got y={}",
             t_10[1][3]
+        );
+    }
+
+    #[test]
+    fn test_kalibr_camchain_stereo_rig() {
+        let camchain = r#"
+cam0:
+  T_cam_imu:
+  - [1.0, 0.0, 0.0, 0.0]
+  - [0.0, 1.0, 0.0, 0.0]
+  - [0.0, 0.0, 1.0, 0.0]
+  - [0.0, 0.0, 0.0, 1.0]
+  camera_model: pinhole
+  distortion_coeffs: [0.01, 0.02, 0.03, 0.04]
+  distortion_model: equidistant
+  intrinsics: [190.0, 191.0, 254.0, 255.0]
+  resolution: [512, 512]
+cam1:
+  T_cam_imu:
+  - [1.0, 0.0, 0.0, -0.1]
+  - [0.0, 1.0, 0.0, 0.0]
+  - [0.0, 0.0, 1.0, 0.0]
+  - [0.0, 0.0, 0.0, 1.0]
+  T_cn_cnm1:
+  - [1.0, 0.0, 0.0, -0.101]
+  - [0.0, 1.0, 0.0, -0.002]
+  - [0.0, 0.0, 1.0, -0.001]
+  - [0.0, 0.0, 0.0, 1.0]
+  camera_model: pinhole
+  distortion_coeffs: [0.05, 0.06, 0.07, 0.08]
+  distortion_model: equidistant
+  intrinsics: [192.0, 193.0, 252.0, 253.0]
+  resolution: [512, 512]
+"#;
+        let path = std::env::temp_dir().join(format!(
+            "rudolf_v_test_camchain_{}_{}.yaml",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, camchain).unwrap();
+
+        let rig = StereoRig::from_kalibr_camchain(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(rig.cam0.model, DistortionModel::Equidistant);
+        assert_eq!(rig.cam1.model, DistortionModel::Equidistant);
+        assert!((rig.cam0.fx - 190.0).abs() < 1e-12);
+        assert!((rig.cam1.cx - 252.0).abs() < 1e-12);
+        assert!((rig.t_10[0] + 0.101).abs() < 1e-12);
+        assert!((rig.t_10[1] + 0.002).abs() < 1e-12);
+        assert!((rig.t_10[2] + 0.001).abs() < 1e-12);
+        assert!(
+            (rig.baseline_meters() - (0.101f64 * 0.101 + 0.002 * 0.002 + 0.001 * 0.001).sqrt())
+                .abs()
+                < 1e-12
         );
     }
 }
