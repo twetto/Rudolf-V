@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "camera-geometry"
+version = "0.1.0"
+description = "Python bindings for Rudolf-V calibrated camera geometry"
+requires-python = ">=3.10"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "camera_geometry._native"
+python-source = "python"

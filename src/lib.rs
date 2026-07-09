@@ -22,3 +22,5 @@ pub mod pyramid;
 pub mod rigid_ransac;
 pub mod shi_tomasi;
 pub mod stereo;
+
+pub use camera_geometry;
