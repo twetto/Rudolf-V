@@ -22,7 +22,7 @@
 //   more idiomatic than enum matching.
 
 use crate::camera::CameraIntrinsics;
-use crate::essential::{self, Correspondence, RansacConfig};
+use crate::essential::{self, BearingCorrespondence, RansacConfig};
 use crate::fast::{FastDetector, Feature};
 use crate::harris::HarrisDetector;
 use crate::histeq::{self, HistEqMethod};
@@ -879,26 +879,33 @@ impl Frontend {
                         if self.features.len() >= 8 {
                             // Build correspondences: prev_features -> current features.
                             // Match by ID (both lists may differ if features were lost).
-                            let corrs: Vec<(usize, Correspondence)> = self
+                            let corrs: Vec<(usize, BearingCorrespondence)> = self
                                 .features
                                 .iter()
                                 .enumerate()
                                 .filter_map(|(idx, f)| {
-                                    self.prev_features
-                                        .iter()
-                                        .find(|pf| pf.id == f.id)
-                                        .map(|pf| {
-                                            let (x1, y1) =
-                                                cam.normalize_undistorted(pf.x as f64, pf.y as f64);
-                                            let (x2, y2) =
-                                                cam.normalize_undistorted(f.x as f64, f.y as f64);
-                                            (idx, Correspondence { x1, y1, x2, y2 })
-                                        })
+                                    self.prev_features.iter().find(|pf| pf.id == f.id).and_then(
+                                        |pf| {
+                                            let b1 = cam
+                                                .pixel_to_bearing(pf.x as f64, pf.y as f64)?
+                                                .vector();
+                                            let b2 = cam
+                                                .pixel_to_bearing(f.x as f64, f.y as f64)?
+                                                .vector();
+                                            Some((
+                                                idx,
+                                                BearingCorrespondence {
+                                                    b1: [b1.x, b1.y, b1.z],
+                                                    b2: [b2.x, b2.y, b2.z],
+                                                },
+                                            ))
+                                        },
+                                    )
                                 })
                                 .collect();
 
                             if corrs.len() >= 8 {
-                                let corr_only: Vec<Correspondence> =
+                                let corr_only: Vec<BearingCorrespondence> =
                                     corrs.iter().map(|(_, c)| *c).collect();
 
                                 // Prior gate first; falls back to estimated
@@ -913,12 +920,13 @@ impl Frontend {
                                     let baseline = (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt();
                                     if baseline >= self.config.epipolar_min_baseline {
                                         essential::essential_from_pose(&r, &t).and_then(|e| {
-                                            let res = essential::epipolar_inliers_with_prior(
-                                                &e,
-                                                &corr_only,
-                                                self.config.epipolar_gate_threshold,
-                                                self.config.epipolar_refine,
-                                            );
+                                            let res =
+                                                essential::epipolar_inliers_with_prior_bearings(
+                                                    &e,
+                                                    &corr_only,
+                                                    self.config.epipolar_gate_threshold,
+                                                    self.config.epipolar_refine,
+                                                );
                                             let reject_frac = 1.0
                                                 - res.num_inliers as f64 / res.total.max(1) as f64;
                                             (reject_frac <= self.config.epipolar_max_reject_frac)
@@ -933,7 +941,7 @@ impl Frontend {
                                 let result_opt = match gate_result {
                                     Some(res) => Some(res),
                                     None if self.config.enable_internal_ransac => {
-                                        essential::estimate_essential_ransac(
+                                        essential::estimate_essential_ransac_bearings(
                                             &corr_only,
                                             &self.config.ransac,
                                         )

@@ -1,12 +1,14 @@
 // examples/euroc_live.rs
 //
-// Live visualization of the Rudolf-V frontend on EuRoC data.
+// Live visualization of the Rudolf-V frontend on EuRoC/TUM-VI-style data.
 // Shows a window with the camera image, tracked features, flow arrows,
 // and fading track trails — like your C tracker's SDL window but in Rust.
 //
 // Usage:
 //   cargo run --example euroc_live --release -- /path/to/MH_01_easy
 //   cargo run --example euroc_live --release -- /path/to/MH_01_easy 500
+//   cargo run --example tumvi_live --release
+//   cargo run --example tumvi_live --release -- /path/to/tumvi/dataset 500
 //
 // Controls:
 //   Space  — pause/resume
@@ -83,12 +85,24 @@ fn detector_label(detector: DetectorType) -> &'static str {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: {} <euroc_dataset_path> [max_frames]", args[0]);
+    let invoked_as_tumvi = args
+        .first()
+        .and_then(|arg| Path::new(arg).file_stem())
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.contains("tumvi"));
+
+    if args.len() < 2 && !invoked_as_tumvi {
+        eprintln!("Usage: {} <dataset_path> [max_frames]", args[0]);
+        eprintln!("  EuRoC:  cargo run --example euroc_live --release -- /path/to/MH_01_easy");
+        eprintln!("  TUM-VI: cargo run --example tumvi_live --release");
         std::process::exit(1);
     }
 
-    let dataset_path = PathBuf::from(&args[1]);
+    let dataset_path = args.get(1).map(PathBuf::from).unwrap_or_else(|| {
+        PathBuf::from("target")
+            .join("tumvi")
+            .join("dataset-calib-cam1_512_16")
+    });
     let max_frames: usize = args
         .get(2)
         .and_then(|s| s.parse().ok())
@@ -143,14 +157,15 @@ fn main() {
 
     // Load camera intrinsics for geometric verification (optional).
     let sensor_yaml = cam0_dir.join("sensor.yaml");
-    let camera = match CameraIntrinsics::from_euroc_yaml(&sensor_yaml) {
+    let camera = match load_camera(&dataset_path, &sensor_yaml, "cam0") {
         Ok(cam) => {
             println!(
-                "Camera: fx={:.1} fy={:.1} cx={:.1} cy={:.1}, {} distortion coeffs",
+                "Camera: fx={:.1} fy={:.1} cx={:.1} cy={:.1}, {:?}, {} distortion coeffs",
                 cam.fx,
                 cam.fy,
                 cam.cx,
                 cam.cy,
+                cam.model,
                 cam.distortion.len()
             );
             Some(cam)
@@ -438,6 +453,21 @@ fn parse_euroc_csv(csv_path: &Path) -> Vec<String> {
         }
     }
     filenames
+}
+
+fn load_camera(
+    dataset_path: &Path,
+    sensor_yaml: &Path,
+    camera: &str,
+) -> Result<CameraIntrinsics, String> {
+    if sensor_yaml.exists() {
+        return CameraIntrinsics::from_euroc_yaml(sensor_yaml);
+    }
+    let camchain = dataset_path.join("dso").join("camchain.yaml");
+    if camchain.exists() {
+        return CameraIntrinsics::from_kalibr_camchain(&camchain, camera);
+    }
+    CameraIntrinsics::from_euroc_yaml(sensor_yaml)
 }
 
 fn list_png_files(dir: &Path) -> Vec<String> {

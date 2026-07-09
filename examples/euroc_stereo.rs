@@ -1,11 +1,13 @@
-// examples/euroc_stereo.rs — Stereo matching on EuRoC datasets.
+// examples/euroc_stereo.rs — Stereo matching on EuRoC/TUM-VI datasets.
 //
 // Runs the CPU frontend on cam0, then matches tracked features into cam1
-// using the 1D inverse-depth Gauss-Newton stereo matcher.
+// using the 1D unit-bearing + log-range Gauss-Newton stereo matcher.
 //
 // Usage:
 //     cargo run --example euroc_stereo --release -- /path/to/V2_01_easy
 //     cargo run --example euroc_stereo --release -- /path/to/V2_01_easy 200
+//     cargo run --example tumvi_stereo --release
+//     cargo run --example tumvi_stereo --release -- /path/to/dataset-calib-cam1_512_16 200
 //
 // Env vars:
 //     RUDOLF_DETECTOR    — "fast" / "shi-tomasi" / "harris" (default: fast)
@@ -13,7 +15,7 @@
 //     RUDOLF_SHI_THRESH  — Shi-Tomasi floor            (default: 0)
 //     RUDOLF_SHI_BLOCK   — Shi-Tomasi tensor half-size (default: 2)
 
-use rudolf_v::camera::{CameraIntrinsics, StereoRig};
+use rudolf_v::camera::StereoRig;
 use rudolf_v::fast::Feature;
 use rudolf_v::frontend::{DetectorType, Frontend, FrontendConfig, LbpPolicy};
 use rudolf_v::histeq::{self, HistEqMethod};
@@ -27,12 +29,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-const VIS_NEAR_DEPTH_M: f64 = 0.5;
-const VIS_FAR_DEPTH_M: f64 = 5.0;
+const VIS_NEAR_RANGE_M: f64 = 0.5;
+const VIS_FAR_RANGE_M: f64 = 5.0;
 const PANEL_GAP: usize = 8;
 
 #[derive(Clone, Copy)]
-struct DepthStats {
+struct RangeStats {
     mean: f64,
     median: f64,
     min: f64,
@@ -87,13 +89,42 @@ fn detector_label(detector: DetectorType) -> &'static str {
     }
 }
 
+fn load_stereo_rig(data_dir: &Path) -> Result<StereoRig, String> {
+    let cam0_yaml = data_dir.join("mav0/cam0/sensor.yaml");
+    let cam1_yaml = data_dir.join("mav0/cam1/sensor.yaml");
+    if cam0_yaml.exists() && cam1_yaml.exists() {
+        return StereoRig::from_euroc(&cam0_yaml, &cam1_yaml);
+    }
+
+    let camchain = data_dir.join("dso/camchain.yaml");
+    if camchain.exists() {
+        return StereoRig::from_kalibr_camchain(&camchain);
+    }
+
+    Err(format!(
+        "expected EuRoC sensor.yaml files at {} and {}, or TUM-VI/Kalibr camchain at {}",
+        cam0_yaml.display(),
+        cam1_yaml.display(),
+        camchain.display()
+    ))
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
+    let exe_name = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+        .unwrap_or_else(|| "euroc_stereo".to_string());
+    let is_tumvi_example = exe_name.contains("tumvi_stereo");
+
+    if args.len() < 2 && !is_tumvi_example {
         eprintln!("Usage: euroc_stereo <euroc_dataset_path> [num_frames]");
         std::process::exit(1);
     }
-    let data_dir = PathBuf::from(&args[1]);
+    let data_dir = args
+        .get(1)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("target/tumvi/dataset-calib-cam1_512_16"));
     let max_frames: usize = args
         .get(2)
         .and_then(|s| s.parse().ok())
@@ -102,8 +133,8 @@ fn main() {
     let cam0_dir = data_dir.join("mav0/cam0");
     let cam1_dir = data_dir.join("mav0/cam1");
 
-    let rig = StereoRig::from_euroc(&cam0_dir.join("sensor.yaml"), &cam1_dir.join("sensor.yaml"))
-        .expect("Failed to load stereo rig from EuRoC sensor.yaml files");
+    let rig = load_stereo_rig(&data_dir)
+        .unwrap_or_else(|e| panic!("Failed to load stereo rig from {}: {e}", data_dir.display()));
 
     println!("Stereo rig: baseline = {:.4}m", rig.baseline_meters());
     println!(
@@ -142,7 +173,7 @@ fn main() {
     let (w, h) = (cam0_frames[0].width(), cam0_frames[0].height());
     println!("Resolution: {w}×{h}, {num_frames} pairs loaded\n");
 
-    let camera = Some(CameraIntrinsics::from_euroc_yaml(&cam0_dir.join("sensor.yaml")).unwrap());
+    let camera = Some(rig.cam0.clone());
 
     let detector = env_detector();
     let fast_threshold: u8 = std::env::var("RUDOLF_FAST_THRESH")
@@ -202,7 +233,7 @@ fn main() {
     let win_w = panel_w * 2 + PANEL_GAP;
     let win_h = panel_h;
     let mut window = Window::new(
-        "Rudolf-V — EuRoC Stereo Depth",
+        "Rudolf-V — EuRoC Stereo Range",
         win_w,
         win_h,
         WindowOptions {
@@ -216,10 +247,10 @@ fn main() {
     let mut fb = vec![0u32; win_w * win_h];
     let mut cam1_display_buf = Image::new(w, h);
 
-    eprintln!("frame,features,matched,match_rate,mean_depth,median_depth,min_depth,max_depth,frontend_ms,stereo_ms");
+    eprintln!("frame,features,matched,match_rate,mean_range,median_range,min_range,max_range,frontend_ms,stereo_ms");
     println!(
-        "Depth colors: {:.1}m red/yellow, {:.1}m blue (metric Z-depth). Controls: Q/Esc=quit",
-        VIS_NEAR_DEPTH_M, VIS_FAR_DEPTH_M
+        "Range colors: {:.1}m red/yellow, {:.1}m blue (unit-bearing range). Controls: Q/Esc=quit",
+        VIS_NEAR_RANGE_M, VIS_FAR_RANGE_M
     );
 
     let mut total_frontend_ms = 0.0f64;
@@ -297,11 +328,11 @@ fn main() {
             0.0
         };
 
-        let depth_stats = summarize_depths(&matched);
+        let range_stats = summarize_ranges(rig, &features, &matches);
 
         eprintln!(
             "{i},{n_features},{n_matched},{rate:.1},{:.2},{:.2},{:.2},{:.2},{frontend_ms:.2},{stereo_ms:.2}",
-            depth_stats.mean, depth_stats.median, depth_stats.min, depth_stats.max
+            range_stats.mean, range_stats.median, range_stats.min, range_stats.max
         );
 
         total_frontend_ms += frontend_ms;
@@ -315,13 +346,14 @@ fn main() {
             histeq::apply_histeq_into(&cam1_frames[i], stereo_histeq, &mut cam1_display_buf);
             &cam1_display_buf
         };
-        render_stereo_depth(
+        render_stereo_range(
             &mut fb,
             win_w,
             cam0_display,
             cam1_display,
             &features,
             &matches,
+            rig,
             scale,
         );
         window
@@ -330,8 +362,8 @@ fn main() {
 
         if i % 50 == 0 || i == num_frames - 1 {
             println!(
-                "Frame {i:4}: {n_matched:3}/{n_features:3} matched ({rate:4.1}%) | depth: mean={:5.2}m median={:5.2}m [{:.2}–{:.2}m] | fe={frontend_ms:.1}ms stereo={stereo_ms:.1}ms",
-                depth_stats.mean, depth_stats.median, depth_stats.min, depth_stats.max
+                "Frame {i:4}: {n_matched:3}/{n_features:3} matched ({rate:4.1}%) | range: mean={:5.2}m median={:5.2}m [{:.2}–{:.2}m] | fe={frontend_ms:.1}ms stereo={stereo_ms:.1}ms",
+                range_stats.mean, range_stats.median, range_stats.min, range_stats.max
             );
         }
     }
@@ -364,12 +396,17 @@ fn main() {
     println!();
 }
 
-fn summarize_depths(matches: &[&StereoMatch]) -> DepthStats {
-    let mut depths: Vec<f64> = matches.iter().map(|m| 1.0 / m.inv_depth as f64).collect();
-    depths.sort_by(|a, b| a.total_cmp(b));
+fn summarize_ranges(rig: &StereoRig, features: &[Feature], matches: &[StereoMatch]) -> RangeStats {
+    let mut ranges: Vec<f64> = features
+        .iter()
+        .zip(matches)
+        .filter_map(|(feat, m)| m.point_cam0(rig, feat))
+        .map(|p| (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt())
+        .collect();
+    ranges.sort_by(|a, b| a.total_cmp(b));
 
-    if depths.is_empty() {
-        return DepthStats {
+    if ranges.is_empty() {
+        return RangeStats {
             mean: 0.0,
             median: 0.0,
             min: 0.0,
@@ -377,22 +414,23 @@ fn summarize_depths(matches: &[&StereoMatch]) -> DepthStats {
         };
     }
 
-    let mean = depths.iter().sum::<f64>() / depths.len() as f64;
-    DepthStats {
+    let mean = ranges.iter().sum::<f64>() / ranges.len() as f64;
+    RangeStats {
         mean,
-        median: depths[depths.len() / 2],
-        min: depths[0],
-        max: depths[depths.len() - 1],
+        median: ranges[ranges.len() / 2],
+        min: ranges[0],
+        max: ranges[ranges.len() - 1],
     }
 }
 
-fn render_stereo_depth(
+fn render_stereo_range(
     fb: &mut [u32],
     win_w: usize,
     cam0: &Image<u8>,
     cam1: &Image<u8>,
     features: &[Feature],
     matches: &[StereoMatch],
+    rig: &StereoRig,
     scale: usize,
 ) {
     fb.fill(0xFF202020);
@@ -409,8 +447,13 @@ fn render_stereo_depth(
             continue;
         }
 
-        let depth_m = 1.0 / stereo_match.inv_depth as f64;
-        let color = color_for_depth(depth_m);
+        let Some(p_cam0) = stereo_match.point_cam0(rig, feature) else {
+            draw_cross_scaled(fb, win_w, 0, feature.x, feature.y, scale, 0xFFFF3030);
+            continue;
+        };
+        let range_m =
+            (p_cam0[0] * p_cam0[0] + p_cam0[1] * p_cam0[1] + p_cam0[2] * p_cam0[2]).sqrt();
+        let color = color_for_range(range_m);
 
         draw_point_scaled(fb, win_w, 0, feature.x, feature.y, scale, color);
         draw_point_scaled(
@@ -510,8 +553,8 @@ fn grayscale_color(value: u8) -> u32 {
     0xFF000000 | (c << 16) | (c << 8) | c
 }
 
-fn color_for_depth(depth_m: f64) -> u32 {
-    let t = ((VIS_FAR_DEPTH_M - depth_m) / (VIS_FAR_DEPTH_M - VIS_NEAR_DEPTH_M)).clamp(0.0, 1.0);
+fn color_for_range(range_m: f64) -> u32 {
+    let t = ((VIS_FAR_RANGE_M - range_m) / (VIS_FAR_RANGE_M - VIS_NEAR_RANGE_M)).clamp(0.0, 1.0);
     jet_color(t)
 }
 

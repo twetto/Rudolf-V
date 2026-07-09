@@ -1,4 +1,4 @@
-// camera.rs -- Pinhole camera model with radial-tangential distortion.
+// camera.rs -- Rudolf-V camera calibration compatibility layer.
 //
 // Handles:
 // - Parsing camera intrinsics from EuRoC ASL sensor.yaml
@@ -8,8 +8,17 @@
 // The EuRoC sensor.yaml format is simple enough that we parse it
 // manually, avoiding a serde_yaml dependency.
 
-use std::fs;
-use std::path::Path;
+use camera_geometry::{CameraModel, CameraProjection, Pixel, UnitBearing};
+use nalgebra::Vector3;
+use std::{fs, path::Path};
+
+/// Projection model represented by this calibration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DistortionModel {
+    None,
+    RadTan,
+    Equidistant,
+}
 
 /// Pinhole camera intrinsics with optional radial-tangential distortion.
 #[derive(Debug, Clone)]
@@ -27,6 +36,8 @@ pub struct CameraIntrinsics {
     /// Radial-tangential distortion coefficients [k1, k2, p1, p2].
     /// Empty if no distortion model.
     pub distortion: Vec<f64>,
+    /// Projection/distortion interpretation for `distortion`.
+    pub model: DistortionModel,
 }
 
 impl CameraIntrinsics {
@@ -39,6 +50,7 @@ impl CameraIntrinsics {
             cy,
             resolution: [width, height],
             distortion: Vec::new(),
+            model: DistortionModel::None,
         }
     }
 
@@ -53,7 +65,19 @@ impl CameraIntrinsics {
     pub fn from_euroc_yaml(path: &Path) -> Result<Self, String> {
         let content = fs::read_to_string(path)
             .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+        Self::from_yaml_content(&content)
+    }
 
+    /// Parse one camera from a Kalibr camchain file.
+    pub fn from_kalibr_camchain(path: &Path, camera: &str) -> Result<Self, String> {
+        let content = fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+        let section = yaml_section(&content, camera)
+            .ok_or_else(|| format!("camera section {camera}: not found in {}", path.display()))?;
+        Self::from_yaml_content(section)
+    }
+
+    fn from_yaml_content(content: &str) -> Result<Self, String> {
         let intrinsics = parse_bracket_values(&content, "intrinsics:")
             .ok_or_else(|| "intrinsics: line not found".to_string())?;
         if intrinsics.len() != 4 {
@@ -69,8 +93,10 @@ impl CameraIntrinsics {
             ));
         }
 
-        let distortion =
-            parse_bracket_values(&content, "distortion_coefficients:").unwrap_or_default();
+        let distortion = parse_bracket_values(&content, "distortion_coefficients:")
+            .or_else(|| parse_bracket_values(&content, "distortion_coeffs:"))
+            .unwrap_or_default();
+        let model = parse_projection_model(&content, &distortion)?;
 
         Ok(CameraIntrinsics {
             fx: intrinsics[0],
@@ -79,6 +105,7 @@ impl CameraIntrinsics {
             cy: intrinsics[3],
             resolution: [resolution[0] as usize, resolution[1] as usize],
             distortion,
+            model,
         })
     }
 
@@ -105,125 +132,96 @@ impl CameraIntrinsics {
     ///
     /// Returns the undistorted pixel coordinates.
     pub fn undistort_point(&self, u: f64, v: f64) -> (f64, f64) {
-        if self.distortion.is_empty() {
-            return (u, v);
-        }
-
-        let k1 = self.distortion.get(0).copied().unwrap_or(0.0);
-        let k2 = self.distortion.get(1).copied().unwrap_or(0.0);
-        let p1 = self.distortion.get(2).copied().unwrap_or(0.0);
-        let p2 = self.distortion.get(3).copied().unwrap_or(0.0);
-
-        // Work in normalized coordinates.
-        let x0 = (u - self.cx) / self.fx;
-        let y0 = (v - self.cy) / self.fy;
-
-        // Iterative undistortion: solve the forward distortion model
-        // x_d = x(1 + k1*r^2 + k2*r^4) + 2*p1*x*y + p2*(r^2 + 2*x^2)
-        // y_d = y(1 + k1*r^2 + k2*r^4) + p1*(r^2 + 2*y^2) + 2*p2*x*y
-        // for (x, y) given (x_d, y_d) = (x0, y0).
-        let mut x = x0;
-        let mut y = y0;
-
-        for _ in 0..20 {
-            let r2 = x * x + y * y;
-            let r4 = r2 * r2;
-            let radial = 1.0 + k1 * r2 + k2 * r4;
-            let dx = 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x);
-            let dy = p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y;
-
-            x = (x0 - dx) / radial;
-            y = (y0 - dy) / radial;
-        }
-
+        let (x, y) = self.pixel_to_normalized_legacy(u, v);
         self.denormalize(x, y)
     }
 
     /// Normalize a pixel point with undistortion: pixel -> undistorted normalized.
     pub fn normalize_undistorted(&self, u: f64, v: f64) -> (f64, f64) {
-        let (u_ud, v_ud) = self.undistort_point(u, v);
-        self.normalize(u_ud, v_ud)
+        self.pixel_to_normalized_legacy(u, v)
+    }
+
+    /// Convert a pixel to a unit-sphere bearing.
+    ///
+    /// This is the geometry-first API. It preserves fisheye rays that cannot be
+    /// represented safely as pinhole-normalized `(x/z, y/z)` coordinates.
+    pub fn pixel_to_bearing(&self, u: f64, v: f64) -> Option<UnitBearing> {
+        self.projection().unproject(Pixel::new(u, v))
+    }
+
+    /// Convert a unit bearing to legacy pinhole-normalized coordinates.
+    ///
+    /// Transitional adapter for old call sites. New geometric code should use
+    /// `UnitBearing` directly.
+    pub fn bearing_to_normalized_legacy(bearing: UnitBearing) -> Option<(f64, f64)> {
+        let b = bearing.vector();
+        (b.z.abs() > 1.0e-12).then_some((b.x / b.z, b.y / b.z))
+    }
+
+    /// Legacy pixel -> `(x/z, y/z)` adapter.
+    pub fn pixel_to_normalized_legacy(&self, u: f64, v: f64) -> (f64, f64) {
+        self.pixel_to_bearing(u, v)
+            .and_then(Self::bearing_to_normalized_legacy)
+            .unwrap_or((f64::NAN, f64::NAN))
     }
 
     /// Apply forward radial-tangential distortion to normalized coordinates.
     ///
     /// Given undistorted normalized (x, y), returns distorted normalized (x_d, y_d).
     pub fn distort_normalized(&self, x: f64, y: f64) -> (f64, f64) {
-        if self.distortion.is_empty() {
-            return (x, y);
-        }
-        let k1 = self.distortion.get(0).copied().unwrap_or(0.0);
-        let k2 = self.distortion.get(1).copied().unwrap_or(0.0);
-        let p1 = self.distortion.get(2).copied().unwrap_or(0.0);
-        let p2 = self.distortion.get(3).copied().unwrap_or(0.0);
-
-        let r2 = x * x + y * y;
-        let r4 = r2 * r2;
-        let radial = 1.0 + k1 * r2 + k2 * r4;
-        let x_d = x * radial + 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x);
-        let y_d = y * radial + p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y;
-        (x_d, y_d)
+        let Some(pixel) = self.projection().project(Vector3::new(x, y, 1.0)) else {
+            return (f64::NAN, f64::NAN);
+        };
+        self.normalize(pixel.x(), pixel.y())
     }
 
     /// Project a 3D point (in camera frame) to distorted pixel coordinates.
     ///
     /// Returns `None` if the point is behind or too close to the camera (Z ≤ 1e-6).
     pub fn project_point(&self, p: [f64; 3]) -> Option<(f64, f64)> {
-        if p[2] <= 1e-6 {
-            return None;
-        }
-        let z_inv = 1.0 / p[2];
-        let x_n = p[0] * z_inv;
-        let y_n = p[1] * z_inv;
-        let (x_d, y_d) = self.distort_normalized(x_n, y_n);
-        Some(self.denormalize(x_d, y_d))
+        let pixel = self.projection().project(Vector3::new(p[0], p[1], p[2]))?;
+        Some((pixel.x(), pixel.y()))
     }
 
     /// 2×3 Jacobian d(u,v)/d(X,Y,Z) of the full projection including distortion.
     ///
     /// Returns `[[du/dX, du/dY, du/dZ], [dv/dX, dv/dY, dv/dZ]]`.
     pub fn projection_jacobian(&self, p: [f64; 3]) -> [[f64; 3]; 2] {
-        let z_inv = 1.0 / p[2];
-        let x = p[0] * z_inv;
-        let y = p[1] * z_inv;
+        let Some(j) = self
+            .projection()
+            .project_jacobian(Vector3::new(p[0], p[1], p[2]))
+        else {
+            return [[f64::NAN; 3]; 2];
+        };
+        [
+            [j[(0, 0)], j[(0, 1)], j[(0, 2)]],
+            [j[(1, 0)], j[(1, 1)], j[(1, 2)]],
+        ]
+    }
 
-        // d(x,y)/d(X,Y,Z) — pinhole normalization Jacobian
-        let dx_dp = [z_inv, 0.0, -x * z_inv];
-        let dy_dp = [0.0, z_inv, -y * z_inv];
-
-        if self.distortion.is_empty() {
-            return [
-                [self.fx * dx_dp[0], self.fx * dx_dp[1], self.fx * dx_dp[2]],
-                [self.fy * dy_dp[0], self.fy * dy_dp[1], self.fy * dy_dp[2]],
-            ];
+    /// Concrete camera-geometry projection model for this calibration.
+    pub fn projection(&self) -> CameraProjection {
+        let intrinsics = [self.fx, self.fy, self.cx, self.cy];
+        match self.effective_model() {
+            DistortionModel::None => CameraProjection::pinhole(intrinsics, self.resolution),
+            DistortionModel::RadTan => CameraProjection::pinhole_radtan(
+                intrinsics,
+                distortion4(&self.distortion),
+                self.resolution,
+            ),
+            DistortionModel::Equidistant => CameraProjection::pinhole_equidistant(
+                intrinsics,
+                distortion4(&self.distortion),
+                self.resolution,
+            ),
         }
+    }
 
-        let k1 = self.distortion.get(0).copied().unwrap_or(0.0);
-        let k2 = self.distortion.get(1).copied().unwrap_or(0.0);
-        let p1 = self.distortion.get(2).copied().unwrap_or(0.0);
-        let p2 = self.distortion.get(3).copied().unwrap_or(0.0);
-
-        let r2 = x * x + y * y;
-        let r4 = r2 * r2;
-        let radial = 1.0 + k1 * r2 + k2 * r4;
-        let d_radial_dr2 = k1 + 2.0 * k2 * r2;
-
-        // d(x_d)/d(x) and d(x_d)/d(y)
-        let dxd_dx = radial + 2.0 * x * x * d_radial_dr2 + 2.0 * p1 * y + 6.0 * p2 * x;
-        let dxd_dy = 2.0 * x * y * d_radial_dr2 + 2.0 * p1 * x + 2.0 * p2 * y;
-        let dyd_dx = 2.0 * x * y * d_radial_dr2 + 2.0 * p1 * x + 2.0 * p2 * y;
-        let dyd_dy = radial + 2.0 * y * y * d_radial_dr2 + 6.0 * p1 * y + 2.0 * p2 * x;
-
-        // Chain: d(u,v)/d(X,Y,Z) = diag(fx,fy) * d(xd,yd)/d(x,y) * d(x,y)/d(X,Y,Z)
-        let mut row_u = [0.0; 3];
-        let mut row_v = [0.0; 3];
-        for i in 0..3 {
-            let dxi = dx_dp[i];
-            let dyi = dy_dp[i];
-            row_u[i] = self.fx * (dxd_dx * dxi + dxd_dy * dyi);
-            row_v[i] = self.fy * (dyd_dx * dxi + dyd_dy * dyi);
+    fn effective_model(&self) -> DistortionModel {
+        match (self.model, self.distortion.is_empty()) {
+            (DistortionModel::None, false) => DistortionModel::RadTan,
+            (model, _) => model,
         }
-        [row_u, row_v]
     }
 }
 
@@ -255,6 +253,34 @@ impl StereoRig {
         let t_bs1 = parse_t_bs(cam1_yaml)?;
         let t_bs1_inv = invert_se3(&t_bs1);
         let t_10 = multiply_se3(&t_bs1_inv, &t_bs0);
+        let r_10 = [
+            [t_10[0][0], t_10[0][1], t_10[0][2]],
+            [t_10[1][0], t_10[1][1], t_10[1][2]],
+            [t_10[2][0], t_10[2][1], t_10[2][2]],
+        ];
+        let t = [t_10[0][3], t_10[1][3], t_10[2][3]];
+        Ok(StereoRig {
+            cam0,
+            cam1,
+            r_10,
+            t_10: t,
+        })
+    }
+
+    /// Parse a stereo rig from a Kalibr camchain file.
+    ///
+    /// Kalibr stores `T_cn_cnm1` under `cam1` as the transform from the
+    /// previous camera (`cam0`) to the current camera (`cam1`), matching this
+    /// type's `p_cam1 = R * p_cam0 + t` convention.
+    pub fn from_kalibr_camchain(path: &Path) -> Result<Self, String> {
+        let content = fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+        let cam0 = CameraIntrinsics::from_kalibr_camchain(path, "cam0")?;
+        let cam1 = CameraIntrinsics::from_kalibr_camchain(path, "cam1")?;
+        let cam1_section = yaml_section(&content, "cam1")
+            .ok_or_else(|| format!("camera section cam1: not found in {}", path.display()))?;
+        let t_10 = parse_matrix4_after_key(cam1_section, "T_cn_cnm1:")
+            .ok_or_else(|| format!("T_cn_cnm1: not found in {}", path.display()))?;
         let r_10 = [
             [t_10[0][0], t_10[0][1], t_10[0][2]],
             [t_10[1][0], t_10[1][1], t_10[1][2]],
@@ -355,6 +381,88 @@ fn parse_bracket_values(content: &str, key: &str) -> Option<Vec<f64>> {
         .filter_map(|s| s.trim().parse::<f64>().ok())
         .collect();
     Some(vals)
+}
+
+fn parse_matrix4_after_key(content: &str, key: &str) -> Option<[[f64; 4]; 4]> {
+    let mut lines = content.lines().skip_while(|line| line.trim() != key);
+    lines.next()?;
+    let mut rows = [[0.0; 4]; 4];
+    for row in &mut rows {
+        let line = lines.next()?.trim();
+        let open = line.find('[')?;
+        let close = line.rfind(']')?;
+        let vals: Vec<f64> = line[open + 1..close]
+            .split(',')
+            .filter_map(|s| s.trim().parse::<f64>().ok())
+            .collect();
+        if vals.len() != 4 {
+            return None;
+        }
+        row.copy_from_slice(&vals);
+    }
+    Some(rows)
+}
+
+fn yaml_section<'a>(content: &'a str, name: &str) -> Option<&'a str> {
+    let marker = format!("{name}:");
+    let start_line = content.lines().position(|line| line.trim_end() == marker)?;
+    let start_byte = content
+        .lines()
+        .take(start_line + 1)
+        .map(|line| line.len() + 1)
+        .sum::<usize>();
+    let tail = &content[start_byte..];
+    let end = tail.find("\ncam").unwrap_or(tail.len());
+    Some(&tail[..end])
+}
+
+fn parse_projection_model(content: &str, distortion: &[f64]) -> Result<DistortionModel, String> {
+    let camera_model = parse_scalar_value(content, "camera_model:").unwrap_or("pinhole");
+    let distortion_model = parse_scalar_value(content, "distortion_model:").unwrap_or("");
+    match (camera_model, distortion_model) {
+        ("pinhole", "" | "none") if distortion.is_empty() => Ok(DistortionModel::None),
+        ("pinhole", "radtan" | "radial-tangential") => {
+            validate_distortion_len("radtan", distortion)?;
+            Ok(DistortionModel::RadTan)
+        }
+        ("pinhole", "equidistant") => {
+            validate_distortion_len("equidistant", distortion)?;
+            Ok(DistortionModel::Equidistant)
+        }
+        ("pinhole", "") if !distortion.is_empty() => {
+            validate_distortion_len("implicit radtan", distortion)?;
+            Ok(DistortionModel::RadTan)
+        }
+        _ => Err(format!(
+            "unsupported camera projection camera_model={camera_model}, distortion_model={distortion_model}"
+        )),
+    }
+}
+
+fn parse_scalar_value<'a>(content: &'a str, key: &str) -> Option<&'a str> {
+    content
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(key).map(str::trim))
+}
+
+fn validate_distortion_len(name: &str, distortion: &[f64]) -> Result<(), String> {
+    if distortion.len() == 4 {
+        Ok(())
+    } else {
+        Err(format!(
+            "{name} distortion expected 4 values, got {}",
+            distortion.len()
+        ))
+    }
+}
+
+fn distortion4(distortion: &[f64]) -> [f64; 4] {
+    [
+        distortion.first().copied().unwrap_or(0.0),
+        distortion.get(1).copied().unwrap_or(0.0),
+        distortion.get(2).copied().unwrap_or(0.0),
+        distortion.get(3).copied().unwrap_or(0.0),
+    ]
 }
 
 #[cfg(test)]
@@ -616,6 +724,61 @@ mod tests {
             t_10[1][3].abs() < 0.01,
             "EuRoC stereo baseline should be mostly horizontal, got y={}",
             t_10[1][3]
+        );
+    }
+
+    #[test]
+    fn test_kalibr_camchain_stereo_rig() {
+        let camchain = r#"
+cam0:
+  T_cam_imu:
+  - [1.0, 0.0, 0.0, 0.0]
+  - [0.0, 1.0, 0.0, 0.0]
+  - [0.0, 0.0, 1.0, 0.0]
+  - [0.0, 0.0, 0.0, 1.0]
+  camera_model: pinhole
+  distortion_coeffs: [0.01, 0.02, 0.03, 0.04]
+  distortion_model: equidistant
+  intrinsics: [190.0, 191.0, 254.0, 255.0]
+  resolution: [512, 512]
+cam1:
+  T_cam_imu:
+  - [1.0, 0.0, 0.0, -0.1]
+  - [0.0, 1.0, 0.0, 0.0]
+  - [0.0, 0.0, 1.0, 0.0]
+  - [0.0, 0.0, 0.0, 1.0]
+  T_cn_cnm1:
+  - [1.0, 0.0, 0.0, -0.101]
+  - [0.0, 1.0, 0.0, -0.002]
+  - [0.0, 0.0, 1.0, -0.001]
+  - [0.0, 0.0, 0.0, 1.0]
+  camera_model: pinhole
+  distortion_coeffs: [0.05, 0.06, 0.07, 0.08]
+  distortion_model: equidistant
+  intrinsics: [192.0, 193.0, 252.0, 253.0]
+  resolution: [512, 512]
+"#;
+        let path = std::env::temp_dir().join(format!(
+            "rudolf_v_test_camchain_{}_{}.yaml",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, camchain).unwrap();
+
+        let rig = StereoRig::from_kalibr_camchain(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(rig.cam0.model, DistortionModel::Equidistant);
+        assert_eq!(rig.cam1.model, DistortionModel::Equidistant);
+        assert!((rig.cam0.fx - 190.0).abs() < 1e-12);
+        assert!((rig.cam1.cx - 252.0).abs() < 1e-12);
+        assert!((rig.t_10[0] + 0.101).abs() < 1e-12);
+        assert!((rig.t_10[1] + 0.002).abs() < 1e-12);
+        assert!((rig.t_10[2] + 0.001).abs() < 1e-12);
+        assert!(
+            (rig.baseline_meters() - (0.101f64 * 0.101 + 0.002 * 0.002 + 0.001 * 0.001).sqrt())
+                .abs()
+                < 1e-12
         );
     }
 }

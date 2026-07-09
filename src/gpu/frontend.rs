@@ -38,7 +38,7 @@
 use std::time::Instant;
 
 use crate::camera::CameraIntrinsics;
-use crate::essential::{self, Correspondence, RansacConfig};
+use crate::essential::{self, BearingCorrespondence, RansacConfig};
 use crate::fast::Feature;
 use crate::frontend::{select_by_tile_deficit, FrameStats, TimingStats};
 use crate::gpu::device::GpuDevice;
@@ -121,21 +121,21 @@ impl Default for GpuFrontendConfig {
     fn default() -> Self {
         GpuFrontendConfig {
             submit_strategy: SubmitStrategy::Separate,
-            nms_strategy:    NmsStrategy::Cpu,
-            fast_threshold:  20,
+            nms_strategy: NmsStrategy::Cpu,
+            fast_threshold: 20,
             fast_arc_length: 9,
-            max_features:    200,
-            cell_size:       16,
+            max_features: 200,
+            cell_size: 16,
             coarse_tile_cols: 8,
             coarse_tile_rows: 6,
-            pyramid_levels:  3,
-            pyramid_sigma:   1.0,
-            klt_window:      7,
-            klt_max_iter:    30,
-            klt_epsilon:     0.01,
-            histeq:          HistEqMethod::None,
-            camera:          None,
-            ransac:          RansacConfig::default(),
+            pyramid_levels: 3,
+            pyramid_sigma: 1.0,
+            klt_window: 7,
+            klt_max_iter: 30,
+            klt_epsilon: 0.01,
+            histeq: HistEqMethod::None,
+            camera: None,
+            ransac: RansacConfig::default(),
         }
     }
 }
@@ -172,19 +172,19 @@ pub struct GpuFrontend {
 
     // GPU pipelines (compiled once).
     pyr_pipeline: GpuPyramidPipeline,
-    fast:         GpuFastDetector,
-    klt:          GpuKltTracker,
+    fast: GpuFastDetector,
+    klt: GpuKltTracker,
 
     // CPU post-processing.
     grid: OccupancyGrid,
 
     // Per-frame state.
-    prev_pyramid:  Option<GpuPyramid>,
-    features:      Vec<Feature>,
+    prev_pyramid: Option<GpuPyramid>,
+    features: Vec<Feature>,
     prev_features: Vec<Feature>,
-    next_id:       u64,
-    histeq_buf:    Image<u8>,
-    has_prev:      bool,
+    next_id: u64,
+    histeq_buf: Image<u8>,
+    has_prev: bool,
 
     img_w: usize,
     img_h: usize,
@@ -197,11 +197,16 @@ impl GpuFrontend {
     /// at startup, not every frame.
     pub fn new(gpu: &GpuDevice, config: GpuFrontendConfig, img_w: usize, img_h: usize) -> Self {
         let pyr_pipeline = GpuPyramidPipeline::new(gpu);
-        let fast         = GpuFastDetector::new(
-            gpu, config.fast_threshold, config.fast_arc_length,
-            img_w, img_h, config.cell_size, config.nms_strategy,
+        let fast = GpuFastDetector::new(
+            gpu,
+            config.fast_threshold,
+            config.fast_arc_length,
+            img_w,
+            img_h,
+            config.cell_size,
+            config.nms_strategy,
         );
-        let klt          = GpuKltTracker::new(
+        let klt = GpuKltTracker::new(
             gpu,
             config.klt_window,
             config.klt_max_iter,
@@ -213,14 +218,18 @@ impl GpuFrontend {
 
         GpuFrontend {
             config,
-            pyr_pipeline, fast, klt, grid,
-            prev_pyramid:  None,
-            histeq_buf:    Image::new(img_w, img_h),
-            features:      Vec::new(),
+            pyr_pipeline,
+            fast,
+            klt,
+            grid,
+            prev_pyramid: None,
+            histeq_buf: Image::new(img_w, img_h),
+            features: Vec::new(),
             prev_features: Vec::new(),
-            next_id:       1,
-            has_prev:      false,
-            img_w, img_h,
+            next_id: 1,
+            has_prev: false,
+            img_w,
+            img_h,
         }
     }
 
@@ -231,10 +240,10 @@ impl GpuFrontend {
     /// it tracks successfully.
     pub fn process<'a>(
         &'a mut self,
-        gpu:   &GpuDevice,
+        gpu: &GpuDevice,
         image: &Image<u8>,
     ) -> (&'a [Feature], FrameStats) {
-        assert_eq!(image.width(),  self.img_w, "image width mismatch");
+        assert_eq!(image.width(), self.img_w, "image width mismatch");
         assert_eq!(image.height(), self.img_h, "image height mismatch");
 
         let t_total = Instant::now();
@@ -253,13 +262,19 @@ impl GpuFrontend {
         // ── Step 1: Build GPU pyramid ────────────────────────────────────────
         let t0 = Instant::now();
         let curr_pyramid = self.pyr_pipeline.build(
-            gpu, input, self.config.pyramid_levels, self.config.pyramid_sigma,
+            gpu,
+            input,
+            self.config.pyramid_levels,
+            self.config.pyramid_sigma,
         );
         timing.pyramid = t0.elapsed().as_secs_f64();
 
         let mut stats = FrameStats {
-            tracked: 0, lost: 0, rejected: 0,
-            new_detections: 0, total: 0,
+            tracked: 0,
+            lost: 0,
+            rejected: 0,
+            new_detections: 0,
+            total: 0,
             occupied_cells: 0,
             total_cells: self.grid.total_cells(),
             timing: TimingStats::default(),
@@ -278,34 +293,59 @@ impl GpuFrontend {
         // `winners` is populated differently depending on strategy:
         // Separate — filled in Step 4 after KLT.
         // Fused    — filled here alongside KLT results.
-        let fused_winners: Option<Vec<Feature>> =
-            if self.config.submit_strategy == SubmitStrategy::Fused
-                && self.has_prev
-                && !self.features.is_empty()
-            {
+        let fused_winners: Option<Vec<Feature>> = if self.config.submit_strategy
+            == SubmitStrategy::Fused
+            && self.has_prev
+            && !self.features.is_empty()
+        {
+            let feats_snap: Vec<Feature> = self.features.clone();
+            let prev = self.prev_pyramid.as_ref().unwrap();
+
+            self.klt.prepare(gpu, &feats_snap, prev, &curr_pyramid);
+
+            let mut encoder = gpu
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("GpuFrontend fused"),
+                });
+            self.klt.record_into(&mut encoder);
+            if slots_before_klt > 0 {
+                self.fast
+                    .record_into(gpu, &mut encoder, &curr_pyramid.levels[0]);
+            }
+            gpu.queue.submit(std::iter::once(encoder.finish()));
+
+            self.klt.arm_readback();
+            if slots_before_klt > 0 {
+                self.fast.arm_readback();
+            }
+            gpu.device.poll(wgpu::Maintain::Wait);
+
+            let results = self.klt.collect_results(&feats_snap);
+            let detected = if slots_before_klt > 0 {
+                self.fast.collect_winners(0)
+            } else {
+                Vec::new()
+            };
+
+            let mut write = 0;
+            for result in &results {
+                if result.status == TrackStatus::Tracked {
+                    self.features[write] = result.feature.clone();
+                    write += 1;
+                    stats.tracked += 1;
+                } else {
+                    stats.lost += 1;
+                }
+            }
+            self.features.truncate(write);
+            Some(detected)
+        } else {
+            // Separate: run KLT standalone; FAST runs independently in Step 4.
+            if self.has_prev && !self.features.is_empty() {
                 let feats_snap: Vec<Feature> = self.features.clone();
                 let prev = self.prev_pyramid.as_ref().unwrap();
-
-                self.klt.prepare(gpu, &feats_snap, prev, &curr_pyramid);
-
-                let mut encoder = gpu.device.create_command_encoder(
-                    &wgpu::CommandEncoderDescriptor { label: Some("GpuFrontend fused") });
-                self.klt.record_into(&mut encoder);
-                if slots_before_klt > 0 {
-                    self.fast.record_into(gpu, &mut encoder, &curr_pyramid.levels[0]);
-                }
-                gpu.queue.submit(std::iter::once(encoder.finish()));
-
-                self.klt.arm_readback();
-                if slots_before_klt > 0 { self.fast.arm_readback(); }
-                gpu.device.poll(wgpu::Maintain::Wait);
-
-                let results = self.klt.collect_results(&feats_snap);
-                let detected = if slots_before_klt > 0 {
-                    self.fast.collect_winners(0)
-                } else {
-                    Vec::new()
-                };
+                let results = self.klt.track(gpu, prev, &curr_pyramid, &feats_snap);
 
                 let mut write = 0;
                 for result in &results {
@@ -318,53 +358,44 @@ impl GpuFrontend {
                     }
                 }
                 self.features.truncate(write);
-                Some(detected)
-            } else {
-                // Separate: run KLT standalone; FAST runs independently in Step 4.
-                if self.has_prev && !self.features.is_empty() {
-                    let feats_snap: Vec<Feature> = self.features.clone();
-                    let prev = self.prev_pyramid.as_ref().unwrap();
-                    let results = self.klt.track(gpu, prev, &curr_pyramid, &feats_snap);
-
-                    let mut write = 0;
-                    for result in &results {
-                        if result.status == TrackStatus::Tracked {
-                            self.features[write] = result.feature.clone();
-                            write += 1;
-                            stats.tracked += 1;
-                        } else {
-                            stats.lost += 1;
-                        }
-                    }
-                    self.features.truncate(write);
-                }
-                None
-            };
+            }
+            None
+        };
         timing.klt = t0.elapsed().as_secs_f64();
 
         // ── Step 2b: Geometric verification (RANSAC, CPU) ────────────────────
         let t0 = Instant::now();
         if let Some(ref cam) = self.config.camera {
             if self.features.len() >= 8 {
-                let corrs: Vec<(usize, Correspondence)> = self.features.iter()
+                let corrs: Vec<(usize, BearingCorrespondence)> = self
+                    .features
+                    .iter()
                     .enumerate()
                     .filter_map(|(idx, f)| {
-                        self.prev_features.iter()
+                        self.prev_features
+                            .iter()
                             .find(|pf| pf.id == f.id)
-                            .map(|pf| {
-                                let (x1, y1) = cam.normalize_undistorted(pf.x as f64, pf.y as f64);
-                                let (x2, y2) = cam.normalize_undistorted(f.x as f64, f.y as f64);
-                                (idx, Correspondence { x1, y1, x2, y2 })
+                            .and_then(|pf| {
+                                let b1 = cam.pixel_to_bearing(pf.x as f64, pf.y as f64)?.vector();
+                                let b2 = cam.pixel_to_bearing(f.x as f64, f.y as f64)?.vector();
+                                Some((
+                                    idx,
+                                    BearingCorrespondence {
+                                        b1: [b1.x, b1.y, b1.z],
+                                        b2: [b2.x, b2.y, b2.z],
+                                    },
+                                ))
                             })
                     })
                     .collect();
 
                 if corrs.len() >= 8 {
-                    let corr_only: Vec<Correspondence> =
+                    let corr_only: Vec<BearingCorrespondence> =
                         corrs.iter().map(|(_, c)| *c).collect();
 
-                    if let Some(result) = essential::estimate_essential_ransac(
-                        &corr_only, &self.config.ransac,
+                    if let Some(result) = essential::estimate_essential_ransac_bearings(
+                        &corr_only,
+                        &self.config.ransac,
                     ) {
                         let mut inliers = Vec::new();
                         for (ci, (feat_idx, _)) in corrs.iter().enumerate() {
@@ -374,8 +405,10 @@ impl GpuFrontend {
                                 stats.rejected += 1;
                             }
                         }
-                        let matched_ids: Vec<u64> =
-                            corrs.iter().map(|(idx, _)| self.features[*idx].id).collect();
+                        let matched_ids: Vec<u64> = corrs
+                            .iter()
+                            .map(|(idx, _)| self.features[*idx].id)
+                            .collect();
                         for f in &self.features {
                             if !matched_ids.contains(&f.id) {
                                 inliers.push(f.clone());
@@ -403,7 +436,7 @@ impl GpuFrontend {
         let slots = self.config.max_features.saturating_sub(self.features.len());
 
         let winners = if let Some(w) = fused_winners {
-            w  // already collected in fused KLT block above
+            w // already collected in fused KLT block above
         } else if slots > 0 {
             self.fast.detect(gpu, &curr_pyramid.levels[0], 0)
         } else {
@@ -419,7 +452,11 @@ impl GpuFrontend {
                     let y = f.y as usize;
                     if x < mask.width() && y < mask.height() && mask.get(x, y) > 0 {
                         Some(Feature {
-                            x: f.x, y: f.y, score: f.score, level: f.level, id: 0,
+                            x: f.x,
+                            y: f.y,
+                            score: f.score,
+                            level: f.level,
+                            id: 0,
                             descriptor: 0,
                         })
                     } else {
@@ -439,9 +476,15 @@ impl GpuFrontend {
             );
             let mut added = 0;
             for f in &selected {
-                if added >= slots { break; }
+                if added >= slots {
+                    break;
+                }
                 self.features.push(Feature {
-                    x: f.x, y: f.y, score: f.score, level: f.level, id: self.next_id,
+                    x: f.x,
+                    y: f.y,
+                    score: f.score,
+                    level: f.level,
+                    id: self.next_id,
                     descriptor: 0,
                 });
                 self.next_id += 1;
@@ -453,14 +496,14 @@ impl GpuFrontend {
         timing.detect = t0.elapsed().as_secs_f64();
 
         // ── Step 5: Advance state ─────────────────────────────────────────────
-        self.prev_pyramid  = Some(curr_pyramid);
+        self.prev_pyramid = Some(curr_pyramid);
         self.prev_features = self.features.clone();
-        self.has_prev      = true;
+        self.has_prev = true;
 
         timing.total = t_total.elapsed().as_secs_f64();
-        stats.total          = self.features.len();
+        stats.total = self.features.len();
         stats.occupied_cells = self.grid.total_cells() - self.grid.count_empty();
-        stats.timing         = timing;
+        stats.timing = timing;
 
         (&self.features, stats)
     }
@@ -485,7 +528,8 @@ impl GpuFrontend {
 
         let before = self.features.len();
         self.features.retain(|feature| !ids.contains(&feature.id));
-        self.prev_features.retain(|feature| !ids.contains(&feature.id));
+        self.prev_features
+            .retain(|feature| !ids.contains(&feature.id));
 
         self.grid.clear();
         for feature in &self.features {
@@ -532,21 +576,28 @@ mod tests {
 
     fn run_gpu_test(name: &str) -> String {
         let out = std::process::Command::new("cargo")
-            .args(["test", "--lib", "--", name, "--exact", "--ignored", "--nocapture"])
+            .args([
+                "test",
+                "--lib",
+                "--",
+                name,
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
             .output()
             .unwrap_or_else(|e| panic!("subprocess failed: {e}"));
-        String::from_utf8_lossy(&out.stdout).into_owned()
-            + &String::from_utf8_lossy(&out.stderr)
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr)
     }
 
     fn make_scene(w: usize, h: usize, shift_x: usize, shift_y: usize) -> Image<u8> {
         let mut img = Image::from_vec(w, h, vec![25u8; w * h]);
         for &(rx, ry, rw, rh, val) in &[
             (30usize, 25usize, 20usize, 20usize, 200u8),
-            (70,  20, 25, 15, 180),
+            (70, 20, 25, 15, 180),
             (110, 30, 18, 22, 210),
-            (25,  65, 22, 25, 190),
-            (75,  60, 30, 20, 170),
+            (25, 65, 22, 25, 190),
+            (75, 60, 30, 20, 170),
             (115, 70, 20, 18, 205),
         ] {
             for y in (ry + shift_y)..((ry + shift_y + rh).min(h)) {
@@ -565,7 +616,10 @@ mod tests {
     fn inner_first_frame_detects() {
         let img = make_scene(160, 120, 0, 0);
         let gpu = GpuDevice::new().unwrap();
-        let config = GpuFrontendConfig { max_features: 50, ..Default::default() };
+        let config = GpuFrontendConfig {
+            max_features: 50,
+            ..Default::default()
+        };
         let mut fe = GpuFrontend::new(&gpu, config, 160, 120);
 
         let (features, stats) = fe.process(&gpu, &img);
@@ -581,7 +635,10 @@ mod tests {
     fn inner_unique_ids() {
         let img = make_scene(160, 120, 0, 0);
         let gpu = GpuDevice::new().unwrap();
-        let config = GpuFrontendConfig { max_features: 50, ..Default::default() };
+        let config = GpuFrontendConfig {
+            max_features: 50,
+            ..Default::default()
+        };
         let mut fe = GpuFrontend::new(&gpu, config, 160, 120);
 
         let (features, _) = fe.process(&gpu, &img);
@@ -598,7 +655,10 @@ mod tests {
         let img1 = make_scene(160, 120, 0, 0);
         let img2 = make_scene(160, 120, 2, 1);
         let gpu = GpuDevice::new().unwrap();
-        let config = GpuFrontendConfig { max_features: 50, ..Default::default() };
+        let config = GpuFrontendConfig {
+            max_features: 50,
+            ..Default::default()
+        };
         let mut fe = GpuFrontend::new(&gpu, config, 160, 120);
 
         let n1 = fe.process(&gpu, &img1).0.len();
@@ -607,7 +667,8 @@ mod tests {
         let (_, stats) = fe.process(&gpu, &img2);
         assert!(stats.tracked > 0, "should track some features: {stats:?}");
         println!("GPU_TEST_OK");
-        drop(fe); drop(gpu);
+        drop(fe);
+        drop(gpu);
     }
 
     #[test]
@@ -616,7 +677,10 @@ mod tests {
         let img1 = make_scene(160, 120, 0, 0);
         let img2 = make_scene(160, 120, 2, 1);
         let gpu = GpuDevice::new().unwrap();
-        let config = GpuFrontendConfig { max_features: 50, ..Default::default() };
+        let config = GpuFrontendConfig {
+            max_features: 50,
+            ..Default::default()
+        };
         let mut fe = GpuFrontend::new(&gpu, config, 160, 120);
 
         let ids1: Vec<u64> = fe.process(&gpu, &img1).0.iter().map(|f| f.id).collect();
@@ -633,11 +697,18 @@ mod tests {
         let img = make_scene(160, 120, 0, 0);
         let gpu = GpuDevice::new().unwrap();
         let max = 15usize;
-        let config = GpuFrontendConfig { max_features: max, ..Default::default() };
+        let config = GpuFrontendConfig {
+            max_features: max,
+            ..Default::default()
+        };
         let mut fe = GpuFrontend::new(&gpu, config, 160, 120);
 
         let (features, _) = fe.process(&gpu, &img);
-        assert!(features.len() <= max, "features {} > max {max}", features.len());
+        assert!(
+            features.len() <= max,
+            "features {} > max {max}",
+            features.len()
+        );
         println!("GPU_TEST_OK");
     }
 
@@ -647,7 +718,10 @@ mod tests {
         let img1 = make_scene(160, 120, 0, 0);
         let img2 = make_scene(160, 120, 15, 10); // large shift → many lost
         let gpu = GpuDevice::new().unwrap();
-        let config = GpuFrontendConfig { max_features: 50, ..Default::default() };
+        let config = GpuFrontendConfig {
+            max_features: 50,
+            ..Default::default()
+        };
         let mut fe = GpuFrontend::new(&gpu, config, 160, 120);
 
         fe.process(&gpu, &img1);
@@ -677,14 +751,19 @@ mod tests {
     #[ignore = "GPU integration"]
     fn inner_three_frame_sequence() {
         let gpu = GpuDevice::new().unwrap();
-        let config = GpuFrontendConfig { max_features: 30, ..Default::default() };
+        let config = GpuFrontendConfig {
+            max_features: 30,
+            ..Default::default()
+        };
         let mut fe = GpuFrontend::new(&gpu, config, 160, 120);
 
         for i in 0..3usize {
             let img = make_scene(160, 120, i * 2, i);
             let (features, stats) = fe.process(&gpu, &img);
-            eprintln!("frame {i}: tracked={} lost={} new={} total={}",
-                stats.tracked, stats.lost, stats.new_detections, stats.total);
+            eprintln!(
+                "frame {i}: tracked={} lost={} new={} total={}",
+                stats.tracked, stats.lost, stats.new_detections, stats.total
+            );
             if i > 0 {
                 assert!(stats.tracked > 0, "frame {i}: should track some features");
             }
@@ -706,12 +785,12 @@ mod tests {
         };
     }
 
-    gpu_test!(test_first_frame_detects,    inner_first_frame_detects);
-    gpu_test!(test_unique_ids,             inner_unique_ids);
+    gpu_test!(test_first_frame_detects, inner_first_frame_detects);
+    gpu_test!(test_unique_ids, inner_unique_ids);
     gpu_test!(test_tracking_across_frames, inner_tracking_across_frames);
-    gpu_test!(test_ids_persist,            inner_ids_persist);
+    gpu_test!(test_ids_persist, inner_ids_persist);
     gpu_test!(test_max_features_respected, inner_max_features_respected);
-    gpu_test!(test_replenishment,          inner_replenishment_after_loss);
-    gpu_test!(test_reset,                  inner_reset_clears_state);
-    gpu_test!(test_three_frame_sequence,   inner_three_frame_sequence);
+    gpu_test!(test_replenishment, inner_replenishment_after_loss);
+    gpu_test!(test_reset, inner_reset_clears_state);
+    gpu_test!(test_three_frame_sequence, inner_three_frame_sequence);
 }
