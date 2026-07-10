@@ -2,14 +2,13 @@
 //
 // Handles:
 // - Parsing camera intrinsics from EuRoC ASL sensor.yaml
-// - Pixel <-> normalized (bearing) coordinate conversion
-// - K matrix construction for geometric verification
+// - Pixel <-> unit-bearing conversion
+// - Camera-geometry projection model construction
 //
 // The EuRoC sensor.yaml format is simple enough that we parse it
 // manually, avoiding a serde_yaml dependency.
 
 use camera_geometry::{CameraModel, CameraProjection, Pixel, UnitBearing};
-use nalgebra::Vector3;
 use std::{fs, path::Path};
 
 /// Projection model represented by this calibration.
@@ -109,94 +108,12 @@ impl CameraIntrinsics {
         })
     }
 
-    /// Convert pixel coordinates (u, v) to normalized (bearing) coordinates.
-    ///
-    /// x_n = (u - cx) / fx
-    /// y_n = (v - cy) / fy
-    ///
-    /// This applies K^{-1} to the homogeneous pixel coordinate [u, v, 1]^T.
-    /// Does NOT undistort -- call undistort_point first if needed.
-    pub fn normalize(&self, u: f64, v: f64) -> (f64, f64) {
-        ((u - self.cx) / self.fx, (v - self.cy) / self.fy)
-    }
-
-    /// Convert normalized coordinates back to pixel coordinates.
-    pub fn denormalize(&self, x_n: f64, y_n: f64) -> (f64, f64) {
-        (x_n * self.fx + self.cx, y_n * self.fy + self.cy)
-    }
-
-    /// Undistort a pixel point using the radial-tangential model.
-    ///
-    /// Uses iterative refinement (fixed-point iteration on the distortion
-    /// equations). Converges in 5-10 iterations for typical lens distortion.
-    ///
-    /// Returns the undistorted pixel coordinates.
-    pub fn undistort_point(&self, u: f64, v: f64) -> (f64, f64) {
-        let (x, y) = self.pixel_to_normalized_legacy(u, v);
-        self.denormalize(x, y)
-    }
-
-    /// Normalize a pixel point with undistortion: pixel -> undistorted normalized.
-    pub fn normalize_undistorted(&self, u: f64, v: f64) -> (f64, f64) {
-        self.pixel_to_normalized_legacy(u, v)
-    }
-
     /// Convert a pixel to a unit-sphere bearing.
     ///
     /// This is the geometry-first API. It preserves fisheye rays that cannot be
     /// represented safely as pinhole-normalized `(x/z, y/z)` coordinates.
     pub fn pixel_to_bearing(&self, u: f64, v: f64) -> Option<UnitBearing> {
         self.projection().unproject(Pixel::new(u, v))
-    }
-
-    /// Convert a unit bearing to legacy pinhole-normalized coordinates.
-    ///
-    /// Transitional adapter for old call sites. New geometric code should use
-    /// `UnitBearing` directly.
-    pub fn bearing_to_normalized_legacy(bearing: UnitBearing) -> Option<(f64, f64)> {
-        let b = bearing.vector();
-        (b.z.abs() > 1.0e-12).then_some((b.x / b.z, b.y / b.z))
-    }
-
-    /// Legacy pixel -> `(x/z, y/z)` adapter.
-    pub fn pixel_to_normalized_legacy(&self, u: f64, v: f64) -> (f64, f64) {
-        self.pixel_to_bearing(u, v)
-            .and_then(Self::bearing_to_normalized_legacy)
-            .unwrap_or((f64::NAN, f64::NAN))
-    }
-
-    /// Apply forward radial-tangential distortion to normalized coordinates.
-    ///
-    /// Given undistorted normalized (x, y), returns distorted normalized (x_d, y_d).
-    pub fn distort_normalized(&self, x: f64, y: f64) -> (f64, f64) {
-        let Some(pixel) = self.projection().project(Vector3::new(x, y, 1.0)) else {
-            return (f64::NAN, f64::NAN);
-        };
-        self.normalize(pixel.x(), pixel.y())
-    }
-
-    /// Project a 3D point (in camera frame) to distorted pixel coordinates.
-    ///
-    /// Returns `None` if the point is behind or too close to the camera (Z ≤ 1e-6).
-    pub fn project_point(&self, p: [f64; 3]) -> Option<(f64, f64)> {
-        let pixel = self.projection().project(Vector3::new(p[0], p[1], p[2]))?;
-        Some((pixel.x(), pixel.y()))
-    }
-
-    /// 2×3 Jacobian d(u,v)/d(X,Y,Z) of the full projection including distortion.
-    ///
-    /// Returns `[[du/dX, du/dY, du/dZ], [dv/dX, dv/dY, dv/dZ]]`.
-    pub fn projection_jacobian(&self, p: [f64; 3]) -> [[f64; 3]; 2] {
-        let Some(j) = self
-            .projection()
-            .project_jacobian(Vector3::new(p[0], p[1], p[2]))
-        else {
-            return [[f64::NAN; 3]; 2];
-        };
-        [
-            [j[(0, 0)], j[(0, 1)], j[(0, 2)]],
-            [j[(1, 0)], j[(1, 1)], j[(1, 2)]],
-        ]
     }
 
     /// Concrete camera-geometry projection model for this calibration.
@@ -237,11 +154,37 @@ impl CameraIntrinsics {
 pub struct StereoRig {
     pub cam0: CameraIntrinsics,
     pub cam1: CameraIntrinsics,
+    pub(crate) cam0_projection: CameraProjection,
+    pub(crate) cam1_projection: CameraProjection,
     pub r_10: [[f64; 3]; 3],
     pub t_10: [f64; 3],
 }
 
 impl StereoRig {
+    /// Construct a stereo rig and cache concrete projection models.
+    ///
+    /// The public `cam0`/`cam1` calibration structs are retained for existing
+    /// callers that inspect calibration values. Matching/projection code should
+    /// use the cached projection fields inside this crate, so hot paths do not
+    /// rebuild `CameraProjection` from intrinsics and distortion coefficients.
+    pub fn new(
+        cam0: CameraIntrinsics,
+        cam1: CameraIntrinsics,
+        r_10: [[f64; 3]; 3],
+        t_10: [f64; 3],
+    ) -> Self {
+        let cam0_projection = cam0.projection();
+        let cam1_projection = cam1.projection();
+        Self {
+            cam0,
+            cam1,
+            cam0_projection,
+            cam1_projection,
+            r_10,
+            t_10,
+        }
+    }
+
     /// Parse a stereo rig from two EuRoC sensor.yaml files.
     ///
     /// Each file contains `T_BS` (sensor → body). The cam0→cam1 transform is:
@@ -259,12 +202,7 @@ impl StereoRig {
             [t_10[2][0], t_10[2][1], t_10[2][2]],
         ];
         let t = [t_10[0][3], t_10[1][3], t_10[2][3]];
-        Ok(StereoRig {
-            cam0,
-            cam1,
-            r_10,
-            t_10: t,
-        })
+        Ok(StereoRig::new(cam0, cam1, r_10, t))
     }
 
     /// Parse a stereo rig from a Kalibr camchain file.
@@ -287,12 +225,7 @@ impl StereoRig {
             [t_10[2][0], t_10[2][1], t_10[2][2]],
         ];
         let t = [t_10[0][3], t_10[1][3], t_10[2][3]];
-        Ok(StereoRig {
-            cam0,
-            cam1,
-            r_10,
-            t_10: t,
-        })
+        Ok(StereoRig::new(cam0, cam1, r_10, t))
     }
 
     /// Transform a 3D point from cam0 frame to cam1 frame.
@@ -468,60 +401,25 @@ fn distortion4(distortion: &[f64]) -> [f64; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nalgebra::Vector3;
 
     #[test]
-    fn test_normalize_denormalize() {
-        let cam = CameraIntrinsics::new(458.654, 457.296, 367.215, 248.375, 752, 480);
-        let (xn, yn) = cam.normalize(367.215, 248.375);
-        assert!(
-            (xn).abs() < 1e-10,
-            "principal point should normalize to (0, 0)"
-        );
-        assert!((yn).abs() < 1e-10);
-
-        let (u, v) = cam.denormalize(xn, yn);
-        assert!((u - 367.215).abs() < 1e-10);
-        assert!((v - 248.375).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_normalize_corner() {
+    fn test_pixel_to_bearing_no_distortion() {
         let cam = CameraIntrinsics::new(500.0, 500.0, 320.0, 240.0, 640, 480);
-        let (xn, yn) = cam.normalize(0.0, 0.0);
-        assert!((xn - (-0.64)).abs() < 1e-10);
-        assert!((yn - (-0.48)).abs() < 1e-10);
+        let b = cam.pixel_to_bearing(320.0, 240.0).unwrap().vector();
+        assert!((b.x).abs() < 1e-12);
+        assert!((b.y).abs() < 1e-12);
+        assert!((b.z - 1.0).abs() < 1e-12);
     }
 
     #[test]
-    fn test_roundtrip() {
-        let cam = CameraIntrinsics::new(458.654, 457.296, 367.215, 248.375, 752, 480);
-        let u = 123.456;
-        let v = 321.654;
-        let (xn, yn) = cam.normalize(u, v);
-        let (u2, v2) = cam.denormalize(xn, yn);
-        assert!((u - u2).abs() < 1e-10);
-        assert!((v - v2).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_undistort_no_distortion() {
-        let cam = CameraIntrinsics::new(500.0, 500.0, 320.0, 240.0, 640, 480);
-        let (u, v) = cam.undistort_point(100.0, 200.0);
-        assert!((u - 100.0).abs() < 1e-10);
-        assert!((v - 200.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_undistort_with_distortion() {
+    fn test_pixel_to_bearing_with_distortion() {
         let mut cam = CameraIntrinsics::new(500.0, 500.0, 320.0, 240.0, 640, 480);
         cam.distortion = vec![-0.28, 0.07, 0.0, 0.0];
-        // Principal point should be unchanged regardless of distortion.
-        let (u, v) = cam.undistort_point(320.0, 240.0);
-        assert!(
-            (u - 320.0).abs() < 1e-6,
-            "principal point undistorted: ({u}, {v})"
-        );
-        assert!((v - 240.0).abs() < 1e-6);
+        let b = cam.pixel_to_bearing(320.0, 240.0).unwrap().vector();
+        assert!((b.x).abs() < 1e-12);
+        assert!((b.y).abs() < 1e-12);
+        assert!((b.z - 1.0).abs() < 1e-12);
     }
 
     #[test]
@@ -546,35 +444,16 @@ mod tests {
     }
 
     #[test]
-    fn test_distort_no_distortion() {
+    fn test_projection_pinhole() {
         let cam = CameraIntrinsics::new(500.0, 500.0, 320.0, 240.0, 640, 480);
-        let (xd, yd) = cam.distort_normalized(0.1, 0.2);
-        assert!((xd - 0.1).abs() < 1e-10);
-        assert!((yd - 0.2).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_distort_undistort_roundtrip() {
-        let mut cam = CameraIntrinsics::new(500.0, 500.0, 320.0, 240.0, 640, 480);
-        cam.distortion = vec![-0.28, 0.07, 0.0001, 0.00002];
-        let x = 0.15;
-        let y = -0.1;
-        let (xd, yd) = cam.distort_normalized(x, y);
-        let (ud, vd) = cam.denormalize(xd, yd);
-        let (uu, vu) = cam.undistort_point(ud, vd);
-        let (xu, yu) = cam.normalize(uu, vu);
-        assert!((xu - x).abs() < 1e-6, "roundtrip x: {xu} vs {x}");
-        assert!((yu - y).abs() < 1e-6, "roundtrip y: {yu} vs {y}");
-    }
-
-    #[test]
-    fn test_project_point_pinhole() {
-        let cam = CameraIntrinsics::new(500.0, 500.0, 320.0, 240.0, 640, 480);
-        let (u, v) = cam.project_point([0.0, 0.0, 1.0]).unwrap();
+        let projection = cam.projection();
+        let pixel = projection.project(Vector3::new(0.0, 0.0, 1.0)).unwrap();
+        let (u, v) = (pixel.x(), pixel.y());
         assert!((u - 320.0).abs() < 1e-10);
         assert!((v - 240.0).abs() < 1e-10);
 
-        let (u, v) = cam.project_point([0.1, -0.2, 2.0]).unwrap();
+        let pixel = projection.project(Vector3::new(0.1, -0.2, 2.0)).unwrap();
+        let (u, v) = (pixel.x(), pixel.y());
         assert!((u - (500.0 * 0.05 + 320.0)).abs() < 1e-10);
         assert!((v - (500.0 * -0.1 + 240.0)).abs() < 1e-10);
     }
@@ -582,35 +461,39 @@ mod tests {
     #[test]
     fn test_project_behind_camera() {
         let cam = CameraIntrinsics::new(500.0, 500.0, 320.0, 240.0, 640, 480);
-        assert!(cam.project_point([0.0, 0.0, -1.0]).is_none());
-        assert!(cam.project_point([0.0, 0.0, 0.0]).is_none());
+        let projection = cam.projection();
+        assert!(projection.project(Vector3::new(0.0, 0.0, -1.0)).is_none());
+        assert!(projection.project(Vector3::new(0.0, 0.0, 0.0)).is_none());
     }
 
     #[test]
     fn test_projection_jacobian_pinhole() {
         let cam = CameraIntrinsics::new(500.0, 500.0, 320.0, 240.0, 640, 480);
-        let p = [0.3, -0.2, 2.0];
-        let j = cam.projection_jacobian(p);
+        let projection = cam.projection();
+        let p = Vector3::new(0.3, -0.2, 2.0);
+        let j = projection.project_jacobian(p).unwrap();
         let eps = 1e-6;
         for i in 0..3 {
             let mut pp = p;
             let mut pm = p;
             pp[i] += eps;
             pm[i] -= eps;
-            let (up, vp) = cam.project_point(pp).unwrap();
-            let (um, vm) = cam.project_point(pm).unwrap();
+            let plus = projection.project(pp).unwrap();
+            let minus = projection.project(pm).unwrap();
+            let (up, vp) = (plus.x(), plus.y());
+            let (um, vm) = (minus.x(), minus.y());
             let du = (up - um) / (2.0 * eps);
             let dv = (vp - vm) / (2.0 * eps);
             assert!(
-                (j[0][i] - du).abs() < 1e-3,
+                (j[(0, i)] - du).abs() < 1e-3,
                 "du/d{i}: analytical={} numerical={}",
-                j[0][i],
+                j[(0, i)],
                 du
             );
             assert!(
-                (j[1][i] - dv).abs() < 1e-3,
+                (j[(1, i)] - dv).abs() < 1e-3,
                 "dv/d{i}: analytical={} numerical={}",
-                j[1][i],
+                j[(1, i)],
                 dv
             );
         }
@@ -620,28 +503,31 @@ mod tests {
     fn test_projection_jacobian_with_distortion() {
         let mut cam = CameraIntrinsics::new(500.0, 500.0, 320.0, 240.0, 640, 480);
         cam.distortion = vec![-0.28, 0.07, 0.0001, 0.00002];
-        let p = [0.3, -0.2, 2.0];
-        let j = cam.projection_jacobian(p);
+        let projection = cam.projection();
+        let p = Vector3::new(0.3, -0.2, 2.0);
+        let j = projection.project_jacobian(p).unwrap();
         let eps = 1e-6;
         for i in 0..3 {
             let mut pp = p;
             let mut pm = p;
             pp[i] += eps;
             pm[i] -= eps;
-            let (up, vp) = cam.project_point(pp).unwrap();
-            let (um, vm) = cam.project_point(pm).unwrap();
+            let plus = projection.project(pp).unwrap();
+            let minus = projection.project(pm).unwrap();
+            let (up, vp) = (plus.x(), plus.y());
+            let (um, vm) = (minus.x(), minus.y());
             let du = (up - um) / (2.0 * eps);
             let dv = (vp - vm) / (2.0 * eps);
             assert!(
-                (j[0][i] - du).abs() < 1e-3,
+                (j[(0, i)] - du).abs() < 1e-3,
                 "du/d{i}: analytical={} numerical={}",
-                j[0][i],
+                j[(0, i)],
                 du
             );
             assert!(
-                (j[1][i] - dv).abs() < 1e-3,
+                (j[(1, i)] - dv).abs() < 1e-3,
                 "dv/d{i}: analytical={} numerical={}",
-                j[1][i],
+                j[(1, i)],
                 dv
             );
         }

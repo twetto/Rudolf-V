@@ -49,6 +49,7 @@ use crate::histeq::{self, HistEqMethod};
 use crate::image::Image;
 use crate::klt::TrackStatus;
 use crate::occupancy::OccupancyGrid;
+use camera_geometry::{CameraModel, CameraProjection, Pixel};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -169,6 +170,7 @@ impl Default for GpuFrontendConfig {
 /// ```
 pub struct GpuFrontend {
     config: GpuFrontendConfig,
+    camera_projection: Option<CameraProjection>,
 
     // GPU pipelines (compiled once).
     pyr_pipeline: GpuPyramidPipeline,
@@ -196,6 +198,7 @@ impl GpuFrontend {
     /// This compiles three compute shaders (pyramid, FAST, KLT). Call once
     /// at startup, not every frame.
     pub fn new(gpu: &GpuDevice, config: GpuFrontendConfig, img_w: usize, img_h: usize) -> Self {
+        let camera_projection = config.camera.as_ref().map(CameraIntrinsics::projection);
         let pyr_pipeline = GpuPyramidPipeline::new(gpu);
         let fast = GpuFastDetector::new(
             gpu,
@@ -218,6 +221,7 @@ impl GpuFrontend {
 
         GpuFrontend {
             config,
+            camera_projection,
             pyr_pipeline,
             fast,
             klt,
@@ -365,7 +369,7 @@ impl GpuFrontend {
 
         // ── Step 2b: Geometric verification (RANSAC, CPU) ────────────────────
         let t0 = Instant::now();
-        if let Some(ref cam) = self.config.camera {
+        if let Some(ref cam) = self.camera_projection {
             if self.features.len() >= 8 {
                 let corrs: Vec<(usize, BearingCorrespondence)> = self
                     .features
@@ -376,8 +380,11 @@ impl GpuFrontend {
                             .iter()
                             .find(|pf| pf.id == f.id)
                             .and_then(|pf| {
-                                let b1 = cam.pixel_to_bearing(pf.x as f64, pf.y as f64)?.vector();
-                                let b2 = cam.pixel_to_bearing(f.x as f64, f.y as f64)?.vector();
+                                let b1 = cam
+                                    .unproject(Pixel::new(pf.x as f64, pf.y as f64))?
+                                    .vector();
+                                let b2 =
+                                    cam.unproject(Pixel::new(f.x as f64, f.y as f64))?.vector();
                                 Some((
                                     idx,
                                     BearingCorrespondence {

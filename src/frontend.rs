@@ -32,6 +32,7 @@ use crate::nms::OccupancyNms;
 use crate::occupancy::OccupancyGrid;
 use crate::pyramid::{Pyramid, PyramidScratch};
 use crate::shi_tomasi::{ShiTomasiDetector, ShiTomasiScratch};
+use camera_geometry::{CameraModel, CameraProjection, Pixel};
 
 /// Which corner detector to use.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -573,6 +574,7 @@ impl Default for FrontendConfig {
 /// GPU kernels for each step. Our CPU reference mirrors that pipeline.
 pub struct Frontend {
     config: FrontendConfig,
+    camera_projection: Option<CameraProjection>,
     /// Double-buffered pyramids: swap each frame to avoid allocation.
     prev_pyramid: Pyramid,
     curr_pyramid: Pyramid,
@@ -678,6 +680,7 @@ pub struct FrameStats {
 impl Frontend {
     /// Create a new frontend for images of the given dimensions.
     pub fn new(config: FrontendConfig, img_w: usize, img_h: usize) -> Self {
+        let camera_projection = config.camera.as_ref().map(CameraIntrinsics::projection);
         let grid = OccupancyGrid::new(img_w, img_h, config.cell_size);
         let pyr_scratch = PyramidScratch::new(img_w, img_h, config.pyramid_sigma);
         let klt_scratch = KltScratch::new(config.klt_window);
@@ -689,6 +692,7 @@ impl Frontend {
         };
         Frontend {
             config,
+            camera_projection,
             prev_pyramid: Pyramid {
                 levels: Vec::new(),
                 u8_levels: Vec::new(),
@@ -875,7 +879,7 @@ impl Frontend {
                 let prior = pose_prior;
                 let use_gate = self.config.epipolar_gate_threshold > 0.0 && prior.is_some();
                 if use_gate || self.config.enable_internal_ransac {
-                    if let Some(ref cam) = self.config.camera {
+                    if let Some(ref cam) = self.camera_projection {
                         if self.features.len() >= 8 {
                             // Build correspondences: prev_features -> current features.
                             // Match by ID (both lists may differ if features were lost).
@@ -887,10 +891,10 @@ impl Frontend {
                                     self.prev_features.iter().find(|pf| pf.id == f.id).and_then(
                                         |pf| {
                                             let b1 = cam
-                                                .pixel_to_bearing(pf.x as f64, pf.y as f64)?
+                                                .unproject(Pixel::new(pf.x as f64, pf.y as f64))?
                                                 .vector();
                                             let b2 = cam
-                                                .pixel_to_bearing(f.x as f64, f.y as f64)?
+                                                .unproject(Pixel::new(f.x as f64, f.y as f64))?
                                                 .vector();
                                             Some((
                                                 idx,

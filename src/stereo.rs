@@ -1,9 +1,11 @@
-use crate::camera::{CameraIntrinsics, StereoRig};
+use crate::camera::StereoRig;
 use crate::fast::Feature;
 use crate::histeq::{self, HistEqMethod};
 use crate::image::Image;
 use crate::klt::bilerp_ptr;
 use crate::pyramid::{Pyramid, PyramidScratch};
+use camera_geometry::{CameraModel, CameraProjection, Pixel};
+use nalgebra::Vector3;
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -40,11 +42,11 @@ fn bilerp_key(x: f64, y: f64) -> BilerpKey {
 
 #[inline(always)]
 fn unit_bearing_and_range_per_z(
-    camera: &CameraIntrinsics,
+    camera: &CameraProjection,
     u: f64,
     v: f64,
 ) -> Option<([f64; 3], f64)> {
-    let bearing = camera.pixel_to_bearing(u, v)?.vector();
+    let bearing = camera.unproject(Pixel::new(u, v))?.vector();
     if bearing.z <= 1e-12 {
         return None;
     }
@@ -416,14 +418,14 @@ fn failed_stereo_match(feat: &Feature) -> StereoMatch {
 
 impl StereoMatch {
     /// Recover the 3D position of this match in cam0's frame from the
-    /// feature's pixel coordinates and the rig's cam0 intrinsics.
+    /// feature's pixel coordinates and the rig's cached cam0 projection.
     /// Returns None for failed matches or invalid inverse-z depth.
     pub fn point_cam0(&self, rig: &StereoRig, feat: &Feature) -> Option<[f64; 3]> {
         if !self.matched || self.inv_depth <= 0.0 {
             return None;
         }
         let (unit_bearing, range_per_z) =
-            unit_bearing_and_range_per_z(&rig.cam0, feat.x as f64, feat.y as f64)?;
+            unit_bearing_and_range_per_z(&rig.cam0_projection, feat.x as f64, feat.y as f64)?;
         let rho = self.inv_depth as f64;
         let range = inv_depth_to_range(rho, range_per_z);
         Some([
@@ -528,7 +530,7 @@ impl StereoMatcher {
             .filter(|(i, m)| {
                 m.matched
                     && unit_bearing_and_range_per_z(
-                        &self.rig.cam0,
+                        &self.rig.cam0_projection,
                         features[*i].x as f64,
                         features[*i].y as f64,
                     )
@@ -542,7 +544,7 @@ impl StereoMatcher {
         let mut cached_depth_params = vec![0.0f64; features.len()];
         for &i in &valid {
             let (_, range_per_z) = unit_bearing_and_range_per_z(
-                &self.rig.cam0,
+                &self.rig.cam0_projection,
                 features[i].x as f64,
                 features[i].y as f64,
             )
@@ -630,7 +632,11 @@ impl StereoMatcher {
             unit_bearing[2] * range,
         ];
         let p_cam1 = self.rig.transform_point(p_cam0);
-        let (u1_full, v1_full) = self.rig.cam1.project_point(p_cam1)?;
+        let pixel = self
+            .rig
+            .cam1_projection
+            .project(Vector3::new(p_cam1[0], p_cam1[1], p_cam1[2]))?;
+        let (u1_full, v1_full) = (pixel.x(), pixel.y());
         let u1_s = u1_full * scale;
         let v1_s = v1_full * scale;
         let u0_s = feat.x as f64 * scale + cam0_pad;
@@ -725,7 +731,7 @@ impl StereoMatcher {
 
     fn match_one(&self, feat: &Feature, cam0_pyramid: &Pyramid) -> StereoMatch {
         let Some((unit_bearing, range_per_z)) =
-            unit_bearing_and_range_per_z(&self.rig.cam0, feat.x as f64, feat.y as f64)
+            unit_bearing_and_range_per_z(&self.rig.cam0_projection, feat.x as f64, feat.y as f64)
         else {
             return failed_stereo_match(feat);
         };
@@ -757,7 +763,7 @@ impl StereoMatcher {
         let fail = failed_stereo_match(feat);
 
         let Some((unit_bearing, range_per_z)) =
-            unit_bearing_and_range_per_z(&self.rig.cam0, feat.x as f64, feat.y as f64)
+            unit_bearing_and_range_per_z(&self.rig.cam0_projection, feat.x as f64, feat.y as f64)
         else {
             return fail;
         };
@@ -866,9 +872,14 @@ impl StereoMatcher {
                     unit_bearing[2] * range,
                 ];
                 let p_cam1 = self.rig.transform_point(p_cam0);
-                let Some((u1_full, v1_full)) = self.rig.cam1.project_point(p_cam1) else {
+                let Some(pixel) = self
+                    .rig
+                    .cam1_projection
+                    .project(Vector3::new(p_cam1[0], p_cam1[1], p_cam1[2]))
+                else {
                     return fail;
                 };
+                let (u1_full, v1_full) = (pixel.x(), pixel.y());
                 let u1_s = u1_full * scale;
                 let v1_s = v1_full * scale;
 
@@ -891,14 +902,20 @@ impl StereoMatcher {
                     unit_bearing[1] * drange_dparam,
                     unit_bearing[2] * drange_dparam,
                 ]);
-                let j_proj = self.rig.cam1.projection_jacobian(p_cam1);
-                let du_dparam = (j_proj[0][0] * db_dparam[0]
-                    + j_proj[0][1] * db_dparam[1]
-                    + j_proj[0][2] * db_dparam[2])
+                let Some(j_proj) = self
+                    .rig
+                    .cam1_projection
+                    .project_jacobian(Vector3::new(p_cam1[0], p_cam1[1], p_cam1[2]))
+                else {
+                    return fail;
+                };
+                let du_dparam = (j_proj[(0, 0)] * db_dparam[0]
+                    + j_proj[(0, 1)] * db_dparam[1]
+                    + j_proj[(0, 2)] * db_dparam[2])
                     * scale;
-                let dv_dparam = (j_proj[1][0] * db_dparam[0]
-                    + j_proj[1][1] * db_dparam[1]
-                    + j_proj[1][2] * db_dparam[2])
+                let dv_dparam = (j_proj[(1, 0)] * db_dparam[0]
+                    + j_proj[(1, 1)] * db_dparam[1]
+                    + j_proj[(1, 2)] * db_dparam[2])
                     * scale;
 
                 let k1 = bilerp_key(u1_s, v1_s);
@@ -960,9 +977,14 @@ impl StereoMatcher {
             unit_bearing[2] * range,
         ];
         let p_cam1 = self.rig.transform_point(p_cam0);
-        let Some((u1, v1)) = self.rig.cam1.project_point(p_cam1) else {
+        let Some(pixel) = self
+            .rig
+            .cam1_projection
+            .project(Vector3::new(p_cam1[0], p_cam1[1], p_cam1[2]))
+        else {
             return fail;
         };
+        let (u1, v1) = (pixel.x(), pixel.y());
 
         let half_f = self.config.patch_half_size as f64;
         let cam0_l0 = cam0_pyramid.level(0);
@@ -1029,12 +1051,12 @@ mod tests {
     fn make_stereo_rig_simple() -> StereoRig {
         let cam0 = CameraIntrinsics::new(500.0, 500.0, 320.0, 240.0, 640, 480);
         let cam1 = CameraIntrinsics::new(500.0, 500.0, 320.0, 240.0, 640, 480);
-        StereoRig {
+        StereoRig::new(
             cam0,
             cam1,
-            r_10: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-            t_10: [-0.11, 0.0, 0.0],
-        }
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [-0.11, 0.0, 0.0],
+        )
     }
 
     fn make_textured_image(w: usize, h: usize) -> Image<u8> {
@@ -1145,8 +1167,16 @@ mod tests {
 
         let near_cam1 = rig.transform_point([0.0, 0.0, 2.0]);
         let far_cam1 = rig.transform_point([0.0, 0.0, 10.0]);
-        let (near_u, _) = rig.cam1.project_point(near_cam1).unwrap();
-        let (far_u, _) = rig.cam1.project_point(far_cam1).unwrap();
+        let near_pixel = rig
+            .cam1_projection
+            .project(Vector3::new(near_cam1[0], near_cam1[1], near_cam1[2]))
+            .unwrap();
+        let far_pixel = rig
+            .cam1_projection
+            .project(Vector3::new(far_cam1[0], far_cam1[1], far_cam1[2]))
+            .unwrap();
+        let near_u = near_pixel.x();
+        let far_u = far_pixel.x();
 
         assert!(
             near_u < far_u,
