@@ -16,6 +16,7 @@ pub mod harris;
 pub mod histeq;
 pub mod image;
 pub mod klt;
+pub mod klt_reference;
 pub mod nms;
 pub mod occupancy;
 pub mod pyramid;

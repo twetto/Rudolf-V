@@ -28,6 +28,9 @@ use crate::harris::HarrisDetector;
 use crate::histeq::{self, HistEqMethod};
 use crate::image::Image;
 use crate::klt::{KltScratch, KltTracker, LkMethod, TrackStatus, TrackedFeature};
+use crate::klt_reference::{
+    KltTemplatePolicy, ReferenceKltTracker, ReferenceKltWarp, ReferenceTrack,
+};
 use crate::nms::OccupancyNms;
 use crate::occupancy::OccupancyGrid;
 use crate::pyramid::{Pyramid, PyramidScratch};
@@ -359,6 +362,22 @@ fn prune_overfull_tiles(
     pruned
 }
 
+fn align_reference_tracks(reference_tracks: &mut Vec<ReferenceTrack>, features: &[Feature]) {
+    if reference_tracks.is_empty() {
+        return;
+    }
+    let mut aligned = Vec::with_capacity(features.len());
+    for feature in features {
+        if let Some(reference) = reference_tracks
+            .iter()
+            .find(|reference| reference.id == feature.id)
+        {
+            aligned.push(reference.clone());
+        }
+    }
+    *reference_tracks = aligned;
+}
+
 /// Selects new detection candidates by coarse tile deficit.
 ///
 /// Grid NMS supplies at most one candidate per fine cell. This pass fixes
@@ -474,6 +493,10 @@ pub struct FrontendConfig {
     pub klt_epsilon: f32,
     /// KLT algorithm variant.
     pub klt_method: LkMethod,
+    /// Which template source temporal KLT uses.
+    pub klt_template_policy: KltTemplatePolicy,
+    /// Geometric warp used with stored reference patches.
+    pub klt_reference_warp: ReferenceKltWarp,
     /// Compute final level-0 patch residual for tracked points.
     ///
     /// Disabled by default because it adds an extra patch pass per track.
@@ -550,6 +573,8 @@ impl Default for FrontendConfig {
             klt_max_iter: 30,
             klt_epsilon: 0.01,
             klt_method: LkMethod::ForwardAdditive,
+            klt_template_policy: KltTemplatePolicy::PreviousFrame,
+            klt_reference_warp: ReferenceKltWarp::Translation,
             klt_residual_enabled: false,
             lbp_verification_enabled: true,
             lbp_policy: LbpPolicy::SoftPenalty,
@@ -588,6 +613,8 @@ pub struct Frontend {
     features: Vec<Feature>,
     /// Metadata for `features`, kept index-aligned with the feature vector.
     track_meta: Vec<TrackMeta>,
+    /// First-observation reference patches, kept index-aligned with `features`.
+    reference_tracks: Vec<ReferenceTrack>,
     /// Previous frame's feature positions (for geometric verification).
     prev_features: Vec<Feature>,
     /// Reusable buffer for KLT tracking results (avoids per-frame alloc).
@@ -710,6 +737,7 @@ impl Frontend {
             has_prev: false,
             features: Vec::new(),
             track_meta: Vec::new(),
+            reference_tracks: Vec::new(),
             prev_features: Vec::new(),
             track_results: Vec::new(),
             klt_scratch,
@@ -801,6 +829,9 @@ impl Frontend {
         if self.has_prev {
             if !self.features.is_empty() {
                 debug_assert_eq!(self.features.len(), self.track_meta.len());
+                if self.config.klt_template_policy == KltTemplatePolicy::FirstObservation {
+                    debug_assert_eq!(self.features.len(), self.reference_tracks.len());
+                }
                 let tracker = KltTracker::with_method(
                     self.config.klt_window,
                     self.config.klt_max_iter,
@@ -810,13 +841,33 @@ impl Frontend {
                 )
                 .with_residual(self.config.klt_residual_enabled);
 
-                tracker.track_into_opt(
-                    &self.prev_pyramid,
-                    &self.curr_pyramid,
-                    &self.features,
-                    &mut self.track_results,
-                    &mut self.klt_scratch,
-                );
+                if self.config.klt_template_policy == KltTemplatePolicy::FirstObservation {
+                    let ref_tracker = ReferenceKltTracker::new(
+                        self.config.klt_window,
+                        self.config.klt_max_iter,
+                        self.config.klt_epsilon,
+                        self.config.pyramid_levels,
+                        self.config.klt_residual_enabled,
+                        self.config.klt_reference_warp,
+                    );
+                    self.track_results.clear();
+                    self.track_results.reserve(self.features.len());
+                    for (feature, reference) in self.features.iter().zip(&self.reference_tracks) {
+                        self.track_results.push(ref_tracker.track(
+                            reference,
+                            &self.curr_pyramid,
+                            feature,
+                        ));
+                    }
+                } else {
+                    tracker.track_into_opt(
+                        &self.prev_pyramid,
+                        &self.curr_pyramid,
+                        &self.features,
+                        &mut self.track_results,
+                        &mut self.klt_scratch,
+                    );
+                }
 
                 // Filter features in-place: keep only successfully tracked.
                 // Avoids allocating a second Vec.
@@ -845,6 +896,9 @@ impl Frontend {
                         }
 
                         self.features[write] = feat.clone();
+                        if self.config.klt_template_policy == KltTemplatePolicy::FirstObservation {
+                            self.reference_tracks[write] = self.reference_tracks[i].clone();
+                        }
                         let klt_quality = if self.config.klt_residual_enabled {
                             klt_quality_from_residual(self.track_results[i].residual)
                         } else {
@@ -868,6 +922,9 @@ impl Frontend {
                 }
                 self.features.truncate(write);
                 self.track_meta.truncate(write);
+                if self.config.klt_template_policy == KltTemplatePolicy::FirstObservation {
+                    self.reference_tracks.truncate(write);
+                }
                 timing.klt = t0.elapsed().as_secs_f64();
 
                 // Step 2b: Geometric verification (essential matrix RANSAC).
@@ -957,11 +1014,18 @@ impl Frontend {
                                     // Remove outlier features.
                                     let mut inlier_features = Vec::new();
                                     let mut inlier_meta = Vec::new();
+                                    let mut inlier_references = Vec::new();
                                     let mut ransac_rejected = 0usize;
                                     for (ci, (feat_idx, _)) in corrs.iter().enumerate() {
                                         if result.inliers[ci] {
                                             inlier_features.push(self.features[*feat_idx].clone());
                                             inlier_meta.push(self.track_meta[*feat_idx].clone());
+                                            if self.config.klt_template_policy
+                                                == KltTemplatePolicy::FirstObservation
+                                            {
+                                                inlier_references
+                                                    .push(self.reference_tracks[*feat_idx].clone());
+                                            }
                                         } else {
                                             ransac_rejected += 1;
                                             stats.rejected += 1;
@@ -976,11 +1040,22 @@ impl Frontend {
                                         if !matched_ids.contains(&f.id) {
                                             inlier_features.push(f.clone());
                                             inlier_meta.push(self.track_meta[idx].clone());
+                                            if self.config.klt_template_policy
+                                                == KltTemplatePolicy::FirstObservation
+                                            {
+                                                inlier_references
+                                                    .push(self.reference_tracks[idx].clone());
+                                            }
                                         }
                                     }
                                     stats.tracked = stats.tracked.saturating_sub(ransac_rejected);
                                     self.features = inlier_features;
                                     self.track_meta = inlier_meta;
+                                    if self.config.klt_template_policy
+                                        == KltTemplatePolicy::FirstObservation
+                                    {
+                                        self.reference_tracks = inlier_references;
+                                    }
                                 }
                             }
                         }
@@ -999,6 +1074,9 @@ impl Frontend {
         );
         stats.rejected += pruned;
         stats.tracked = stats.tracked.saturating_sub(pruned);
+        if pruned > 0 && self.config.klt_template_policy == KltTemplatePolicy::FirstObservation {
+            align_reference_tracks(&mut self.reference_tracks, &self.features);
+        }
 
         if self.config.tile_reservoir_pruning_enabled {
             let pruned = prune_overfull_tiles(
@@ -1012,6 +1090,10 @@ impl Frontend {
             );
             stats.rejected += pruned;
             stats.tracked = stats.tracked.saturating_sub(pruned);
+            if pruned > 0 && self.config.klt_template_policy == KltTemplatePolicy::FirstObservation
+            {
+                align_reference_tracks(&mut self.reference_tracks, &self.features);
+            }
         }
 
         // Step 3: Update occupancy grid from tracked features.
@@ -1117,6 +1199,26 @@ impl Frontend {
                 );
                 self.features.push(new_feat);
                 self.track_meta.push(new_meta);
+                if self.config.klt_template_policy == KltTemplatePolicy::FirstObservation {
+                    let ref_tracker = ReferenceKltTracker::new(
+                        self.config.klt_window,
+                        self.config.klt_max_iter,
+                        self.config.klt_epsilon,
+                        self.config.pyramid_levels,
+                        self.config.klt_residual_enabled,
+                        self.config.klt_reference_warp,
+                    );
+                    if let Some(reference) =
+                        ref_tracker.make_track(self.features.last().unwrap(), &self.curr_pyramid)
+                    {
+                        self.reference_tracks.push(reference);
+                    } else {
+                        self.features.pop();
+                        self.track_meta.pop();
+                        self.next_id -= 1;
+                        continue;
+                    }
+                }
                 self.grid.mark(f.x, f.y);
                 stats.new_detections += 1;
             }
@@ -1176,12 +1278,18 @@ impl Frontend {
             if write != read {
                 self.features[write] = self.features[read].clone();
                 self.track_meta[write] = self.track_meta[read].clone();
+                if self.config.klt_template_policy == KltTemplatePolicy::FirstObservation {
+                    self.reference_tracks[write] = self.reference_tracks[read].clone();
+                }
             }
             write += 1;
         }
 
         self.features.truncate(write);
         self.track_meta.truncate(write);
+        if self.config.klt_template_policy == KltTemplatePolicy::FirstObservation {
+            self.reference_tracks.truncate(write);
+        }
         self.prev_features
             .retain(|feature| !ids.contains(&feature.id));
 
@@ -1222,6 +1330,7 @@ impl Frontend {
         self.has_prev = false;
         self.features.clear();
         self.track_meta.clear();
+        self.reference_tracks.clear();
         self.prev_features.clear();
         self.pose_prior = None;
         self.grid.clear();
@@ -1429,9 +1538,11 @@ mod tests {
 
         assert!(!persisted.is_empty(), "expected some persisted tracks");
         assert!(persisted.iter().all(|m| m.age >= 2));
-        assert!(persisted
-            .iter()
-            .all(|m| m.klt_quality > 0.0 && m.klt_quality <= 1.0));
+        assert!(
+            persisted
+                .iter()
+                .all(|m| m.klt_quality > 0.0 && m.klt_quality <= 1.0)
+        );
     }
 
     #[test]
@@ -1481,9 +1592,11 @@ mod tests {
             .collect();
 
         assert!(!persisted.is_empty(), "expected some persisted tracks");
-        assert!(persisted
-            .iter()
-            .all(|m| m.klt_quality > 0.0 && m.klt_quality <= 1.0));
+        assert!(
+            persisted
+                .iter()
+                .all(|m| m.klt_quality > 0.0 && m.klt_quality <= 1.0)
+        );
     }
 
     #[test]
@@ -1547,10 +1660,12 @@ mod tests {
         frontend.process(&img1);
         frontend.process(&img2);
 
-        assert!(frontend
-            .track_meta()
-            .iter()
-            .all(|m| m.reservoir_score.is_finite()));
+        assert!(
+            frontend
+                .track_meta()
+                .iter()
+                .all(|m| m.reservoir_score.is_finite())
+        );
     }
 
     #[test]
@@ -1802,10 +1917,12 @@ mod tests {
         assert_eq!(removed, 1);
         assert_eq!(frontend.features().len(), before - 1);
         assert_eq!(frontend.features().len(), frontend.track_meta().len());
-        assert!(frontend
-            .features()
-            .iter()
-            .all(|feature| feature.id != drop_id));
+        assert!(
+            frontend
+                .features()
+                .iter()
+                .all(|feature| feature.id != drop_id)
+        );
         assert!(frontend.track_meta().iter().all(|meta| meta.id != drop_id));
     }
 

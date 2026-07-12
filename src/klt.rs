@@ -39,8 +39,9 @@
 // SIMD mirrors the texture-gather pattern.
 
 use crate::fast::Feature;
-use crate::image::{interpolate_bilinear, interpolate_bilinear_unchecked, Image};
+use crate::image::{Image, interpolate_bilinear, interpolate_bilinear_unchecked};
 use crate::pyramid::Pyramid;
+use nalgebra::{Matrix2, SMatrix, SVector, Vector2};
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -62,12 +63,17 @@ pub enum TrackStatus {
 pub enum LkMethod {
     ForwardAdditive,
     InverseCompositional,
+    /// Inverse compositional KLT with a 2x3 affine warp.
+    InverseCompositionalAffine,
     /// Inverse compositional with fixed-point (i16) arithmetic.
     /// Uses integer bilinear interpolation and i16 buffers, enabling
     /// _mm256_madd_epi16 (16 elements/cycle) vs _mm256_fmadd_ps (8/cycle).
     /// Also 2× less memory bandwidth for scratch buffers (i16 vs f32).
     InverseCompositionalFixed,
 }
+
+type Mat6 = SMatrix<f32, 6, 6>;
+type Vec6 = SVector<f32, 6>;
 
 /// A feature with its tracking status after a track() call.
 #[derive(Debug, Clone)]
@@ -367,6 +373,7 @@ impl KltTracker {
     ) -> TrackedFeature {
         let mut dx = 0.0f32;
         let mut dy = 0.0f32;
+        let mut affine_p = Vec6::zeros();
 
         // If both pyramids carry replicate-padded f32 levels with a sufficient
         // border, the IC path uses them and skips per-feature bounds checks.
@@ -412,6 +419,18 @@ impl KltTracker {
                         )
                     }
                 }
+                LkMethod::InverseCompositionalAffine => {
+                    let prev_img = &prev_pyr.levels[level];
+                    let curr_img = &curr_pyr.levels[level];
+                    self.lk_inverse_compositional_affine(
+                        prev_img,
+                        curr_img,
+                        feat_x,
+                        feat_y,
+                        &mut affine_p,
+                        level,
+                    )
+                }
                 LkMethod::InverseCompositionalFixed => {
                     // Use direct u8 path when pyramid has u8 levels (build_reuse).
                     if prev_pyr.has_u8_levels() && curr_pyr.has_u8_levels() {
@@ -434,8 +453,13 @@ impl KltTracker {
 
             match result {
                 LkResult::Converged(new_dx, new_dy) | LkResult::MaxIter(new_dx, new_dy) => {
-                    dx = new_dx;
-                    dy = new_dy;
+                    if self.method == LkMethod::InverseCompositionalAffine {
+                        dx = affine_p[4];
+                        dy = affine_p[5];
+                    } else {
+                        dx = new_dx;
+                        dy = new_dy;
+                    }
                 }
                 LkResult::Singular => {
                     return TrackedFeature {
@@ -453,7 +477,7 @@ impl KltTracker {
                 }
             }
 
-            if level > 0 {
+            if level > 0 && self.method != LkMethod::InverseCompositionalAffine {
                 dx *= 2.0;
                 dy *= 2.0;
             }
@@ -470,15 +494,26 @@ impl KltTracker {
             TrackStatus::OutOfBounds
         };
         let residual = if status == TrackStatus::Tracked && self.compute_residual {
-            mean_abs_patch_residual(
-                &prev_pyr.levels[0],
-                &curr_pyr.levels[0],
-                feature.x,
-                feature.y,
-                dx,
-                dy,
-                self.window_size,
-            )
+            if self.method == LkMethod::InverseCompositionalAffine {
+                mean_abs_patch_residual_affine(
+                    &prev_pyr.levels[0],
+                    &curr_pyr.levels[0],
+                    feature.x,
+                    feature.y,
+                    &affine_p,
+                    self.window_size,
+                )
+            } else {
+                mean_abs_patch_residual(
+                    &prev_pyr.levels[0],
+                    &curr_pyr.levels[0],
+                    feature.x,
+                    feature.y,
+                    dx,
+                    dy,
+                    self.window_size,
+                )
+            }
         } else if status == TrackStatus::Tracked {
             f32::NAN
         } else {
@@ -895,6 +930,91 @@ impl KltTracker {
         }
 
         LkResult::MaxIter(dx, dy)
+    }
+
+    fn lk_inverse_compositional_affine(
+        &self,
+        prev_img: &Image<f32>,
+        curr_img: &Image<f32>,
+        feat_x: f32,
+        feat_y: f32,
+        p: &mut Vec6,
+        level: usize,
+    ) -> LkResult {
+        let half = self.window_size as isize;
+        let scale = 1.0 / (1u32 << level) as f32;
+        let mut lp = Vec6::new(p[0], p[1], p[2], p[3], p[4] * scale, p[5] * scale);
+
+        let mut h = Mat6::zeros();
+        for py in -half..=half {
+            let oy = py as f32;
+            for px in -half..=half {
+                let ox = px as f32;
+                let x = feat_x + ox;
+                let y = feat_y + oy;
+                let gx = 0.5
+                    * (interpolate_bilinear(prev_img, x + 1.0, y)
+                        - interpolate_bilinear(prev_img, x - 1.0, y));
+                let gy = 0.5
+                    * (interpolate_bilinear(prev_img, x, y + 1.0)
+                        - interpolate_bilinear(prev_img, x, y - 1.0));
+                let j = Vec6::new(gx * ox, gx * oy, gy * ox, gy * oy, gx, gy);
+                h += j * j.transpose();
+            }
+        }
+
+        let Some(chol) = h.cholesky() else {
+            return LkResult::Singular;
+        };
+
+        for _iter in 0..self.max_iterations {
+            let mut b = Vec6::zeros();
+
+            for py in -half..=half {
+                let oy = py as f32;
+                for px in -half..=half {
+                    let ox = px as f32;
+                    let tx = feat_x + ox;
+                    let ty = feat_y + oy;
+                    let template = interpolate_bilinear(prev_img, tx, ty);
+                    let wx = feat_x + lp[4] + (1.0 + lp[0]) * ox + lp[1] * oy;
+                    let wy = feat_y + lp[5] + lp[2] * ox + (1.0 + lp[3]) * oy;
+                    let e = template - interpolate_bilinear(curr_img, wx, wy);
+                    let gx = 0.5
+                        * (interpolate_bilinear(prev_img, tx + 1.0, ty)
+                            - interpolate_bilinear(prev_img, tx - 1.0, ty));
+                    let gy = 0.5
+                        * (interpolate_bilinear(prev_img, tx, ty + 1.0)
+                            - interpolate_bilinear(prev_img, tx, ty - 1.0));
+                    let j = Vec6::new(gx * ox, gx * oy, gy * ox, gy * oy, gx, gy);
+                    b += j * e;
+                }
+            }
+
+            let delta = chol.solve(&b);
+            let Some(updated) = compose_inverse_affine_update(&lp, &delta) else {
+                return LkResult::Singular;
+            };
+            lp = updated;
+
+            if delta.norm_squared() < self.epsilon * self.epsilon {
+                p[0] = lp[0];
+                p[1] = lp[1];
+                p[2] = lp[2];
+                p[3] = lp[3];
+                p[4] = lp[4] / scale;
+                p[5] = lp[5] / scale;
+                return LkResult::Converged(lp[4], lp[5]);
+            }
+        }
+
+        p[0] = lp[0];
+        p[1] = lp[1];
+        p[2] = lp[2];
+        p[3] = lp[3];
+        p[4] = lp[4] / scale;
+        p[5] = lp[5] / scale;
+        LkResult::MaxIter(lp[4], lp[5])
     }
 
     // =====================================================================
@@ -1410,6 +1530,32 @@ enum LkResult {
     Singular,
 }
 
+fn compose_inverse_affine_update(p: &Vec6, delta_ref_minus_cur: &Vec6) -> Option<Vec6> {
+    let a = Matrix2::new(1.0 + p[0], p[1], p[2], 1.0 + p[3]);
+    let t = Vector2::new(p[4], p[5]);
+
+    let delta_a = Matrix2::new(
+        1.0 - delta_ref_minus_cur[0],
+        -delta_ref_minus_cur[1],
+        -delta_ref_minus_cur[2],
+        1.0 - delta_ref_minus_cur[3],
+    );
+    let delta_t = Vector2::new(-delta_ref_minus_cur[4], -delta_ref_minus_cur[5]);
+
+    let delta_a_inv = delta_a.try_inverse()?;
+    let new_a = a * delta_a_inv;
+    let new_t = t - new_a * delta_t;
+
+    Some(Vec6::new(
+        new_a[(0, 0)] - 1.0,
+        new_a[(0, 1)],
+        new_a[(1, 0)],
+        new_a[(1, 1)] - 1.0,
+        new_t[0],
+        new_t[1],
+    ))
+}
+
 fn mean_abs_patch_residual(
     prev_img: &Image<f32>,
     curr_img: &Image<f32>,
@@ -1429,6 +1575,34 @@ fn mean_abs_patch_residual(
             let py_f = py as f32;
             let t = interpolate_bilinear(prev_img, feat_x + px_f, feat_y + py_f);
             let w = interpolate_bilinear(curr_img, feat_x + dx + px_f, feat_y + dy + py_f);
+            sum += (t - w).abs();
+            count += 1;
+        }
+    }
+
+    sum / count.max(1) as f32
+}
+
+fn mean_abs_patch_residual_affine(
+    prev_img: &Image<f32>,
+    curr_img: &Image<f32>,
+    feat_x: f32,
+    feat_y: f32,
+    p: &Vec6,
+    window_size: usize,
+) -> f32 {
+    let half = window_size as isize;
+    let mut sum = 0.0f32;
+    let mut count = 0usize;
+
+    for py in -half..=half {
+        let oy = py as f32;
+        for px in -half..=half {
+            let ox = px as f32;
+            let t = interpolate_bilinear(prev_img, feat_x + ox, feat_y + oy);
+            let wx = feat_x + p[4] + (1.0 + p[0]) * ox + p[1] * oy;
+            let wy = feat_y + p[5] + p[2] * ox + (1.0 + p[3]) * oy;
+            let w = interpolate_bilinear(curr_img, wx, wy);
             sum += (t - w).abs();
             count += 1;
         }
@@ -3254,7 +3428,7 @@ mod tests {
         let iw10: i32 = 12 * 24; // 288
         let iw01: i32 = 20 * 8; // 160
         let iw11: i32 = 12 * 8; // 96
-                                // Sum = 1024 ✓
+        // Sum = 1024 ✓
 
         for ix in 0..4 {
             let val_u8 = unsafe {

@@ -3,6 +3,7 @@
 use rudolf_v::frontend::{DetectorType, Frontend, FrontendConfig};
 use rudolf_v::image::Image;
 use rudolf_v::klt::LkMethod;
+use rudolf_v::klt_reference::KltTemplatePolicy;
 
 /// Create a multi-rectangle scene with controllable shift.
 fn make_scene(shift_x: usize, shift_y: usize) -> Image<u8> {
@@ -166,4 +167,26 @@ fn ic_frontend_works() {
     frontend.process(&img1);
     let (_, stats) = frontend.process(&img2);
     assert!(stats.tracked > 0, "IC frontend should track: {stats:?}");
+}
+
+#[test]
+fn first_observation_reference_frontend_works() {
+    let config = FrontendConfig {
+        klt_method: LkMethod::InverseCompositional,
+        klt_template_policy: KltTemplatePolicy::FirstObservation,
+        max_features: 30,
+        ..Default::default()
+    };
+    let mut frontend = Frontend::new(config, 160, 120);
+
+    for i in 0..4 {
+        let img = make_scene(i * 2, i);
+        let (_, stats) = frontend.process(&img);
+        if i > 0 {
+            assert!(
+                stats.tracked > 0,
+                "reference-template frontend should track on frame {i}: {stats:?}"
+            );
+        }
+    }
 }
