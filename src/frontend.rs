@@ -478,6 +478,14 @@ pub struct FrontendConfig {
     ///
     /// Disabled by default because it adds an extra patch pass per track.
     pub klt_residual_enabled: bool,
+    /// Forward-backward consistency gate: re-track each forward-tracked feature
+    /// backward (curr -> prev) and reject it when the round-trip lands more than
+    /// this many pixels from its original position. Catches self-consistent slow
+    /// correspondence drift / occlusion that the forward residual and downstream
+    /// innovation gating cannot (the estimate tracks the drift, so the forward
+    /// error stays small). 0 disables (default); ~0.5 px removes most gross
+    /// outliers. Costs one extra KLT pass per frame.
+    pub klt_fb_threshold_px: f32,
     /// LBP descriptor verification (occlusion/drift detection).
     pub lbp_verification_enabled: bool,
     /// Whether high LBP distance is metadata only or a hard reservoir reject.
@@ -551,6 +559,7 @@ impl Default for FrontendConfig {
             klt_epsilon: 0.01,
             klt_method: LkMethod::ForwardAdditive,
             klt_residual_enabled: false,
+            klt_fb_threshold_px: 0.0,
             lbp_verification_enabled: true,
             lbp_policy: LbpPolicy::SoftPenalty,
             lbp_threshold: 4,
@@ -818,6 +827,38 @@ impl Frontend {
                     &mut self.klt_scratch,
                 );
 
+                // Step 2a: forward-backward consistency gate. Re-track each
+                // successfully forward-tracked feature backward (curr -> prev)
+                // and reject those whose round-trip lands more than
+                // klt_fb_threshold_px from the original position. This catches
+                // self-consistent slow drift / occlusion that neither the
+                // forward residual nor downstream innovation gating can see (the
+                // estimate tracks the drift, so those errors stay small).
+                let mut fb_reject = vec![false; self.track_results.len()];
+                if self.config.klt_fb_threshold_px > 0.0 {
+                    let mut fb_input: Vec<Feature> = Vec::new();
+                    let mut fb_idx: Vec<usize> = Vec::new();
+                    for i in 0..self.track_results.len() {
+                        if self.track_results[i].status == TrackStatus::Tracked {
+                            fb_input.push(self.track_results[i].feature.clone());
+                            fb_idx.push(i);
+                        }
+                    }
+                    if !fb_input.is_empty() {
+                        let back = tracker.track(&self.curr_pyramid, &self.prev_pyramid, &fb_input);
+                        let thr2 =
+                            self.config.klt_fb_threshold_px * self.config.klt_fb_threshold_px;
+                        for (j, bf) in back.iter().enumerate() {
+                            let i = fb_idx[j];
+                            let dx = bf.feature.x - self.features[i].x;
+                            let dy = bf.feature.y - self.features[i].y;
+                            if bf.status != TrackStatus::Tracked || dx * dx + dy * dy > thr2 {
+                                fb_reject[i] = true;
+                            }
+                        }
+                    }
+                }
+
                 // Filter features in-place: keep only successfully tracked.
                 // Avoids allocating a second Vec.
                 let mut write = 0;
@@ -825,6 +866,10 @@ impl Frontend {
 
                 for i in 0..self.track_results.len() {
                     if self.track_results[i].status == TrackStatus::Tracked {
+                        if fb_reject[i] {
+                            stats.rejected += 1;
+                            continue;
+                        }
                         let feat = &self.track_results[i].feature;
                         let mut lbp_distance = 0u16;
 
@@ -1429,9 +1474,11 @@ mod tests {
 
         assert!(!persisted.is_empty(), "expected some persisted tracks");
         assert!(persisted.iter().all(|m| m.age >= 2));
-        assert!(persisted
-            .iter()
-            .all(|m| m.klt_quality > 0.0 && m.klt_quality <= 1.0));
+        assert!(
+            persisted
+                .iter()
+                .all(|m| m.klt_quality > 0.0 && m.klt_quality <= 1.0)
+        );
     }
 
     #[test]
@@ -1481,9 +1528,11 @@ mod tests {
             .collect();
 
         assert!(!persisted.is_empty(), "expected some persisted tracks");
-        assert!(persisted
-            .iter()
-            .all(|m| m.klt_quality > 0.0 && m.klt_quality <= 1.0));
+        assert!(
+            persisted
+                .iter()
+                .all(|m| m.klt_quality > 0.0 && m.klt_quality <= 1.0)
+        );
     }
 
     #[test]
@@ -1547,10 +1596,12 @@ mod tests {
         frontend.process(&img1);
         frontend.process(&img2);
 
-        assert!(frontend
-            .track_meta()
-            .iter()
-            .all(|m| m.reservoir_score.is_finite()));
+        assert!(
+            frontend
+                .track_meta()
+                .iter()
+                .all(|m| m.reservoir_score.is_finite())
+        );
     }
 
     #[test]
@@ -1802,10 +1853,12 @@ mod tests {
         assert_eq!(removed, 1);
         assert_eq!(frontend.features().len(), before - 1);
         assert_eq!(frontend.features().len(), frontend.track_meta().len());
-        assert!(frontend
-            .features()
-            .iter()
-            .all(|feature| feature.id != drop_id));
+        assert!(
+            frontend
+                .features()
+                .iter()
+                .all(|feature| feature.id != drop_id)
+        );
         assert!(frontend.track_meta().iter().all(|meta| meta.id != drop_id));
     }
 
