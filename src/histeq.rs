@@ -240,6 +240,9 @@ pub fn equalize_clahe(image: &Image<u8>, tile_size: usize, clip_limit: f32) -> I
 }
 
 /// Apply CLAHE into a pre-allocated buffer.
+///
+/// When the `parallel` feature is enabled, both the per-tile LUT computation
+/// and the bilinear remap pass are parallelized with rayon.
 pub fn equalize_clahe_into(
     image: &Image<u8>,
     tile_size: usize,
@@ -261,48 +264,55 @@ pub fn equalize_clahe_into(
     let src = image.as_slice();
     let src_stride = image.stride();
 
-    // Compute per-tile LUTs.
-    let mut tile_luts = vec![[0u8; 256]; cols * rows];
+    // Compute per-tile LUTs (parallel over tiles when rayon is available).
+    #[cfg(feature = "parallel")]
+    let tile_luts: Vec<[u8; 256]> = (0..rows * cols)
+        .into_par_iter()
+        .map(|idx| {
+            let ty = idx / cols;
+            let tx = idx % cols;
+            clahe_tile_lut(src, src_stride, w, h, tile_size, tx, ty, clip_limit)
+        })
+        .collect();
 
-    for ty in 0..rows {
-        for tx in 0..cols {
-            let x0 = tx * tile_size;
-            let y0 = ty * tile_size;
-            let x1 = (x0 + tile_size).min(w);
-            let y1 = (y0 + tile_size).min(h);
-            let tile_pixels = (x1 - x0) * (y1 - y0);
+    #[cfg(not(feature = "parallel"))]
+    let tile_luts: Vec<[u8; 256]> = (0..rows * cols)
+        .map(|idx| {
+            let ty = idx / cols;
+            let tx = idx % cols;
+            clahe_tile_lut(src, src_stride, w, h, tile_size, tx, ty, clip_limit)
+        })
+        .collect();
 
-            let mut hist = [0u32; 256];
-            for y in y0..y1 {
-                let row = y * src_stride;
-                unsafe {
-                    for x in x0..x1 {
-                        let v = *src.get_unchecked(row + x) as usize;
-                        *hist.get_unchecked_mut(v) += 1;
-                    }
-                }
-            }
-
-            if clip_limit > 0.0 {
-                clip_histogram(&mut hist, tile_pixels, clip_limit);
-            }
-
-            tile_luts[ty * cols + tx] = build_lut(&hist, tile_pixels);
-        }
-    }
-
-    // Remap each pixel using bilinear interpolation between 4 nearest tiles.
-    let dst_stride = out.stride();
-    let dst = out.as_mut_slice();
-
+    // Precompute x-direction tile indices and blend weights (same for every row).
+    let inv_tile = 1.0 / tile_size as f32;
     let tile_cx = |tx: usize| -> f32 { (tx as f32 + 0.5) * tile_size as f32 };
     let tile_cy = |ty: usize| -> f32 { (ty as f32 + 0.5) * tile_size as f32 };
 
-    for y in 0..h {
+    let col_tx0: Vec<usize> = (0..w)
+        .map(|x| (((x as f32) * inv_tile - 0.5).floor() as isize).max(0) as usize)
+        .collect();
+    let col_tx1: Vec<usize> = col_tx0.iter().map(|&t| (t + 1).min(cols - 1)).collect();
+    let col_ax: Vec<f32> = (0..w)
+        .map(|x| {
+            let tx0 = col_tx0[x];
+            let tx1 = col_tx1[x];
+            if tx0 == tx1 {
+                0.0
+            } else {
+                ((x as f32 - tile_cx(tx0)) / (tile_cx(tx1) - tile_cx(tx0))).clamp(0.0, 1.0)
+            }
+        })
+        .collect();
+
+    // Remap each pixel using bilinear interpolation between 4 nearest tile LUTs.
+    let dst_stride = out.stride();
+    let dst = out.as_mut_slice();
+
+    let remap_row = |y: usize, dst_row: &mut [u8]| {
         let src_off = y * src_stride;
-        let dst_off = y * dst_stride;
         let py = y as f32;
-        let fy = (py / tile_size as f32) - 0.5;
+        let fy = py * inv_tile - 0.5;
         let ty0 = (fy.floor() as isize).max(0) as usize;
         let ty1 = (ty0 + 1).min(rows - 1);
         let ay = if ty0 == ty1 {
@@ -310,35 +320,85 @@ pub fn equalize_clahe_into(
         } else {
             ((py - tile_cy(ty0)) / (tile_cy(ty1) - tile_cy(ty0))).clamp(0.0, 1.0)
         };
+        let w_top = 1.0 - ay;
+        let lut_row0 = &tile_luts[ty0 * cols..ty0 * cols + cols];
+        let lut_row1 = &tile_luts[ty1 * cols..ty1 * cols + cols];
 
         for x in 0..w {
-            let px = x as f32;
-            let fx = (px / tile_size as f32) - 0.5;
-            let tx0 = (fx.floor() as isize).max(0) as usize;
-            let tx1 = (tx0 + 1).min(cols - 1);
-            let ax = if tx0 == tx1 {
-                0.0
-            } else {
-                ((px - tile_cx(tx0)) / (tile_cx(tx1) - tile_cx(tx0))).clamp(0.0, 1.0)
-            };
-
+            let tx0 = unsafe { *col_tx0.get_unchecked(x) };
+            let tx1 = unsafe { *col_tx1.get_unchecked(x) };
+            let ax = unsafe { *col_ax.get_unchecked(x) };
             let v = unsafe { *src.get_unchecked(src_off + x) as usize };
 
-            let v00 = tile_luts[ty0 * cols + tx0][v] as f32;
-            let v10 = tile_luts[ty0 * cols + tx1][v] as f32;
-            let v01 = tile_luts[ty1 * cols + tx0][v] as f32;
-            let v11 = tile_luts[ty1 * cols + tx1][v] as f32;
+            let v00 = unsafe { *lut_row0.get_unchecked(tx0).get_unchecked(v) } as f32;
+            let v10 = unsafe { *lut_row0.get_unchecked(tx1).get_unchecked(v) } as f32;
+            let v01 = unsafe { *lut_row1.get_unchecked(tx0).get_unchecked(v) } as f32;
+            let v11 = unsafe { *lut_row1.get_unchecked(tx1).get_unchecked(v) } as f32;
 
-            let val = v00 * (1.0 - ax) * (1.0 - ay)
-                + v10 * ax * (1.0 - ay)
-                + v01 * (1.0 - ax) * ay
-                + v11 * ax * ay;
+            let top = v00 + ax * (v10 - v00);
+            let bot = v01 + ax * (v11 - v01);
+            let val = top * w_top + bot * ay;
 
             unsafe {
-                *dst.get_unchecked_mut(dst_off + x) = val.round().clamp(0.0, 255.0) as u8;
+                *dst_row.get_unchecked_mut(x) = val.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    };
+
+    #[cfg(feature = "parallel")]
+    {
+        let dst_base = dst.as_mut_ptr() as usize;
+        (0..h).into_par_iter().for_each(|y| {
+            let dst_off = y * dst_stride;
+            let row =
+                unsafe { std::slice::from_raw_parts_mut((dst_base as *mut u8).add(dst_off), w) };
+            remap_row(y, row);
+        });
+    }
+
+    #[cfg(not(feature = "parallel"))]
+    {
+        for y in 0..h {
+            let dst_off = y * dst_stride;
+            let (_, rest) = dst.split_at_mut(dst_off);
+            let row = &mut rest[..w];
+            remap_row(y, row);
+        }
+    }
+}
+
+fn clahe_tile_lut(
+    src: &[u8],
+    src_stride: usize,
+    w: usize,
+    h: usize,
+    tile_size: usize,
+    tx: usize,
+    ty: usize,
+    clip_limit: f32,
+) -> [u8; 256] {
+    let x0 = tx * tile_size;
+    let y0 = ty * tile_size;
+    let x1 = (x0 + tile_size).min(w);
+    let y1 = (y0 + tile_size).min(h);
+    let tile_pixels = (x1 - x0) * (y1 - y0);
+
+    let mut hist = [0u32; 256];
+    for y in y0..y1 {
+        let row = y * src_stride;
+        unsafe {
+            for x in x0..x1 {
+                let v = *src.get_unchecked(row + x) as usize;
+                *hist.get_unchecked_mut(v) += 1;
             }
         }
     }
+
+    if clip_limit > 0.0 {
+        clip_histogram(&mut hist, tile_pixels, clip_limit);
+    }
+
+    build_lut(&hist, tile_pixels)
 }
 
 /// Clip histogram bins and redistribute excess counts.
