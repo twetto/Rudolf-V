@@ -135,8 +135,22 @@ fn tracked_features_preserve_metadata() {
 
     let tracker = KltTracker::new(5, 30, 0.01, 3);
     let features = vec![
-        Feature { x: 36.0, y: 36.0, score: 100.0, level: 0, id: 42, descriptor: 0 },
-        Feature { x: 71.0, y: 66.0, score: 80.0, level: 0, id: 99, descriptor: 0 },
+        Feature {
+            x: 36.0,
+            y: 36.0,
+            score: 100.0,
+            level: 0,
+            id: 42,
+            descriptor: 0,
+        },
+        Feature {
+            x: 71.0,
+            y: 66.0,
+            score: 80.0,
+            level: 0,
+            id: 99,
+            descriptor: 0,
+        },
     ];
 
     let results = tracker.track(&pyr, &pyr, &features);

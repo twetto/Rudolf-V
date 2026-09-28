@@ -50,7 +50,9 @@ fn harris_corners_at_cell_boundaries() {
         assert!(
             dist <= tolerance,
             "Harris corner at ({:.0},{:.0}) is {:.1}px from nearest junction",
-            f.x, f.y, dist,
+            f.x,
+            f.y,
+            dist,
         );
     }
 }
@@ -73,8 +75,14 @@ fn harris_nms_gives_well_distributed_corners() {
     // No two survivors in the same NMS cell.
     for i in 0..suppressed.len() {
         for j in (i + 1)..suppressed.len() {
-            let ci = (suppressed[i].x as usize / cell_size, suppressed[i].y as usize / cell_size);
-            let cj = (suppressed[j].x as usize / cell_size, suppressed[j].y as usize / cell_size);
+            let ci = (
+                suppressed[i].x as usize / cell_size,
+                suppressed[i].y as usize / cell_size,
+            );
+            let cj = (
+                suppressed[j].x as usize / cell_size,
+                suppressed[j].y as usize / cell_size,
+            );
             assert_ne!(ci, cj, "two Harris corners in same NMS cell");
         }
     }
@@ -105,7 +113,7 @@ fn response_positive_at_corners_negative_at_edges() {
     // The elbow corners of the cross should have positive response.
     // Pick a few interior edge points — they should have negative response.
     let corner_response = response.get(15, 15); // near a corner
-    let edge_response = response.get(20, 15);   // along an edge
+    let edge_response = response.get(20, 15); // along an edge
 
     // We just check that corners are significantly stronger than edges.
     assert!(

@@ -205,7 +205,9 @@ mod tests {
             assert!(
                 dist <= tolerance,
                 "Harris corner at ({:.0},{:.0}) is {:.1}px from nearest junction",
-                f.x, f.y, dist,
+                f.x,
+                f.y,
+                dist,
             );
         }
     }
@@ -215,7 +217,10 @@ mod tests {
         let img = Image::from_vec(40, 40, vec![128u8; 1600]);
         let det = HarrisDetector::new(0.04, 1e6, 2);
         let features = det.detect(&img);
-        assert!(features.is_empty(), "flat image should have no Harris corners");
+        assert!(
+            features.is_empty(),
+            "flat image should have no Harris corners"
+        );
     }
 
     #[test]
@@ -260,7 +265,10 @@ mod tests {
                 has_negative = true;
             }
         }
-        assert!(has_positive, "response should have positive values (corners)");
+        assert!(
+            has_positive,
+            "response should have positive values (corners)"
+        );
         assert!(has_negative, "response should have negative values (edges)");
     }
 

@@ -32,10 +32,10 @@
 
 use rudolf_v::camera::CameraIntrinsics;
 use rudolf_v::essential::RansacConfig;
-use rudolf_v::gpu::device::GpuDevice;
-use rudolf_v::gpu::frontend::{GpuFrontend, GpuFrontendConfig, SubmitStrategy};
-use rudolf_v::gpu::fast::NmsStrategy;
 use rudolf_v::frontend::LbpPolicy;
+use rudolf_v::gpu::device::GpuDevice;
+use rudolf_v::gpu::fast::NmsStrategy;
+use rudolf_v::gpu::frontend::{GpuFrontend, GpuFrontendConfig, SubmitStrategy};
 use rudolf_v::gpu::klt::KltSampling;
 use rudolf_v::histeq::HistEqMethod;
 use rudolf_v::image::Image;
@@ -67,7 +67,10 @@ fn main() {
     }
 
     let dataset_path = PathBuf::from(&args[1]);
-    let max_frames: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
+    let max_frames: usize = args
+        .get(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(usize::MAX);
 
     // --- Load dataset ---
     let cam0_dir = dataset_path.join("mav0").join("cam0");
@@ -88,14 +91,21 @@ fn main() {
     let num_frames = image_files.len().min(max_frames);
 
     // Pre-load all frames into memory to exclude I/O from timing.
-    println!("Loading {} frames from {}...", num_frames, dataset_path.display());
+    println!(
+        "Loading {} frames from {}...",
+        num_frames,
+        dataset_path.display()
+    );
     let frames: Vec<Image<u8>> = image_files[..num_frames]
         .iter()
         .map(|f| load_grayscale(&data_dir.join(f)))
         .collect();
 
     let (img_w, img_h) = (frames[0].width(), frames[0].height());
-    println!("Resolution: {}×{}, {} frames loaded", img_w, img_h, num_frames);
+    println!(
+        "Resolution: {}×{}, {} frames loaded",
+        img_w, img_h, num_frames
+    );
 
     // --- GPU init ---
     println!("Initialising GPU...");
@@ -105,41 +115,54 @@ fn main() {
     // --- Config from env ---
     let histeq = match env::var("RUDOLF_HISTEQ").as_deref() {
         Ok("global") => HistEqMethod::Global,
-        Ok("clahe")  => HistEqMethod::Clahe { tile_size: 32, clip_limit: 2.0 },
-        _            => HistEqMethod::None,
+        Ok("clahe") => HistEqMethod::Clahe {
+            tile_size: 32,
+            clip_limit: 2.0,
+        },
+        _ => HistEqMethod::None,
     };
     let max_features: usize = env::var("RUDOLF_FEATURES")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(200);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200);
     let klt_window: usize = env::var("RUDOLF_WINDOW")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(7);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(7);
     let pyramid_levels: usize = env::var("RUDOLF_LEVELS")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
     let cell_size: usize = env::var("RUDOLF_CELL")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(32);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(32);
 
     let submit_strategy = match env::var("RUDOLF_SUBMIT").as_deref() {
         Ok("separate") => SubmitStrategy::Separate,
-        _              => SubmitStrategy::Fused,
+        _ => SubmitStrategy::Fused,
     };
     let nms_strategy = match env::var("RUDOLF_NMS").as_deref() {
         Ok("cpu") => NmsStrategy::Cpu,
-        _         => NmsStrategy::Gpu,
+        _ => NmsStrategy::Gpu,
     };
 
     let klt_sampling = match env::var("RUDOLF_KLT_SAMPLING").as_deref() {
         Ok("hardware") => KltSampling::Hardware,
-        Ok("auto")     => KltSampling::Auto,
-        _              => KltSampling::Manual,
+        Ok("auto") => KltSampling::Auto,
+        _ => KltSampling::Manual,
     };
 
     let (lbp_verification_enabled, lbp_policy) = match env::var("RUDOLF_LBP").as_deref() {
-        Ok("off")  => (false, LbpPolicy::SoftPenalty),
+        Ok("off") => (false, LbpPolicy::SoftPenalty),
         Ok("hard") => (true, LbpPolicy::HardReject),
-        _          => (true, LbpPolicy::SoftPenalty),
+        _ => (true, LbpPolicy::SoftPenalty),
     };
     let tile_reservoir_pruning_enabled = env::var("RUDOLF_TILE_PRUNE").as_deref() != Ok("0");
     let overlap_ms: f64 = env::var("RUDOLF_OVERLAP_MS")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
 
     let sensor_yaml = cam0_dir.join("sensor.yaml");
     let camera = CameraIntrinsics::from_euroc_yaml(&sensor_yaml).ok();
@@ -157,7 +180,7 @@ fn main() {
         pyramid_levels,
         klt_window,
         klt_max_iter: 30,
-        klt_epsilon:  0.01,
+        klt_epsilon: 0.01,
         klt_sampling,
         lbp_verification_enabled,
         lbp_policy,
@@ -165,21 +188,31 @@ fn main() {
         histeq,
         camera,
         ransac: RansacConfig {
-            threshold:      env::var("RUDOLF_RANSAC_THRESH")
-                .ok().and_then(|s| s.parse().ok()).unwrap_or(1e-5),
+            threshold: env::var("RUDOLF_RANSAC_THRESH")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1e-5),
             max_iterations: 200,
-            confidence:     0.99,
+            confidence: 0.99,
         },
         ..Default::default()
     };
 
-    println!("Config: features={} cell={} levels={} window={} histeq={:?}",
-        max_features, cell_size, pyramid_levels, klt_window, histeq);
-    println!("Submit: {:?}  NMS: {:?}  KLT sampling: {:?}",
-        config.submit_strategy, config.nms_strategy, config.klt_sampling);
-    println!("LBP: {} {:?}  tile pruning: {}  simulated backend: {} ms/frame",
-        config.lbp_verification_enabled, config.lbp_policy,
-        config.tile_reservoir_pruning_enabled, overlap_ms);
+    println!(
+        "Config: features={} cell={} levels={} window={} histeq={:?}",
+        max_features, cell_size, pyramid_levels, klt_window, histeq
+    );
+    println!(
+        "Submit: {:?}  NMS: {:?}  KLT sampling: {:?}",
+        config.submit_strategy, config.nms_strategy, config.klt_sampling
+    );
+    println!(
+        "LBP: {} {:?}  tile pruning: {}  simulated backend: {} ms/frame",
+        config.lbp_verification_enabled,
+        config.lbp_policy,
+        config.tile_reservoir_pruning_enabled,
+        overlap_ms
+    );
 
     let mut frontend = GpuFrontend::new(&gpu, config, img_w, img_h);
 
@@ -198,20 +231,20 @@ fn main() {
     eprintln!("frame,tracked,lost,rejected,new,total,histeq_ms,pyramid_ms,klt_ms,ransac_ms,detect_ms,total_ms");
 
     struct Accum {
-        histeq:  Vec<f64>,
+        histeq: Vec<f64>,
         pyramid: Vec<f64>,
-        klt:     Vec<f64>,
-        ransac:  Vec<f64>,
-        detect:  Vec<f64>,
-        total:   Vec<f64>,
+        klt: Vec<f64>,
+        ransac: Vec<f64>,
+        detect: Vec<f64>,
+        total: Vec<f64>,
     }
     let mut acc = Accum {
-        histeq:  Vec::with_capacity(num_frames),
+        histeq: Vec::with_capacity(num_frames),
         pyramid: Vec::with_capacity(num_frames),
-        klt:     Vec::with_capacity(num_frames),
-        ransac:  Vec::with_capacity(num_frames),
-        detect:  Vec::with_capacity(num_frames),
-        total:   Vec::with_capacity(num_frames),
+        klt: Vec::with_capacity(num_frames),
+        ransac: Vec::with_capacity(num_frames),
+        detect: Vec::with_capacity(num_frames),
+        total: Vec::with_capacity(num_frames),
     };
 
     let bench_start = std::time::Instant::now();
@@ -230,11 +263,21 @@ fn main() {
         };
         let t = &stats.timing;
 
-        eprintln!("{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
-            i, stats.tracked, stats.lost, stats.rejected,
-            stats.new_detections, stats.total,
-            t.histeq_ms(), t.pyramid_ms(), t.klt_ms(),
-            t.ransac_ms(), t.detect_ms(), t.total_ms());
+        eprintln!(
+            "{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
+            i,
+            stats.tracked,
+            stats.lost,
+            stats.rejected,
+            stats.new_detections,
+            stats.total,
+            t.histeq_ms(),
+            t.pyramid_ms(),
+            t.klt_ms(),
+            t.ransac_ms(),
+            t.detect_ms(),
+            t.total_ms()
+        );
 
         if i == 1 {
             // Frame 1 is the first frame with tracking
@@ -255,24 +298,33 @@ fn main() {
 
     // --- Summary ---
     println!("═══════════════════════════════════════════════════════════════════");
-    println!("  Rudolf-V GPU Benchmark — {} frames in {:.2}s ({:.1} FPS)",
-        num_frames, bench_elapsed.as_secs_f64(),
-        num_frames as f64 / bench_elapsed.as_secs_f64());
+    println!(
+        "  Rudolf-V GPU Benchmark — {} frames in {:.2}s ({:.1} FPS)",
+        num_frames,
+        bench_elapsed.as_secs_f64(),
+        num_frames as f64 / bench_elapsed.as_secs_f64()
+    );
     println!("═══════════════════════════════════════════════════════════════════");
     println!("");
-    println!("  {:12} {:>8} {:>8} {:>8} {:>8}",
-        "Stage", "Mean", "Min", "Max", "Median");
-    println!("  {:12} {:>8} {:>8} {:>8} {:>8}",
-        "─────", "────", "───", "───", "──────");
+    println!(
+        "  {:12} {:>8} {:>8} {:>8} {:>8}",
+        "Stage", "Mean", "Min", "Max", "Median"
+    );
+    println!(
+        "  {:12} {:>8} {:>8} {:>8} {:>8}",
+        "─────", "────", "───", "───", "──────"
+    );
 
-    print_stat("histeq",  &acc.histeq);
+    print_stat("histeq", &acc.histeq);
     print_stat("pyramid", &acc.pyramid);
-    print_stat("klt",     &acc.klt);
-    print_stat("ransac",  &acc.ransac);
-    print_stat("detect",  &acc.detect);
-    println!("  {:12} {:>8} {:>8} {:>8} {:>8}",
-        "", "────", "───", "───", "──────");
-    print_stat("TOTAL",   &acc.total);
+    print_stat("klt", &acc.klt);
+    print_stat("ransac", &acc.ransac);
+    print_stat("detect", &acc.detect);
+    println!(
+        "  {:12} {:>8} {:>8} {:>8} {:>8}",
+        "", "────", "───", "───", "──────"
+    );
+    print_stat("TOTAL", &acc.total);
 
     println!("");
     println!("  Per-frame CSV written to stderr. Redirect with:");
@@ -281,16 +333,23 @@ fn main() {
 }
 
 fn print_stat(label: &str, vals: &[f64]) {
-    if vals.is_empty() { return; }
+    if vals.is_empty() {
+        return;
+    }
     let mut sorted = vals.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let mean   = vals.iter().sum::<f64>() / vals.len() as f64;
-    let min    = sorted[0];
-    let max    = sorted[sorted.len() - 1];
+    let mean = vals.iter().sum::<f64>() / vals.len() as f64;
+    let min = sorted[0];
+    let max = sorted[sorted.len() - 1];
     let median = sorted[sorted.len() / 2];
-    println!("  {:12} {:>7.2}ms {:>7.2}ms {:>7.2}ms {:>7.2}ms",
+    println!(
+        "  {:12} {:>7.2}ms {:>7.2}ms {:>7.2}ms {:>7.2}ms",
         label,
-        mean * 1000.0, min * 1000.0, max * 1000.0, median * 1000.0);
+        mean * 1000.0,
+        min * 1000.0,
+        max * 1000.0,
+        median * 1000.0
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -304,7 +363,9 @@ fn parse_euroc_csv(csv_path: &Path) -> Vec<String> {
     for line in reader.lines() {
         let line = line.unwrap();
         let line = line.trim();
-        if line.starts_with('#') || line.is_empty() { continue; }
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
         if let Some((_ts, fname)) = line.split_once(',') {
             filenames.push(fname.trim().to_string());
         }
@@ -318,7 +379,11 @@ fn list_png_files(dir: &Path) -> Vec<String> {
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
-            if name.ends_with(".png") { Some(name) } else { None }
+            if name.ends_with(".png") {
+                Some(name)
+            } else {
+                None
+            }
         })
         .collect();
     files.sort();
@@ -326,8 +391,8 @@ fn list_png_files(dir: &Path) -> Vec<String> {
 }
 
 fn load_grayscale(path: &Path) -> Image<u8> {
-    let img = image::open(path)
-        .unwrap_or_else(|e| panic!("Failed to load {}: {e}", path.display()));
+    let img =
+        image::open(path).unwrap_or_else(|e| panic!("Failed to load {}: {e}", path.display()));
     let gray = img.to_luma8();
     let (w, h) = gray.dimensions();
     Image::from_vec(w as usize, h as usize, gray.into_raw())

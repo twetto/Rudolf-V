@@ -104,9 +104,7 @@ fn bench_fast(c: &mut Criterion) {
     let mut group = c.benchmark_group("fast");
     group.warm_up_time(Duration::from_secs(2));
 
-    group.bench_function("cpu_detect_752x480", |b| {
-        b.iter(|| cpu_fast.detect(&img))
-    });
+    group.bench_function("cpu_detect_752x480", |b| b.iter(|| cpu_fast.detect(&img)));
 
     group.bench_function("gpu_detect_752x480", |b| {
         b.iter(|| gpu_fast.detect(&gpu, &pyr.levels[0], 0))
@@ -137,11 +135,17 @@ fn bench_klt(c: &mut Criterion) {
     let cpu_fast = FastDetector::new(20, 9);
     let all_features = cpu_fast.detect(&img1);
     let nms = OccupancyNms::new(128);
-    let features_40: Vec<_> = nms.suppress(&all_features, 752, 480)
-        .into_iter().take(40).collect();
+    let features_40: Vec<_> = nms
+        .suppress(&all_features, 752, 480)
+        .into_iter()
+        .take(40)
+        .collect();
     let nms2 = OccupancyNms::new(64);
-    let features_150: Vec<_> = nms2.suppress(&all_features, 752, 480)
-        .into_iter().take(150).collect();
+    let features_150: Vec<_> = nms2
+        .suppress(&all_features, 752, 480)
+        .into_iter()
+        .take(150)
+        .collect();
 
     let mut group = c.benchmark_group("klt");
     group.warm_up_time(Duration::from_secs(2));
@@ -154,7 +158,8 @@ fn bench_klt(c: &mut Criterion) {
             BenchmarkId::new("cpu_IC_4pyr", format!("{n}feat")),
             features,
             |b, feats| {
-                let tracker = KltTracker::with_method(7, 30, 0.01, 4, LkMethod::InverseCompositional);
+                let tracker =
+                    KltTracker::with_method(7, 30, 0.01, 4, LkMethod::InverseCompositional);
                 b.iter(|| tracker.track(&cpu_pyr1, &cpu_pyr2, feats))
             },
         );
@@ -185,25 +190,25 @@ fn bench_frontend(c: &mut Criterion) {
     let gpu = GpuDevice::new().expect("no Vulkan GPU");
 
     let cpu_config = FrontendConfig {
-        max_features:   40,
-        cell_size:      128,
+        max_features: 40,
+        cell_size: 128,
         pyramid_levels: 4,
-        klt_window:     7,
-        klt_max_iter:   30,
-        klt_method:     LkMethod::InverseCompositional,
-        histeq:         HistEqMethod::Global,
+        klt_window: 7,
+        klt_max_iter: 30,
+        klt_method: LkMethod::InverseCompositional,
+        histeq: HistEqMethod::Global,
         ..Default::default()
     };
 
     let gpu_config = GpuFrontendConfig {
         submit_strategy: SubmitStrategy::Separate,
-        nms_strategy:    NmsStrategy::Cpu,
-        max_features:    40,
-        cell_size:       128,
-        pyramid_levels:  4,
-        klt_window:      7,
-        klt_max_iter:    30,
-        histeq:          HistEqMethod::Global,
+        nms_strategy: NmsStrategy::Cpu,
+        max_features: 40,
+        cell_size: 128,
+        pyramid_levels: 4,
+        klt_window: 7,
+        klt_max_iter: 30,
+        histeq: HistEqMethod::Global,
         ..Default::default()
     };
 
@@ -214,14 +219,18 @@ fn bench_frontend(c: &mut Criterion) {
     group.bench_function("cpu_synthetic_752x480_10frames", |b| {
         b.iter(|| {
             let mut fe = Frontend::new(cpu_config.clone(), 752, 480);
-            for frame in &frames { fe.process(frame); }
+            for frame in &frames {
+                fe.process(frame);
+            }
         })
     });
 
     group.bench_function("gpu_synthetic_752x480_10frames", |b| {
         b.iter(|| {
             let mut fe = GpuFrontend::new(&gpu, gpu_config.clone(), 752, 480);
-            for frame in &frames { fe.process(&gpu, frame); }
+            for frame in &frames {
+                fe.process(&gpu, frame);
+            }
         })
     });
 
@@ -279,7 +288,7 @@ fn bench_euroc(c: &mut Criterion) {
     use std::path::PathBuf;
 
     let euroc_path = match env::var("EUROC_PATH") {
-        Ok(p)  => PathBuf::from(p),
+        Ok(p) => PathBuf::from(p),
         Err(_) => {
             eprintln!("EUROC_PATH not set, skipping EuRoC GPU benchmark.");
             return;
@@ -297,7 +306,8 @@ fn bench_euroc(c: &mut Criterion) {
     // Parse frame list
     let image_files: Vec<String> = {
         let file = fs::File::open(&csv_path).expect("failed to open data.csv");
-        BufReader::new(file).lines()
+        BufReader::new(file)
+            .lines()
             .filter_map(|l| l.ok())
             .filter(|l| !l.trim().starts_with('#') && !l.trim().is_empty())
             .filter_map(|l| l.split_once(',').map(|(_, f)| f.trim().to_string()))
@@ -306,38 +316,43 @@ fn bench_euroc(c: &mut Criterion) {
     let num_frames = image_files.len().min(50);
 
     eprintln!("Loading {} EuRoC frames...", num_frames);
-    let frames: Vec<Image<u8>> = (1000..1000+num_frames).map(|i| {
-        let img = image::open(data_dir.join(&image_files[i])).expect("load failed");
-        let gray = img.to_luma8();
-        let (w, h) = gray.dimensions();
-        Image::from_vec(w as usize, h as usize, gray.into_raw())
-    }).collect();
+    let frames: Vec<Image<u8>> = (1000..1000 + num_frames)
+        .map(|i| {
+            let img = image::open(data_dir.join(&image_files[i])).expect("load failed");
+            let gray = img.to_luma8();
+            let (w, h) = gray.dimensions();
+            Image::from_vec(w as usize, h as usize, gray.into_raw())
+        })
+        .collect();
 
     let (img_w, img_h) = (frames[0].width(), frames[0].height());
-    eprintln!("EuRoC GPU benchmark ready: {}×{}, {} frames", img_w, img_h, num_frames);
+    eprintln!(
+        "EuRoC GPU benchmark ready: {}×{}, {} frames",
+        img_w, img_h, num_frames
+    );
 
     let gpu = GpuDevice::new().expect("no Vulkan GPU");
 
     let cpu_config = FrontendConfig {
-        max_features:   40,
-        cell_size:      128,
+        max_features: 40,
+        cell_size: 128,
         pyramid_levels: 4,
-        klt_window:     7,
-        klt_max_iter:   30,
-        klt_method:     LkMethod::InverseCompositional,
-        histeq:         HistEqMethod::Global,
+        klt_window: 7,
+        klt_max_iter: 30,
+        klt_method: LkMethod::InverseCompositional,
+        histeq: HistEqMethod::Global,
         ..Default::default()
     };
 
     let gpu_config = GpuFrontendConfig {
         submit_strategy: SubmitStrategy::Separate,
-        nms_strategy:    NmsStrategy::Cpu,
-        max_features:    40,
-        cell_size:       128,
-        pyramid_levels:  4,
-        klt_window:      7,
-        klt_max_iter:    30,
-        histeq:          HistEqMethod::Global,
+        nms_strategy: NmsStrategy::Cpu,
+        max_features: 40,
+        cell_size: 128,
+        pyramid_levels: 4,
+        klt_window: 7,
+        klt_max_iter: 30,
+        histeq: HistEqMethod::Global,
         ..Default::default()
     };
 
@@ -347,12 +362,12 @@ fn bench_euroc(c: &mut Criterion) {
         let mut t = TimingStats::default();
         for (i, frame) in frames.iter().enumerate() {
             let (_, stats) = fe.process(frame);
-            t.histeq  += stats.timing.histeq;
+            t.histeq += stats.timing.histeq;
             t.pyramid += stats.timing.pyramid;
-            t.klt     += stats.timing.klt;
-            t.ransac  += stats.timing.ransac;
-            t.detect  += stats.timing.detect;
-            t.total   += stats.timing.total;
+            t.klt += stats.timing.klt;
+            t.ransac += stats.timing.ransac;
+            t.detect += stats.timing.detect;
+            t.total += stats.timing.total;
             if i < 5 || i == num_frames - 1 {
                 eprintln!(
                     "  frame {:3}: tracked={:2} lost={:2} new={:2} total={:2} | {}",
@@ -361,7 +376,10 @@ fn bench_euroc(c: &mut Criterion) {
             }
         }
         let n = num_frames as f64;
-        eprintln!("\nRudolf-V CPU per-stage averages over {} frames:", num_frames);
+        eprintln!(
+            "\nRudolf-V CPU per-stage averages over {} frames:",
+            num_frames
+        );
         eprintln!(
             "  histeq: {:.2}ms  pyramid: {:.2}ms  klt: {:.2}ms  ransac: {:.2}ms  detect: {:.2}ms  total: {:.2}ms\n",
             t.histeq / n * 1000.0,
@@ -379,12 +397,12 @@ fn bench_euroc(c: &mut Criterion) {
         let mut t = TimingStats::default();
         for (i, frame) in frames.iter().enumerate() {
             let (_, stats) = fe.process(&gpu, frame);
-            t.histeq  += stats.timing.histeq;
+            t.histeq += stats.timing.histeq;
             t.pyramid += stats.timing.pyramid;
-            t.klt     += stats.timing.klt;
-            t.ransac  += stats.timing.ransac;
-            t.detect  += stats.timing.detect;
-            t.total   += stats.timing.total;
+            t.klt += stats.timing.klt;
+            t.ransac += stats.timing.ransac;
+            t.detect += stats.timing.detect;
+            t.total += stats.timing.total;
             if i < 5 || i == num_frames - 1 {
                 eprintln!(
                     "  frame {:3}: tracked={:2} lost={:2} new={:2} total={:2} | {}",
@@ -393,7 +411,10 @@ fn bench_euroc(c: &mut Criterion) {
             }
         }
         let n = num_frames as f64;
-        eprintln!("\nRudolf-V GPU per-stage averages over {} frames:", num_frames);
+        eprintln!(
+            "\nRudolf-V GPU per-stage averages over {} frames:",
+            num_frames
+        );
         eprintln!(
             "  histeq: {:.2}ms  pyramid: {:.2}ms  klt: {:.2}ms  ransac: {:.2}ms  detect: {:.2}ms  total: {:.2}ms\n",
             t.histeq / n * 1000.0,
@@ -412,14 +433,18 @@ fn bench_euroc(c: &mut Criterion) {
     group.bench_function(format!("cpu_{num_frames}frames"), |b| {
         b.iter(|| {
             let mut fe = Frontend::new(cpu_config.clone(), img_w, img_h);
-            for frame in &frames { fe.process(frame); }
+            for frame in &frames {
+                fe.process(frame);
+            }
         })
     });
 
     group.bench_function(format!("gpu_{num_frames}frames"), |b| {
         b.iter(|| {
             let mut fe = GpuFrontend::new(&gpu, gpu_config.clone(), img_w, img_h);
-            for frame in &frames { fe.process(&gpu, frame); }
+            for frame in &frames {
+                fe.process(&gpu, frame);
+            }
         })
     });
 

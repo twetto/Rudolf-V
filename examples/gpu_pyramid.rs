@@ -39,7 +39,9 @@ fn main() {
 
     eprintln!(
         "[gpu_pyramid] source: {}×{}, {} levels, sigma={sigma}",
-        src.width(), src.height(), num_levels
+        src.width(),
+        src.height(),
+        num_levels
     );
 
     // --- CPU pyramid ---
@@ -62,12 +64,17 @@ fn main() {
         let data = gpu_pyr.readback_level(&gpu, lvl);
         let cpu_data = cpu_pyr.level(lvl).as_slice();
 
-        let max_err = data.iter().zip(cpu_data.iter())
+        let max_err = data
+            .iter()
+            .zip(cpu_data.iter())
             .map(|(&g, &c)| (g - c).abs())
             .fold(0.0f32, f32::max);
-        let mean_err = data.iter().zip(cpu_data.iter())
+        let mean_err = data
+            .iter()
+            .zip(cpu_data.iter())
             .map(|(&g, &c)| (g - c).abs())
-            .sum::<f32>() / data.len() as f32;
+            .sum::<f32>()
+            / data.len() as f32;
 
         eprintln!(
             "[gpu_pyramid] level {lvl}: {}×{}  max_err={max_err:.4}  mean_err={mean_err:.4}",
@@ -152,7 +159,9 @@ fn main() {
     // --- Display in minifb window ---
     let title = format!(
         "GPU pyramid — CPU (top) vs GPU (bottom) — {}×{} | {} levels | σ={sigma}",
-        src.width(), src.height(), num_levels
+        src.width(),
+        src.height(),
+        num_levels
     );
 
     let mut window = minifb::Window::new(
@@ -171,7 +180,8 @@ fn main() {
     eprintln!("[gpu_pyramid] window open — press Escape or close to exit");
 
     while window.is_open() && !window.is_key_down(minifb::Key::Escape) {
-        window.update_with_buffer(&fb, total_w, total_h)
+        window
+            .update_with_buffer(&fb, total_w, total_h)
             .expect("window update failed");
     }
 }
@@ -203,7 +213,11 @@ fn checkerboard(width: usize, height: usize, tile: usize) -> Image<u8> {
         .map(|i| {
             let x = i % width;
             let y = i / width;
-            if (x / tile + y / tile) % 2 == 0 { 220 } else { 40 }
+            if (x / tile + y / tile) % 2 == 0 {
+                220
+            } else {
+                40
+            }
         })
         .collect();
     Image::<u8>::from_vec(width, height, pixels)

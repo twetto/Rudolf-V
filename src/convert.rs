@@ -147,7 +147,7 @@ mod tests {
         let data: Vec<f32> = vec![-10.0, 0.0, 300.0, 127.6];
         let img = Image::from_vec(2, 2, data);
         let out = f32_raw_to_u8(&img);
-        assert_eq!(out.get(0, 0), 0);   // clamped from -10
+        assert_eq!(out.get(0, 0), 0); // clamped from -10
         assert_eq!(out.get(1, 0), 0);
         assert_eq!(out.get(0, 1), 255); // clamped from 300
         assert_eq!(out.get(1, 1), 128); // 127.6 rounds to 128

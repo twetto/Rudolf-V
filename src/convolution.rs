@@ -32,7 +32,11 @@ use crate::image::{Image, Pixel};
 /// This mirrors GPU texture sampling with clamp-to-edge addressing.
 pub fn convolve_rows<T: Pixel>(src: &Image<T>, kernel: &[f32]) -> Image<f32> {
     assert!(!kernel.is_empty(), "kernel must not be empty");
-    assert!(kernel.len() % 2 == 1, "kernel length must be odd (got {})", kernel.len());
+    assert!(
+        kernel.len() % 2 == 1,
+        "kernel length must be odd (got {})",
+        kernel.len()
+    );
 
     let w = src.width();
     let h = src.height();
@@ -87,7 +91,11 @@ pub fn convolve_rows<T: Pixel>(src: &Image<T>, kernel: &[f32]) -> Image<f32> {
 /// Optimized with interior/border split like convolve_rows.
 pub fn convolve_cols(src: &Image<f32>, kernel: &[f32]) -> Image<f32> {
     assert!(!kernel.is_empty(), "kernel must not be empty");
-    assert!(kernel.len() % 2 == 1, "kernel length must be odd (got {})", kernel.len());
+    assert!(
+        kernel.len() % 2 == 1,
+        "kernel length must be odd (got {})",
+        kernel.len()
+    );
 
     let w = src.width();
     let h = src.height();
@@ -398,7 +406,10 @@ mod tests {
         let var = |img: &Image<f32>| {
             let n = (img.width() * img.height()) as f32;
             let mean: f32 = img.pixels().map(|(_, _, v)| v).sum::<f32>() / n;
-            img.pixels().map(|(_, _, v)| (v - mean) * (v - mean)).sum::<f32>() / n
+            img.pixels()
+                .map(|(_, _, v)| (v - mean) * (v - mean))
+                .sum::<f32>()
+                / n
         };
 
         assert!(
@@ -411,11 +422,7 @@ mod tests {
     fn test_box_filter_3x3() {
         // A 3-tap box filter [1/3, 1/3, 1/3] applied separably should
         // give the mean of a 3×3 neighborhood.
-        let data: Vec<f32> = vec![
-            0.0, 0.0, 0.0,
-            0.0, 9.0, 0.0,
-            0.0, 0.0, 0.0,
-        ];
+        let data: Vec<f32> = vec![0.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0];
         let img = Image::from_vec(3, 3, data);
         let k = vec![1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0];
         let out = convolve_separable(&img, &k, &k);

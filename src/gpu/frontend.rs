@@ -369,7 +369,10 @@ impl GpuFrontend {
     /// [`drop_tracks`]: GpuFrontend::drop_tracks
     pub fn submit(&mut self, gpu: &GpuDevice, image: &Image<u8>) {
         if let Some(p) = &self.pending {
-            assert!(p.discarded, "GpuFrontend::submit: previous frame was not collected");
+            assert!(
+                p.discarded,
+                "GpuFrontend::submit: previous frame was not collected"
+            );
             self.drain_discarded(gpu);
         }
         assert_eq!(image.width(), self.img_w, "image width mismatch");
@@ -385,7 +388,9 @@ impl GpuFrontend {
         if self.config.histeq != HistEqMethod::None {
             histeq::apply_histeq_into(image, self.config.histeq, &mut self.input_buf);
         } else if self.input_buf.stride() == image.stride() {
-            self.input_buf.as_mut_slice().copy_from_slice(image.as_slice());
+            self.input_buf
+                .as_mut_slice()
+                .copy_from_slice(image.as_slice());
         } else {
             self.input_buf = image.clone();
         }
@@ -401,8 +406,16 @@ impl GpuFrontend {
         let curr = self.curr_slot;
         let prev = 1 - curr;
         let can_track = self.has_prev && !self.features.is_empty();
-        let feats_snap: Vec<Feature> = if can_track { self.features.clone() } else { Vec::new() };
-        let meta_snap: Vec<TrackMeta> = if can_track { self.track_meta.clone() } else { Vec::new() };
+        let feats_snap: Vec<Feature> = if can_track {
+            self.features.clone()
+        } else {
+            Vec::new()
+        };
+        let meta_snap: Vec<TrackMeta> = if can_track {
+            self.track_meta.clone()
+        } else {
+            Vec::new()
+        };
         let mut tracking = false;
         let mut separate_pyr = None;
 
@@ -412,15 +425,16 @@ impl GpuFrontend {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("GpuFrontend frame"),
                 });
-            self.pyr_pipeline
-                .record_rebuild(gpu, &mut encoder, &self.input_buf, &self.pyramids[curr]);
+            self.pyr_pipeline.record_rebuild(
+                gpu,
+                &mut encoder,
+                &self.input_buf,
+                &self.pyramids[curr],
+            );
             tracking = can_track
-                && self.klt.prepare(
-                    gpu,
-                    &feats_snap,
-                    &self.pyramids[prev],
-                    &self.pyramids[curr],
-                );
+                && self
+                    .klt
+                    .prepare(gpu, &feats_snap, &self.pyramids[prev], &self.pyramids[curr]);
             if tracking {
                 self.klt.record_into(&mut encoder);
             }
@@ -515,7 +529,10 @@ impl GpuFrontend {
             };
             (results, Some(self.fast.collect_winners(0)))
         } else {
-            let curr_pyr = p.separate_pyr.as_ref().expect("separate pyramid built in submit");
+            let curr_pyr = p
+                .separate_pyr
+                .as_ref()
+                .expect("separate pyramid built in submit");
             let results = match (p.tracking, self.separate_prev.as_ref()) {
                 (true, Some(prev_pyr)) => self.klt.track(gpu, prev_pyr, curr_pyr, &p.feats_snap),
                 _ => Vec::new(),
@@ -680,7 +697,10 @@ impl GpuFrontend {
         let winners = if let Some(w) = fused_winners {
             w
         } else if slots > 0 {
-            let curr_pyr = p.separate_pyr.as_ref().expect("separate pyramid built in submit");
+            let curr_pyr = p
+                .separate_pyr
+                .as_ref()
+                .expect("separate pyramid built in submit");
             self.fast.detect(gpu, &curr_pyr.levels[0], 0)
         } else {
             Vec::new()
@@ -1092,7 +1112,8 @@ mod tests {
         for y in 0..h {
             for x in 0..w {
                 let (sx, sy) = (x.wrapping_sub(shift_x), y.wrapping_sub(shift_y));
-                let v = img.get(x, y) as u32 + ((sx.wrapping_mul(7) ^ sy.wrapping_mul(13)) % 23) as u32;
+                let v =
+                    img.get(x, y) as u32 + ((sx.wrapping_mul(7) ^ sy.wrapping_mul(13)) % 23) as u32;
                 img.set(x, y, v.min(255) as u8);
             }
         }
@@ -1111,7 +1132,10 @@ mod tests {
     #[ignore = "GPU integration"]
     fn inner_split_matches_process() {
         let gpu = GpuDevice::new().unwrap();
-        let config = GpuFrontendConfig { max_features: 40, ..Default::default() };
+        let config = GpuFrontendConfig {
+            max_features: 40,
+            ..Default::default()
+        };
         let mut a = GpuFrontend::new(&gpu, config.clone(), 160, 120);
         let mut b = GpuFrontend::new(&gpu, config, 160, 120);
         for i in 0..6usize {
@@ -1121,7 +1145,11 @@ mod tests {
             assert!(b.is_pending());
             b.collect(&gpu);
             assert!(!b.is_pending());
-            assert_eq!(snapshot(&a), snapshot(&b), "frame {i}: split differs from process");
+            assert_eq!(
+                snapshot(&a),
+                snapshot(&b),
+                "frame {i}: split differs from process"
+            );
         }
         println!("GPU_TEST_OK");
     }
@@ -1130,7 +1158,10 @@ mod tests {
     #[ignore = "GPU integration"]
     fn inner_track_meta_aligned() {
         let gpu = GpuDevice::new().unwrap();
-        let config = GpuFrontendConfig { max_features: 40, ..Default::default() };
+        let config = GpuFrontendConfig {
+            max_features: 40,
+            ..Default::default()
+        };
         let mut fe = GpuFrontend::new(&gpu, config, 160, 120);
         for i in 0..5usize {
             fe.process(&gpu, &textured_scene(i * 2, i));
@@ -1143,7 +1174,10 @@ mod tests {
         // Tracks surviving 5 frames have aged.
         assert!(fe.track_meta().iter().any(|m| m.age > 1), "no track aged");
         // New GPU-detected features get an RI-LBP descriptor on the CPU.
-        assert!(fe.features().iter().any(|f| f.descriptor != 0), "no descriptors computed");
+        assert!(
+            fe.features().iter().any(|f| f.descriptor != 0),
+            "no descriptors computed"
+        );
         println!("GPU_TEST_OK");
     }
 
@@ -1151,7 +1185,10 @@ mod tests {
     #[ignore = "GPU integration"]
     fn inner_drop_tracks_in_flight() {
         let gpu = GpuDevice::new().unwrap();
-        let config = GpuFrontendConfig { max_features: 40, ..Default::default() };
+        let config = GpuFrontendConfig {
+            max_features: 40,
+            ..Default::default()
+        };
         let mut fe = GpuFrontend::new(&gpu, config, 160, 120);
         fe.process(&gpu, &textured_scene(0, 0));
         let ids: Vec<u64> = fe.features().iter().take(3).map(|f| f.id).collect();
@@ -1160,8 +1197,10 @@ mod tests {
         fe.submit(&gpu, &textured_scene(2, 1));
         assert_eq!(fe.drop_tracks(&ids), 3);
         let (features, _) = fe.collect(&gpu);
-        assert!(features.iter().all(|f| !ids.contains(&f.id)),
-            "dropped IDs came back from the in-flight frame");
+        assert!(
+            features.iter().all(|f| !ids.contains(&f.id)),
+            "dropped IDs came back from the in-flight frame"
+        );
         assert_eq!(fe.features().len(), fe.track_meta().len());
         println!("GPU_TEST_OK");
     }
@@ -1207,11 +1246,17 @@ mod tests {
             let (_, stats) = fe.process(&gpu, &img);
             match policy {
                 LbpPolicy::SoftPenalty => {
-                    assert!(stats.tracked > 0, "soft policy must not reject on LBP alone");
+                    assert!(
+                        stats.tracked > 0,
+                        "soft policy must not reject on LBP alone"
+                    );
                     assert!(fe.track_meta().iter().any(|m| m.lbp_distance > 0));
                 }
                 LbpPolicy::HardReject => {
-                    assert_eq!(stats.tracked, 0, "hard policy should reject mismatched descriptors");
+                    assert_eq!(
+                        stats.tracked, 0,
+                        "hard policy should reject mismatched descriptors"
+                    );
                     assert!(stats.rejected > 0);
                 }
             }

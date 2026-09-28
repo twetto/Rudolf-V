@@ -44,14 +44,14 @@ use rudolf_v::klt::TrackStatus;
 // Pipeline parameters
 // ---------------------------------------------------------------------------
 
-const FAST_THRESHOLD: u8    = 20;
-const FAST_ARC:       usize = 9;
-const NMS_CELL:       usize = 16;
-const PYR_LEVELS:     usize = 3;
-const PYR_SIGMA:      f64   = 1.0;
-const KLT_WIN:        usize = 7;
-const KLT_MAX_ITER:   usize = 30;
-const KLT_EPSILON:    f32   = 0.01;
+const FAST_THRESHOLD: u8 = 20;
+const FAST_ARC: usize = 9;
+const NMS_CELL: usize = 16;
+const PYR_LEVELS: usize = 3;
+const PYR_SIGMA: f64 = 1.0;
+const KLT_WIN: usize = 7;
+const KLT_MAX_ITER: usize = 30;
+const KLT_EPSILON: f32 = 0.01;
 
 /// Redetect features every this many frames in synthetic mode.
 const REDETECT_INTERVAL: usize = 30;
@@ -70,8 +70,16 @@ fn main() {
     eprintln!("[frontend] {}", gpu.adapter_info);
 
     let pyr_pipeline = GpuPyramidPipeline::new(&gpu);
-    let mut gpu_fast = GpuFastDetector::new(&gpu, FAST_THRESHOLD, FAST_ARC, 240, 180, NMS_CELL, NmsStrategy::Cpu);
-    let mut gpu_klt  = GpuKltTracker::new(&gpu, KLT_WIN, KLT_MAX_ITER, KLT_EPSILON, PYR_LEVELS, 512);
+    let mut gpu_fast = GpuFastDetector::new(
+        &gpu,
+        FAST_THRESHOLD,
+        FAST_ARC,
+        240,
+        180,
+        NMS_CELL,
+        NmsStrategy::Cpu,
+    );
+    let mut gpu_klt = GpuKltTracker::new(&gpu, KLT_WIN, KLT_MAX_ITER, KLT_EPSILON, PYR_LEVELS, 512);
 
     match args.len() {
         // ---- Synthetic animated mode ----
@@ -80,7 +88,11 @@ fn main() {
         // ---- Single image: zero-motion sanity check ----
         2 => {
             let img = load_image(&args[1]);
-            eprintln!("[frontend] zero-motion mode: {}×{}", img.width(), img.height());
+            eprintln!(
+                "[frontend] zero-motion mode: {}×{}",
+                img.width(),
+                img.height()
+            );
             run_static(&gpu, &pyr_pipeline, &mut gpu_fast, &mut gpu_klt, &img, &img);
         }
 
@@ -88,10 +100,24 @@ fn main() {
         _ => {
             let img1 = load_image(&args[1]);
             let img2 = load_image(&args[2]);
-            assert_eq!((img1.width(), img1.height()), (img2.width(), img2.height()),
-                "images must be the same size");
-            eprintln!("[frontend] two-frame mode: {}×{}", img1.width(), img1.height());
-            run_static(&gpu, &pyr_pipeline, &mut gpu_fast, &mut gpu_klt, &img1, &img2);
+            assert_eq!(
+                (img1.width(), img1.height()),
+                (img2.width(), img2.height()),
+                "images must be the same size"
+            );
+            eprintln!(
+                "[frontend] two-frame mode: {}×{}",
+                img1.width(),
+                img1.height()
+            );
+            run_static(
+                &gpu,
+                &pyr_pipeline,
+                &mut gpu_fast,
+                &mut gpu_klt,
+                &img1,
+                &img2,
+            );
         }
     }
 }
@@ -101,10 +127,10 @@ fn main() {
 // ---------------------------------------------------------------------------
 
 fn run_synthetic(
-    gpu:          &GpuDevice,
+    gpu: &GpuDevice,
     pyr_pipeline: &GpuPyramidPipeline,
-    gpu_fast:     &mut GpuFastDetector,
-    gpu_klt:      &mut GpuKltTracker,
+    gpu_fast: &mut GpuFastDetector,
+    gpu_klt: &mut GpuKltTracker,
 ) {
     let w = 240usize;
     let h = 180usize;
@@ -112,9 +138,14 @@ fn run_synthetic(
     let (win_w, win_h) = (w * SCALE * 2 + 4, h * SCALE + 40);
     let mut window = Window::new(
         "Rudolf-V GPU frontend — synthetic (Esc to quit)",
-        win_w, win_h,
-        WindowOptions { resize: false, ..Default::default() },
-    ).expect("window creation failed");
+        win_w,
+        win_h,
+        WindowOptions {
+            resize: false,
+            ..Default::default()
+        },
+    )
+    .expect("window creation failed");
     window.limit_update_rate(Some(Duration::from_millis(33)));
 
     let mut fb = vec![0u32; win_w * win_h];
@@ -136,12 +167,12 @@ fn run_synthetic(
         let t_frame = Instant::now();
 
         // Generate current and next frames.
-        let frame_t   = make_scene(w, h, shift_x,        shift_y);
-        let frame_t1  = make_scene(w, h, shift_x + vx,   shift_y + vy);
+        let frame_t = make_scene(w, h, shift_x, shift_y);
+        let frame_t1 = make_scene(w, h, shift_x + vx, shift_y + vy);
 
         // --- GPU pyramids ---
         let t0 = Instant::now();
-        let pyr_t  = pyr_pipeline.build(gpu, &frame_t,  PYR_LEVELS, PYR_SIGMA as f32);
+        let pyr_t = pyr_pipeline.build(gpu, &frame_t, PYR_LEVELS, PYR_SIGMA as f32);
         let pyr_t1 = pyr_pipeline.build(gpu, &frame_t1, PYR_LEVELS, PYR_SIGMA as f32);
         let pyr_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -152,7 +183,10 @@ fn run_synthetic(
             let t0 = Instant::now();
             features = gpu_fast.detect(gpu, &pyr_t.levels[0], 0);
             detect_ms = t0.elapsed().as_secs_f64() * 1000.0;
-            eprintln!("[frontend] frame {frame_idx}: redetected {} corners", features.len());
+            eprintln!(
+                "[frontend] frame {frame_idx}: redetected {} corners",
+                features.len()
+            );
         } else {
             detect_ms = 0.0;
         }
@@ -166,20 +200,24 @@ fn run_synthetic(
         };
         let klt_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-        let n_tracked = tracked.iter().filter(|r| r.status == TrackStatus::Tracked).count();
+        let n_tracked = tracked
+            .iter()
+            .filter(|r| r.status == TrackStatus::Tracked)
+            .count();
 
         // --- Render ---
-        render_panels(&mut fb, win_w,
-            &frame_t, &frame_t1,
-            &features, &tracked,
-            frame_idx, pyr_ms, detect_ms, klt_ms, n_tracked);
+        render_panels(
+            &mut fb, win_w, &frame_t, &frame_t1, &features, &tracked, frame_idx, pyr_ms, detect_ms,
+            klt_ms, n_tracked,
+        );
 
         window.update_with_buffer(&fb, win_w, win_h).unwrap();
 
         // Advance state.
         // Update features to tracked positions for next frame.
         if !tracked.is_empty() {
-            features = tracked.into_iter()
+            features = tracked
+                .into_iter()
                 .filter(|r| r.status == TrackStatus::Tracked)
                 .map(|r| r.feature)
                 .collect();
@@ -190,9 +228,11 @@ fn run_synthetic(
         frame_idx += 1;
 
         let frame_ms = t_frame.elapsed().as_secs_f64() * 1000.0;
-        eprint!("\r[frontend] frame {frame_idx:4}  pyr={pyr_ms:.1}ms  \
+        eprint!(
+            "\r[frontend] frame {frame_idx:4}  pyr={pyr_ms:.1}ms  \
             detect={detect_ms:.1}ms  klt={klt_ms:.1}ms  total={frame_ms:.1}ms  \
-            tracked={n_tracked:3}    ");
+            tracked={n_tracked:3}    "
+        );
     }
     eprintln!();
 }
@@ -202,12 +242,12 @@ fn run_synthetic(
 // ---------------------------------------------------------------------------
 
 fn run_static(
-    gpu:          &GpuDevice,
+    gpu: &GpuDevice,
     pyr_pipeline: &GpuPyramidPipeline,
-    gpu_fast:     &mut GpuFastDetector,
-    gpu_klt:      &mut GpuKltTracker,
-    frame1:       &Image<u8>,
-    frame2:       &Image<u8>,
+    gpu_fast: &mut GpuFastDetector,
+    gpu_klt: &mut GpuKltTracker,
+    frame1: &Image<u8>,
+    frame2: &Image<u8>,
 ) {
     let w = frame1.width();
     let h = frame1.height();
@@ -228,13 +268,29 @@ fn run_static(
     let tracked = gpu_klt.track(gpu, &pyr1, &pyr2, &features);
     let klt_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-    let n_tracked = tracked.iter().filter(|r| r.status == TrackStatus::Tracked).count();
-    let n_lost    = tracked.iter().filter(|r| r.status == TrackStatus::Lost).count();
-    let n_oob     = tracked.iter().filter(|r| r.status == TrackStatus::OutOfBounds).count();
+    let n_tracked = tracked
+        .iter()
+        .filter(|r| r.status == TrackStatus::Tracked)
+        .count();
+    let n_lost = tracked
+        .iter()
+        .filter(|r| r.status == TrackStatus::Lost)
+        .count();
+    let n_oob = tracked
+        .iter()
+        .filter(|r| r.status == TrackStatus::OutOfBounds)
+        .count();
 
     eprintln!("[frontend] pyr={pyr_ms:.1}ms  detect={detect_ms:.1}ms  klt={klt_ms:.1}ms");
-    eprintln!("[frontend] {}/{} tracked  {}/{} lost  {}/{} out-of-bounds",
-        n_tracked, features.len(), n_lost, features.len(), n_oob, features.len());
+    eprintln!(
+        "[frontend] {}/{} tracked  {}/{} lost  {}/{} out-of-bounds",
+        n_tracked,
+        features.len(),
+        n_lost,
+        features.len(),
+        n_oob,
+        features.len()
+    );
 
     // --- Display ---
     // For large images, cap the scale so the window fits on screen.
@@ -244,15 +300,21 @@ fn run_static(
     let mut fb = vec![0u32; win_w * win_h];
     let mut window = Window::new(
         "Rudolf-V GPU frontend (Esc to quit)",
-        win_w, win_h,
-        WindowOptions { resize: false, ..Default::default() },
-    ).expect("window failed");
+        win_w,
+        win_h,
+        WindowOptions {
+            resize: false,
+            ..Default::default()
+        },
+    )
+    .expect("window failed");
     window.limit_update_rate(Some(Duration::from_millis(16)));
 
     // Render once with scale as runtime parameter.
-    render_panels_scaled(&mut fb, win_w, scale,
-        frame1, frame2, &features, &tracked,
-        0, pyr_ms, detect_ms, klt_ms, n_tracked);
+    render_panels_scaled(
+        &mut fb, win_w, scale, frame1, frame2, &features, &tracked, 0, pyr_ms, detect_ms, klt_ms,
+        n_tracked,
+    );
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
         window.update_with_buffer(&fb, win_w, win_h).unwrap();
@@ -264,25 +326,37 @@ fn run_static(
 // ---------------------------------------------------------------------------
 
 fn render_panels(
-    fb: &mut Vec<u32>, win_w: usize,
-    frame1: &Image<u8>, frame2: &Image<u8>,
+    fb: &mut Vec<u32>,
+    win_w: usize,
+    frame1: &Image<u8>,
+    frame2: &Image<u8>,
     features: &[Feature],
     tracked: &[rudolf_v::klt::TrackedFeature],
     frame_idx: usize,
-    pyr_ms: f64, detect_ms: f64, klt_ms: f64, n_tracked: usize,
+    pyr_ms: f64,
+    detect_ms: f64,
+    klt_ms: f64,
+    n_tracked: usize,
 ) {
-    render_panels_scaled(fb, win_w, SCALE,
-        frame1, frame2, features, tracked,
-        frame_idx, pyr_ms, detect_ms, klt_ms, n_tracked);
+    render_panels_scaled(
+        fb, win_w, SCALE, frame1, frame2, features, tracked, frame_idx, pyr_ms, detect_ms, klt_ms,
+        n_tracked,
+    );
 }
 
 fn render_panels_scaled(
-    fb: &mut Vec<u32>, win_w: usize, scale: usize,
-    frame1: &Image<u8>, frame2: &Image<u8>,
+    fb: &mut Vec<u32>,
+    win_w: usize,
+    scale: usize,
+    frame1: &Image<u8>,
+    frame2: &Image<u8>,
     features: &[Feature],
     tracked: &[rudolf_v::klt::TrackedFeature],
     _frame_idx: usize,
-    _pyr_ms: f64, _detect_ms: f64, _klt_ms: f64, _n_tracked: usize,
+    _pyr_ms: f64,
+    _detect_ms: f64,
+    _klt_ms: f64,
+    _n_tracked: usize,
 ) {
     let w = frame1.width();
     let h = frame1.height();
@@ -334,8 +408,12 @@ fn render_panels_scaled(
 
         match result.status {
             TrackStatus::Tracked => {
-                let x1 = x_off + (result.feature.x as usize).min(w.saturating_sub(1)) * scale + scale / 2;
-                let y1 = top_pad + (result.feature.y as usize).min(h.saturating_sub(1)) * scale + scale / 2;
+                let x1 = x_off
+                    + (result.feature.x as usize).min(w.saturating_sub(1)) * scale
+                    + scale / 2;
+                let y1 = top_pad
+                    + (result.feature.y as usize).min(h.saturating_sub(1)) * scale
+                    + scale / 2;
                 draw_line(fb, win_w, x0, y0, x1, y1, 0xFF44FF88);
                 draw_circle(fb, win_w, x1, y1, scale.max(2), 0xFF44FF88);
             }
@@ -347,7 +425,10 @@ fn render_panels_scaled(
     }
 
     // Status bar at bottom.
-    let n_tracked = tracked.iter().filter(|r| r.status == TrackStatus::Tracked).count();
+    let n_tracked = tracked
+        .iter()
+        .filter(|r| r.status == TrackStatus::Tracked)
+        .count();
     let _ = (sw, sh, n_tracked); // suppress unused warnings in non-print path
 }
 
@@ -374,8 +455,14 @@ fn draw_circle(fb: &mut Vec<u32>, w: usize, cx: usize, cy: usize, r: usize, colo
     let mut d = 1 - r;
     while x <= y {
         for &(ox, oy) in &[
-            ( x,  y), (-x,  y), ( x, -y), (-x, -y),
-            ( y,  x), (-y,  x), ( y, -x), (-y, -x),
+            (x, y),
+            (-x, y),
+            (x, -y),
+            (-x, -y),
+            (y, x),
+            (-y, x),
+            (y, -x),
+            (-y, -x),
         ] {
             let px = cx as isize + ox;
             let py = cy as isize + oy;
@@ -384,7 +471,12 @@ fn draw_circle(fb: &mut Vec<u32>, w: usize, cx: usize, cy: usize, r: usize, colo
             }
         }
         x += 1;
-        if d < 0 { d += 2 * x + 1; } else { y -= 1; d += 2 * (x - y) + 1; }
+        if d < 0 {
+            d += 2 * x + 1;
+        } else {
+            y -= 1;
+            d += 2 * (x - y) + 1;
+        }
     }
 }
 
@@ -398,11 +490,27 @@ fn draw_line(fb: &mut Vec<u32>, w: usize, x0: usize, y0: usize, x1: usize, y1: u
     let sy: isize = if y0 < y1 { 1 } else { -1 };
     let mut err = dx + dy;
     loop {
-        if x0 >= 0 && y0 >= 0 { set_pixel(fb, w, x0 as usize, y0 as usize, color); }
-        if x0 == x1 && y0 == y1 { break; }
+        if x0 >= 0 && y0 >= 0 {
+            set_pixel(fb, w, x0 as usize, y0 as usize, color);
+        }
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
         let e2 = 2 * err;
-        if e2 >= dy { if x0 == x1 { break; } err += dy; x0 += sx; }
-        if e2 <= dx { if y0 == y1 { break; } err += dx; y0 += sy; }
+        if e2 >= dy {
+            if x0 == x1 {
+                break;
+            }
+            err += dy;
+            x0 += sx;
+        }
+        if e2 <= dx {
+            if y0 == y1 {
+                break;
+            }
+            err += dx;
+            y0 += sy;
+        }
     }
 }
 
@@ -414,9 +522,15 @@ fn draw_cross(fb: &mut Vec<u32>, w: usize, cx: usize, cy: usize, r: usize, color
         let x = cx + d;
         let y = cy + d;
         let ax = cx - d;
-        if x >= 0 && cy >= 0 { set_pixel(fb, w, x as usize, cy as usize, color); }
-        if cx >= 0 && y >= 0 { set_pixel(fb, w, cx as usize, y as usize, color); }
-        if ax >= 0 && cy >= 0 { set_pixel(fb, w, ax as usize, cy as usize, color); }
+        if x >= 0 && cy >= 0 {
+            set_pixel(fb, w, x as usize, cy as usize, color);
+        }
+        if cx >= 0 && y >= 0 {
+            set_pixel(fb, w, cx as usize, y as usize, color);
+        }
+        if ax >= 0 && cy >= 0 {
+            set_pixel(fb, w, ax as usize, cy as usize, color);
+        }
     }
 }
 
@@ -431,15 +545,15 @@ fn make_scene(w: usize, h: usize, shift_x: f32, shift_y: f32) -> Image<u8> {
 
     // Rectangle definitions: (base_x, base_y, width, height, brightness)
     let rects: &[(isize, isize, usize, usize, u8)] = &[
-        (20,  15, 30, 25, 210),
-        (80,  10, 40, 20, 190),
+        (20, 15, 30, 25, 210),
+        (80, 10, 40, 20, 190),
         (150, 20, 25, 35, 220),
-        (18,  70, 20, 30, 200),
-        (70,  60, 35, 25, 185),
+        (18, 70, 20, 30, 200),
+        (70, 60, 35, 25, 185),
         (135, 65, 30, 30, 205),
-        (40,  120, 45, 20, 195),
+        (40, 120, 45, 20, 195),
         (120, 110, 30, 35, 215),
-        (180, 80,  25, 40, 200),
+        (180, 80, 25, 40, 200),
     ];
 
     for &(bx, by, rw, rh, brightness) in rects {

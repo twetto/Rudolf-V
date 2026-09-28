@@ -5,8 +5,8 @@
 // live in tests/ and can only access the crate's public API — a good check
 // that the public surface is usable.
 
-use rudolf_v::image::{Image, interpolate_bilinear};
 use rudolf_v::convert;
+use rudolf_v::image::{interpolate_bilinear, Image};
 
 // ===== Image construction & basic access =====
 
@@ -111,10 +111,10 @@ fn sub_image_with_stride() {
     // 12 13 14 15 [pad pad pad pad]
 
     let view = img.sub_image(1, 1, 2, 2);
-    assert_eq!(view.get(0, 0), 5);   // img(1,1)
-    assert_eq!(view.get(1, 0), 6);   // img(2,1)
-    assert_eq!(view.get(0, 1), 9);   // img(1,2)
-    assert_eq!(view.get(1, 1), 10);  // img(2,2)
+    assert_eq!(view.get(0, 0), 5); // img(1,1)
+    assert_eq!(view.get(1, 0), 6); // img(2,1)
+    assert_eq!(view.get(0, 1), 9); // img(1,2)
+    assert_eq!(view.get(1, 1), 10); // img(2,2)
 }
 
 #[test]
@@ -167,11 +167,7 @@ fn normalized_roundtrip_preserves_extremes() {
     let f = convert::u8_to_f32_normalized(&img);
     let back = convert::f32_normalized_to_u8(&f);
     for i in 0..6 {
-        assert_eq!(
-            back.get(i, 0),
-            data[i],
-            "roundtrip mismatch at pixel {i}"
-        );
+        assert_eq!(back.get(i, 0), data[i], "roundtrip mismatch at pixel {i}");
     }
 }
 

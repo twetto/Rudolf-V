@@ -9,7 +9,7 @@
 // The EuRoC benchmark loads the first 50 frames and runs the full
 // frontend pipeline with the euroc_live configuration.
 
-use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
 use rudolf_v::camera::CameraIntrinsics;
 use rudolf_v::essential::{self, Correspondence, RansacConfig};
@@ -86,9 +86,7 @@ fn bench_fast(c: &mut Criterion) {
     let det = FastDetector::new(20, 9);
 
     let mut group = c.benchmark_group("fast");
-    group.bench_function("detect_752x480", |b| {
-        b.iter(|| det.detect(&img))
-    });
+    group.bench_function("detect_752x480", |b| b.iter(|| det.detect(&img)));
     group.finish();
 }
 
@@ -103,7 +101,11 @@ fn bench_klt(c: &mut Criterion) {
     let det = FastDetector::new(20, 9);
     let features = det.detect(&img1);
     let nms = OccupancyNms::new(128);
-    let features: Vec<_> = nms.suppress(&features, 752, 480).into_iter().take(40).collect();
+    let features: Vec<_> = nms
+        .suppress(&features, 752, 480)
+        .into_iter()
+        .take(40)
+        .collect();
 
     let mut group = c.benchmark_group("klt");
     group.bench_function(
@@ -186,8 +188,8 @@ fn bench_frontend_synthetic(c: &mut Criterion) {
 // ============================================================
 
 fn load_grayscale(path: &Path) -> Image<u8> {
-    let img = image::open(path)
-        .unwrap_or_else(|e| panic!("Failed to load {}: {}", path.display(), e));
+    let img =
+        image::open(path).unwrap_or_else(|e| panic!("Failed to load {}: {}", path.display(), e));
     let gray = img.to_luma8();
     let (w, h) = gray.dimensions();
     Image::from_vec(w as usize, h as usize, gray.into_raw())
@@ -238,7 +240,10 @@ fn bench_euroc(c: &mut Criterion) {
         .map(|i| load_grayscale(&data_dir.join(&image_files[i])))
         .collect();
     let (img_w, img_h) = (frames[0].width(), frames[0].height());
-    eprintln!("EuRoC benchmark ready: {}x{}, {} frames", img_w, img_h, num_frames);
+    eprintln!(
+        "EuRoC benchmark ready: {}x{}, {} frames",
+        img_w, img_h, num_frames
+    );
 
     // Load camera intrinsics if available.
     let sensor_yaml = cam0_dir.join("sensor.yaml");
@@ -264,17 +269,14 @@ fn bench_euroc(c: &mut Criterion) {
     let mut group = c.benchmark_group("euroc");
     group.sample_size(10); // Fewer samples since each iteration processes 50 frames.
 
-    group.bench_function(
-        format!("pipeline_{}frames", num_frames),
-        |b| {
-            b.iter(|| {
-                let mut frontend = Frontend::new(config.clone(), img_w, img_h);
-                for frame in &frames {
-                    frontend.process(frame);
-                }
-            })
-        },
-    );
+    group.bench_function(format!("pipeline_{}frames", num_frames), |b| {
+        b.iter(|| {
+            let mut frontend = Frontend::new(config.clone(), img_w, img_h);
+            for frame in &frames {
+                frontend.process(frame);
+            }
+        })
+    });
 
     // Per-stage on a real EuRoC frame.
     let frame0 = &frames[0];

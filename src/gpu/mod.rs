@@ -1,6 +1,6 @@
 pub mod device;
-pub mod image;
-pub mod pyramid;
 pub mod fast;
-pub mod klt;
 pub mod frontend;
+pub mod image;
+pub mod klt;
+pub mod pyramid;

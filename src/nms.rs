@@ -140,10 +140,10 @@ mod tests {
         let nms = OccupancyNms::new(32);
         // Four features, each in a different cell.
         let features = vec![
-            make_feature(10.0, 10.0, 50.0),   // cell (0, 0)
-            make_feature(40.0, 10.0, 50.0),   // cell (1, 0)
-            make_feature(10.0, 40.0, 50.0),   // cell (0, 1)
-            make_feature(40.0, 40.0, 50.0),   // cell (1, 1)
+            make_feature(10.0, 10.0, 50.0), // cell (0, 0)
+            make_feature(40.0, 10.0, 50.0), // cell (1, 0)
+            make_feature(10.0, 40.0, 50.0), // cell (0, 1)
+            make_feature(40.0, 40.0, 50.0), // cell (1, 1)
         ];
         let result = nms.suppress(&features, 640, 480);
         assert_eq!(result.len(), 4);

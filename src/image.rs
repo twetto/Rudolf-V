@@ -220,13 +220,11 @@ impl<T: Pixel> Image<T> {
     ///
     /// # Panics
     /// Panics if `data.len() != height * stride` or `stride < width`.
-    pub fn from_vec_with_stride(
-        width: usize,
-        height: usize,
-        stride: usize,
-        data: Vec<T>,
-    ) -> Self {
-        assert!(stride >= width, "stride ({stride}) must be >= width ({width})");
+    pub fn from_vec_with_stride(width: usize, height: usize, stride: usize, data: Vec<T>) -> Self {
+        assert!(
+            stride >= width,
+            "stride ({stride}) must be >= width ({width})"
+        );
         assert_eq!(
             data.len(),
             height * stride,
@@ -281,8 +279,12 @@ impl<T: Pixel> Image<T> {
     /// sampler handles addressing — no per-pixel bounds check.
     #[inline(always)]
     pub unsafe fn get_unchecked(&self, x: usize, y: usize) -> T {
-        debug_assert!(x < self.width && y < self.height,
-            "get_unchecked({x},{y}) out of bounds for {}x{}", self.width, self.height);
+        debug_assert!(
+            x < self.width && y < self.height,
+            "get_unchecked({x},{y}) out of bounds for {}x{}",
+            self.width,
+            self.height
+        );
         *self.data.get_unchecked(y * self.stride + x)
     }
 
@@ -311,8 +313,11 @@ impl<T: Pixel> Image<T> {
     /// — what the texture sampler does internally.
     #[inline(always)]
     pub unsafe fn row_ptr(&self, y: usize) -> *const T {
-        debug_assert!(y < self.height,
-            "row_ptr({y}) out of bounds for height {}", self.height);
+        debug_assert!(
+            y < self.height,
+            "row_ptr({y}) out of bounds for height {}",
+            self.height
+        );
         self.data.as_ptr().add(y * self.stride)
     }
 
@@ -345,7 +350,11 @@ impl<T: Pixel> Image<T> {
     /// could leave the reference dangling (like a C++ iterator invalidation).
     #[inline]
     pub fn row(&self, y: usize) -> &[T] {
-        assert!(y < self.height, "row {y} out of bounds (height {})", self.height);
+        assert!(
+            y < self.height,
+            "row {y} out of bounds (height {})",
+            self.height
+        );
         let start = y * self.stride;
         // Only the valid pixel portion, not the stride padding.
         &self.data[start..start + self.width]
@@ -354,7 +363,11 @@ impl<T: Pixel> Image<T> {
     /// Mutable borrow of a single row.
     #[inline]
     pub fn row_mut(&mut self, y: usize) -> &mut [T] {
-        assert!(y < self.height, "row {y} out of bounds (height {})", self.height);
+        assert!(
+            y < self.height,
+            "row {y} out of bounds (height {})",
+            self.height
+        );
         let start = y * self.stride;
         &mut self.data[start..start + self.width]
     }
@@ -412,9 +425,8 @@ impl<T: Pixel> Image<T> {
     /// (the type is monomorphized at compile time).
     pub fn pixels(&self) -> impl Iterator<Item = (usize, usize, T)> + '_ {
         // We iterate row by row, skipping stride padding.
-        (0..self.height).flat_map(move |y| {
-            (0..self.width).map(move |x| (x, y, self.data[y * self.stride + x]))
-        })
+        (0..self.height)
+            .flat_map(move |y| (0..self.width).map(move |x| (x, y, self.data[y * self.stride + x])))
     }
 
     /// Access the underlying data as a flat slice.
@@ -567,9 +579,8 @@ impl<'a, T: Pixel> ImageView<'a, T> {
     /// Iterate over all pixels in the view as `(x, y, value)`.
     pub fn pixels(&self) -> impl Iterator<Item = (usize, usize, T)> + '_ {
         (0..self.height).flat_map(move |y| {
-            (0..self.width).map(move |x| {
-                (x, y, self.data[y * self.parent_stride + self.x_offset + x])
-            })
+            (0..self.width)
+                .map(move |x| (x, y, self.data[y * self.parent_stride + self.x_offset + x]))
         })
     }
 
@@ -644,7 +655,10 @@ impl<'a, T: Pixel> std::ops::Index<(usize, usize)> for ImageView<'a, T> {
 /// # Panics
 /// Panics if the image is empty (width or height is 0).
 pub fn interpolate_bilinear(img: &Image<f32>, x: f32, y: f32) -> f32 {
-    assert!(img.width() > 0 && img.height() > 0, "cannot interpolate on an empty image");
+    assert!(
+        img.width() > 0 && img.height() > 0,
+        "cannot interpolate on an empty image"
+    );
 
     // Clamp to valid coordinate range.
     let max_x = (img.width() - 1) as f32;
@@ -702,10 +716,7 @@ pub unsafe fn interpolate_bilinear_unchecked(img: &Image<f32>, x: f32, y: f32) -
     let p01 = img.get_unchecked(x0, y1);
     let p11 = img.get_unchecked(x1, y1);
 
-    (1.0 - fx) * (1.0 - fy) * p00
-        + fx * (1.0 - fy) * p10
-        + (1.0 - fx) * fy * p01
-        + fx * fy * p11
+    (1.0 - fx) * (1.0 - fy) * p00 + fx * (1.0 - fy) * p10 + (1.0 - fx) * fy * p01 + fx * fy * p11
 }
 
 #[cfg(test)]
@@ -778,9 +789,9 @@ mod tests {
         let view = img.sub_image(1, 1, 2, 2);
         assert_eq!(view.width(), 2);
         assert_eq!(view.height(), 2);
-        assert_eq!(view.get(0, 0), 5);  // img(1,1)
-        assert_eq!(view.get(1, 0), 6);  // img(2,1)
-        assert_eq!(view.get(0, 1), 9);  // img(1,2)
+        assert_eq!(view.get(0, 0), 5); // img(1,1)
+        assert_eq!(view.get(1, 0), 6); // img(2,1)
+        assert_eq!(view.get(0, 1), 9); // img(1,2)
         assert_eq!(view.get(1, 1), 10); // img(2,2)
     }
 

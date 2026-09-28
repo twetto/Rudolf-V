@@ -88,12 +88,8 @@ fn corners_near_rectangle_edges() {
 
     let tolerance = 5.0;
     for f in &features {
-        let dx_to_edge = (f.x - rx as f32)
-            .abs()
-            .min((f.x - (rx + rw) as f32).abs());
-        let dy_to_edge = (f.y - ry as f32)
-            .abs()
-            .min((f.y - (ry + rh) as f32).abs());
+        let dx_to_edge = (f.x - rx as f32).abs().min((f.x - (rx + rw) as f32).abs());
+        let dy_to_edge = (f.y - ry as f32).abs().min((f.y - (ry + rh) as f32).abs());
         let near_edge = dx_to_edge <= tolerance || dy_to_edge <= tolerance;
         assert!(
             near_edge,

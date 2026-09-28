@@ -39,8 +39,8 @@ const TRAIL_LENGTH: usize = 20;
 
 struct Track {
     positions: Vec<(f32, f32)>,
-    color:     u32,
-    age:       usize,
+    color: u32,
+    age: usize,
 }
 
 fn main() {
@@ -51,7 +51,10 @@ fn main() {
     }
 
     let dataset_path = PathBuf::from(&args[1]);
-    let max_frames: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
+    let max_frames: usize = args
+        .get(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(usize::MAX);
 
     let cam0_dir = dataset_path.join("mav0").join("cam0");
     let data_dir = cam0_dir.join("data");
@@ -69,7 +72,11 @@ fn main() {
         list_png_files(&data_dir)
     };
     let num_frames = image_files.len().min(max_frames);
-    println!("Dataset: {} ({} frames)", dataset_path.display(), num_frames);
+    println!(
+        "Dataset: {} ({} frames)",
+        dataset_path.display(),
+        num_frames
+    );
 
     let first = load_grayscale(&data_dir.join(&image_files[0]));
     let (img_w, img_h) = (first.width(), first.height());
@@ -87,16 +94,27 @@ fn main() {
 
     let mut window = Window::new(
         "Rudolf-V GPU — EuRoC Live",
-        win_w, win_h,
-        WindowOptions { resize: false, ..Default::default() },
-    ).expect("failed to create window");
+        win_w,
+        win_h,
+        WindowOptions {
+            resize: false,
+            ..Default::default()
+        },
+    )
+    .expect("failed to create window");
     window.set_target_fps(60);
 
     let sensor_yaml = cam0_dir.join("sensor.yaml");
     let camera = match CameraIntrinsics::from_euroc_yaml(&sensor_yaml) {
         Ok(cam) => {
-            println!("Camera: fx={:.1} fy={:.1} cx={:.1} cy={:.1}, {} distortion coeffs",
-                cam.fx, cam.fy, cam.cx, cam.cy, cam.distortion.len());
+            println!(
+                "Camera: fx={:.1} fy={:.1} cx={:.1} cy={:.1}, {} distortion coeffs",
+                cam.fx,
+                cam.fy,
+                cam.cx,
+                cam.cy,
+                cam.distortion.len()
+            );
             Some(cam)
         }
         Err(e) => {
@@ -110,18 +128,18 @@ fn main() {
         //cell_size:       128,
         //max_features:    2000,
         //cell_size:       16,
-        max_features:    100,
-        cell_size:       96,
-        pyramid_levels:  4,
-        klt_window:      11,
-        klt_max_iter:    30,
-        klt_epsilon:     0.01,
-        histeq:          HistEqMethod::Global,
+        max_features: 100,
+        cell_size: 96,
+        pyramid_levels: 4,
+        klt_window: 11,
+        klt_max_iter: 30,
+        klt_epsilon: 0.01,
+        histeq: HistEqMethod::Global,
         camera,
         ransac: RansacConfig {
-            threshold:      1e-5,
+            threshold: 1e-5,
             max_iterations: 200,
-            confidence:     0.99,
+            confidence: 0.99,
         },
         ..Default::default()
     };
@@ -131,14 +149,16 @@ fn main() {
     let mut tracks: HashMap<u64, Track> = HashMap::new();
     let mut prev_positions: HashMap<u64, (f32, f32)> = HashMap::new();
 
-    let mut frame_idx    = 0usize;
-    let mut paused       = false;
-    let mut show_trails  = true;
-    let mut show_flow    = true;
+    let mut frame_idx = 0usize;
+    let mut paused = false;
+    let mut show_trails = true;
+    let mut show_flow = true;
     let mut frame_delay_ms: u64 = 30;
     let mut last_frame_time = Instant::now();
 
-    println!("\nControls: Space=pause  S=step  Q/Esc=quit  +/-=speed  T=trails  F=flow  H=histeq\n");
+    println!(
+        "\nControls: Space=pause  S=step  Q/Esc=quit  +/-=speed  T=trails  F=flow  H=histeq\n"
+    );
 
     while window.is_open() && !window.is_key_down(Key::Escape) && !window.is_key_down(Key::Q) {
         if window.is_key_pressed(Key::Space, minifb::KeyRepeat::No) {
@@ -157,13 +177,16 @@ fn main() {
         }
         if window.is_key_pressed(Key::H, minifb::KeyRepeat::No) {
             let next = match frontend.histeq() {
-                HistEqMethod::None   => HistEqMethod::Global,
-                HistEqMethod::Global => HistEqMethod::Clahe { tile_size: 32, clip_limit: 2.0 },
+                HistEqMethod::None => HistEqMethod::Global,
+                HistEqMethod::Global => HistEqMethod::Clahe {
+                    tile_size: 32,
+                    clip_limit: 2.0,
+                },
                 HistEqMethod::Clahe { .. } => HistEqMethod::None,
             };
             frontend.set_histeq(next);
             let label = match next {
-                HistEqMethod::None   => "off",
+                HistEqMethod::None => "off",
                 HistEqMethod::Global => "global",
                 HistEqMethod::Clahe { .. } => "CLAHE",
             };
@@ -203,8 +226,8 @@ fn main() {
             for f in &features {
                 let track = tracks.entry(f.id).or_insert_with(|| Track {
                     positions: Vec::with_capacity(TRAIL_LENGTH),
-                    color:     id_to_color(f.id),
-                    age:       0,
+                    color: id_to_color(f.id),
+                    age: 0,
                 });
                 track.age = 0;
                 track.positions.push((f.x, f.y));
@@ -221,10 +244,16 @@ fn main() {
                         let color = fade_color(track.color, alpha * 0.7);
                         let (x0, y0) = track.positions[i - 1];
                         let (x1, y1) = track.positions[i];
-                        draw_line(&mut fb, win_w, win_h,
-                            (x0 * scale as f32) as i32, (y0 * scale as f32) as i32,
-                            (x1 * scale as f32) as i32, (y1 * scale as f32) as i32,
-                            color);
+                        draw_line(
+                            &mut fb,
+                            win_w,
+                            win_h,
+                            (x0 * scale as f32) as i32,
+                            (y0 * scale as f32) as i32,
+                            (x1 * scale as f32) as i32,
+                            (y1 * scale as f32) as i32,
+                            color,
+                        );
                     }
                 }
             }
@@ -235,10 +264,16 @@ fn main() {
                     if let Some(&(px, py)) = prev_positions.get(&f.id) {
                         let mag = ((f.x - px).powi(2) + (f.y - py).powi(2)).sqrt();
                         if mag > 0.5 {
-                            draw_arrow(&mut fb, win_w, win_h,
-                                (px * scale as f32) as i32, (py * scale as f32) as i32,
-                                (f.x * scale as f32) as i32, (f.y * scale as f32) as i32,
-                                0x00FF88);
+                            draw_arrow(
+                                &mut fb,
+                                win_w,
+                                win_h,
+                                (px * scale as f32) as i32,
+                                (py * scale as f32) as i32,
+                                (f.x * scale as f32) as i32,
+                                (f.y * scale as f32) as i32,
+                                0x00FF88,
+                            );
                         }
                     }
                 }
@@ -247,17 +282,29 @@ fn main() {
             // Draw feature dots.
             for f in &features {
                 let color = tracks.get(&f.id).map(|t| t.color).unwrap_or(0x00FF00);
-                draw_circle(&mut fb, win_w, win_h,
+                draw_circle(
+                    &mut fb,
+                    win_w,
+                    win_h,
                     (f.x * scale as f32) as i32,
                     (f.y * scale as f32) as i32,
-                    2 * scale as i32, color);
+                    2 * scale as i32,
+                    color,
+                );
             }
 
             // HUD bar.
             draw_rect(&mut fb, win_w, win_h, 0, 0, win_w, 14, 0x111111);
-            print!("\r{:5}: trk={:<3} lost={:<3} rej={:<3} new={:<3} tot={:<3} | {}  ",
-                frame_idx, stats.tracked, stats.lost, stats.rejected,
-                stats.new_detections, stats.total, stats.timing);
+            print!(
+                "\r{:5}: trk={:<3} lost={:<3} rej={:<3} new={:<3} tot={:<3} | {}  ",
+                frame_idx,
+                stats.tracked,
+                stats.lost,
+                stats.rejected,
+                stats.new_detections,
+                stats.total,
+                stats.timing
+            );
 
             prev_positions = curr_positions;
             frame_idx += 1;
@@ -281,7 +328,9 @@ fn parse_euroc_csv(csv_path: &Path) -> Vec<String> {
     for line in reader.lines() {
         let line = line.unwrap();
         let line = line.trim();
-        if line.starts_with('#') || line.is_empty() { continue; }
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
         if let Some((_ts, fname)) = line.split_once(',') {
             filenames.push(fname.trim().to_string());
         }
@@ -295,7 +344,11 @@ fn list_png_files(dir: &Path) -> Vec<String> {
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
-            if name.ends_with(".png") { Some(name) } else { None }
+            if name.ends_with(".png") {
+                Some(name)
+            } else {
+                None
+            }
         })
         .collect();
     files.sort();
@@ -303,8 +356,8 @@ fn list_png_files(dir: &Path) -> Vec<String> {
 }
 
 fn load_grayscale(path: &Path) -> Image<u8> {
-    let img = image::open(path)
-        .unwrap_or_else(|e| panic!("Failed to load {}: {e}", path.display()));
+    let img =
+        image::open(path).unwrap_or_else(|e| panic!("Failed to load {}: {e}", path.display()));
     let gray = img.to_luma8();
     let (w, h) = gray.dimensions();
     Image::from_vec(w as usize, h as usize, gray.into_raw())
@@ -353,10 +406,18 @@ fn draw_line(fb: &mut [u32], w: usize, h: usize, x0: i32, y0: i32, x1: i32, y1: 
         if x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h {
             fb[y as usize * w + x as usize] = color;
         }
-        if x == x1 && y == y1 { break; }
+        if x == x1 && y == y1 {
+            break;
+        }
         let e2 = 2 * err;
-        if e2 >= dy { err += dy; x += sx; }
-        if e2 <= dx { err += dx; y += sy; }
+        if e2 >= dy {
+            err += dy;
+            x += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y += sy;
+        }
     }
 }
 
@@ -364,7 +425,9 @@ fn draw_arrow(fb: &mut [u32], w: usize, h: usize, x0: i32, y0: i32, x1: i32, y1:
     draw_line(fb, w, h, x0, y0, x1, y1, color);
     let (dx, dy) = ((x1 - x0) as f32, (y1 - y0) as f32);
     let len = (dx * dx + dy * dy).sqrt();
-    if len < 2.0 { return; }
+    if len < 2.0 {
+        return;
+    }
     let (ux, uy) = (dx / len, dy / len);
     let head = 5.0f32.min(len * 0.4);
     let ax = x1 as f32 - head * (ux + 0.4 * uy);
@@ -375,7 +438,16 @@ fn draw_arrow(fb: &mut [u32], w: usize, h: usize, x0: i32, y0: i32, x1: i32, y1:
     draw_line(fb, w, h, x1, y1, bx as i32, by as i32, color);
 }
 
-fn draw_rect(fb: &mut [u32], w: usize, h: usize, rx: usize, ry: usize, rw: usize, rh: usize, color: u32) {
+fn draw_rect(
+    fb: &mut [u32],
+    w: usize,
+    h: usize,
+    rx: usize,
+    ry: usize,
+    rw: usize,
+    rh: usize,
+    color: u32,
+) {
     for y in ry..(ry + rh).min(h) {
         for x in rx..(rx + rw).min(w) {
             fb[y * w + x] = color;
@@ -391,8 +463,8 @@ fn id_to_color(id: u64) -> u32 {
 
 fn fade_color(color: u32, alpha: f32) -> u32 {
     let r = ((color >> 16) & 0xFF) as f32 * alpha;
-    let g = ((color >> 8)  & 0xFF) as f32 * alpha;
-    let b = ( color        & 0xFF) as f32 * alpha;
+    let g = ((color >> 8) & 0xFF) as f32 * alpha;
+    let b = (color & 0xFF) as f32 * alpha;
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
 
@@ -408,5 +480,9 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
         4 => (x, 0.0, c),
         _ => (c, 0.0, x),
     };
-    (((r + m) * 255.0) as u8, ((g + m) * 255.0) as u8, ((b + m) * 255.0) as u8)
+    (
+        ((r + m) * 255.0) as u8,
+        ((g + m) * 255.0) as u8,
+        ((b + m) * 255.0) as u8,
+    )
 }

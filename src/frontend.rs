@@ -1474,11 +1474,9 @@ mod tests {
 
         assert!(!persisted.is_empty(), "expected some persisted tracks");
         assert!(persisted.iter().all(|m| m.age >= 2));
-        assert!(
-            persisted
-                .iter()
-                .all(|m| m.klt_quality > 0.0 && m.klt_quality <= 1.0)
-        );
+        assert!(persisted
+            .iter()
+            .all(|m| m.klt_quality > 0.0 && m.klt_quality <= 1.0));
     }
 
     #[test]
@@ -1528,11 +1526,9 @@ mod tests {
             .collect();
 
         assert!(!persisted.is_empty(), "expected some persisted tracks");
-        assert!(
-            persisted
-                .iter()
-                .all(|m| m.klt_quality > 0.0 && m.klt_quality <= 1.0)
-        );
+        assert!(persisted
+            .iter()
+            .all(|m| m.klt_quality > 0.0 && m.klt_quality <= 1.0));
     }
 
     #[test]
@@ -1596,12 +1592,10 @@ mod tests {
         frontend.process(&img1);
         frontend.process(&img2);
 
-        assert!(
-            frontend
-                .track_meta()
-                .iter()
-                .all(|m| m.reservoir_score.is_finite())
-        );
+        assert!(frontend
+            .track_meta()
+            .iter()
+            .all(|m| m.reservoir_score.is_finite()));
     }
 
     #[test]
@@ -1853,12 +1847,10 @@ mod tests {
         assert_eq!(removed, 1);
         assert_eq!(frontend.features().len(), before - 1);
         assert_eq!(frontend.features().len(), frontend.track_meta().len());
-        assert!(
-            frontend
-                .features()
-                .iter()
-                .all(|feature| feature.id != drop_id)
-        );
+        assert!(frontend
+            .features()
+            .iter()
+            .all(|feature| feature.id != drop_id));
         assert!(frontend.track_meta().iter().all(|meta| meta.id != drop_id));
     }
 

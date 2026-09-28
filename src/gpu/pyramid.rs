@@ -79,7 +79,11 @@ impl GpuPyramidLevel {
     fn new(device: &wgpu::Device, width: u32, height: u32, label: &str) -> Self {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -87,14 +91,20 @@ impl GpuPyramidLevel {
             usage: wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::STORAGE_BINDING
                 | wgpu::TextureUsages::COPY_DST   // for level 0 CPU upload
-                | wgpu::TextureUsages::COPY_SRC,  // for test readback
+                | wgpu::TextureUsages::COPY_SRC, // for test readback
             view_formats: &[],
         });
         // Both views reference the full texture; the distinction is only in
         // how we bind them in the shader (read vs write).
         let read_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let write_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        GpuPyramidLevel { texture, read_view, write_view, width, height }
+        GpuPyramidLevel {
+            texture,
+            read_view,
+            write_view,
+            width,
+            height,
+        }
     }
 }
 
@@ -140,7 +150,10 @@ impl GpuPyramid {
 
         // R32Float: 4 bytes per pixel.
         let bytes_per_pixel: u32 = 4;
-        let aligned_bytes_per_row = align_to(lvl.width * bytes_per_pixel, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let aligned_bytes_per_row = align_to(
+            lvl.width * bytes_per_pixel,
+            wgpu::COPY_BYTES_PER_ROW_ALIGNMENT,
+        );
         let readback_size = (aligned_bytes_per_row * lvl.height) as u64;
 
         let readback_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -150,9 +163,11 @@ impl GpuPyramid {
             mapped_at_creation: false,
         });
 
-        let mut encoder = gpu.device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor { label: Some("GpuPyramid::readback") },
-        );
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("GpuPyramid::readback"),
+            });
         encoder.copy_texture_to_buffer(
             wgpu::ImageCopyTexture {
                 texture: &lvl.texture,
@@ -182,7 +197,8 @@ impl GpuPyramid {
             tx.send(r).expect("readback channel closed");
         });
         gpu.device.poll(wgpu::Maintain::Wait);
-        rx.recv().expect("readback callback never fired")
+        rx.recv()
+            .expect("readback callback never fired")
             .expect("readback map failed");
 
         let mapped = buf_slice.get_mapped_range();
@@ -198,10 +214,7 @@ impl GpuPyramid {
             // properly-aligned R32Float data; f32 and [u8; 4] have the same
             // size; and we're only reading (not mutating).
             let src_f32: &[f32] = unsafe {
-                std::slice::from_raw_parts(
-                    src_bytes.as_ptr() as *const f32,
-                    lvl.width as usize,
-                )
+                std::slice::from_raw_parts(src_bytes.as_ptr() as *const f32, lvl.width as usize)
             };
             out[dst_start..dst_start + lvl.width as usize].copy_from_slice(src_f32);
         }
@@ -227,10 +240,10 @@ impl GpuPyramid {
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct PyramidParams {
-    dst_width:  u32,
+    dst_width: u32,
     dst_height: u32,
-    half_size:  u32,
-    _pad:       u32,
+    half_size: u32,
+    _pad: u32,
     /// coeffs[i/4][i%4] = Gaussian kernel coefficient for index i.
     /// Maximum half_size = 15 (16 coefficients), covering σ ≈ 5.
     coeffs: [[f32; 4]; 4],
@@ -244,7 +257,10 @@ impl PyramidParams {
         let full_len = kernel.len();
         assert!(full_len % 2 == 1, "kernel must have odd length");
         let half_size = (full_len - 1) / 2;
-        assert!(half_size <= 15, "half_size > 15 — increase coeffs array size");
+        assert!(
+            half_size <= 15,
+            "half_size > 15 — increase coeffs array size"
+        );
 
         // Extract the right half (index half_size .. end), which gives
         // coefficients for offsets 0, 1, 2, ..., half_size.
@@ -302,60 +318,66 @@ impl GpuPyramidPipeline {
             .replace("{{WG_X}}", &gpu.workgroup_size.x.to_string())
             .replace("{{WG_Y}}", &gpu.workgroup_size.y.to_string());
 
-        let shader = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("pyramid.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(shader_src.into()),
-        });
+        let shader = gpu
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("pyramid.wgsl"),
+                source: wgpu::ShaderSource::Wgsl(shader_src.into()),
+            });
 
         // Bind group layout: mirrors the @group(0) bindings in pyramid.wgsl.
-        let bgl = gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("GpuPyramid BGL"),
-            entries: &[
-                // Binding 0 — input texture (read as texture_2d<f32>)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        multisampled: false,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+        let bgl = gpu
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("GpuPyramid BGL"),
+                entries: &[
+                    // Binding 0 — input texture (read as texture_2d<f32>)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                // Binding 1 — output texture (storage write)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::R32Float,
-                        view_dimension: wgpu::TextureViewDimension::D2,
+                    // Binding 1 — output texture (storage write)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: wgpu::TextureFormat::R32Float,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                // Binding 2 — kernel params uniform buffer
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    // Binding 2 — kernel params uniform buffer
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-            ],
-        });
+                ],
+            });
 
-        let pipeline_layout =
-            gpu.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        let pipeline_layout = gpu
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("GpuPyramid pipeline layout"),
                 bind_group_layouts: &[&bgl],
                 push_constant_ranges: &[],
             });
 
-        let pipeline =
-            gpu.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        let pipeline = gpu
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("blur_downsample"),
                 layout: Some(&pipeline_layout),
                 module: &shader,
@@ -368,52 +390,63 @@ impl GpuPyramidPipeline {
         let convert_src = include_str!("../shaders/pyramid_convert.wgsl")
             .replace("{{WG_X}}", &gpu.workgroup_size.x.to_string())
             .replace("{{WG_Y}}", &gpu.workgroup_size.y.to_string());
-        let convert_shader = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("pyramid_convert.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(convert_src.into()),
-        });
-        let convert_bgl = gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("GpuPyramid convert BGL"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        multisampled: false,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        sample_type: wgpu::TextureSampleType::Uint,
+        let convert_shader = gpu
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("pyramid_convert.wgsl"),
+                source: wgpu::ShaderSource::Wgsl(convert_src.into()),
+            });
+        let convert_bgl = gpu
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("GpuPyramid convert BGL"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Uint,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::R32Float,
-                        view_dimension: wgpu::TextureViewDimension::D2,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: wgpu::TextureFormat::R32Float,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-            ],
-        });
-        let convert_layout =
-            gpu.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                ],
+            });
+        let convert_layout = gpu
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("GpuPyramid convert layout"),
                 bind_group_layouts: &[&convert_bgl],
                 push_constant_ranges: &[],
             });
         let convert_pipeline =
-            gpu.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("convert_u8"),
-                layout: Some(&convert_layout),
-                module: &convert_shader,
-                entry_point: "convert_u8",
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                cache: None,
-            });
+            gpu.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("convert_u8"),
+                    layout: Some(&convert_layout),
+                    module: &convert_shader,
+                    entry_point: "convert_u8",
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                });
 
-        GpuPyramidPipeline { pipeline, bgl, convert_pipeline, convert_bgl }
+        GpuPyramidPipeline {
+            pipeline,
+            bgl,
+            convert_pipeline,
+            convert_bgl,
+        }
     }
 
     /// Allocate a pyramid for in-place rebuilding with [`record_rebuild`].
@@ -437,7 +470,11 @@ impl GpuPyramidPipeline {
         let (w0, h0) = (width as u32, height as u32);
         let raw = gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("pyramid raw u8"),
-            size: wgpu::Extent3d { width: w0, height: h0, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: w0,
+                height: h0,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -476,11 +513,13 @@ impl GpuPyramidPipeline {
         for lvl_idx in 1..num_levels {
             let (prev, curr) = (&levels[lvl_idx - 1], &levels[lvl_idx]);
             let params = PyramidParams::new(curr.width, curr.height, &kernel);
-            let params_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("PyramidParams"),
-                contents: bytemuck::bytes_of(&params),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
+            let params_buf = gpu
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("PyramidParams"),
+                    contents: bytemuck::bytes_of(&params),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
             level_bgs.push(gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("pyramid level bind group"),
                 layout: &self.bgl,
@@ -557,7 +596,11 @@ impl GpuPyramidPipeline {
                 bytes_per_row: Some(src.stride() as u32),
                 rows_per_image: Some(h),
             },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
         );
 
         {
@@ -606,7 +649,7 @@ impl GpuPyramidPipeline {
 
         // Hardcoded [1,4,6,4,1]/16, half_size=2, 25 textureLoads per pixel
         // Matches the CPU build_reuse path exactly (pyrdown_int uses this kernel).
-        let kernel = vec![1.0/16.0, 4.0/16.0, 6.0/16.0, 4.0/16.0, 1.0/16.0];
+        let kernel = vec![1.0 / 16.0, 4.0 / 16.0, 6.0 / 16.0, 4.0 / 16.0, 1.0 / 16.0];
 
         let mut levels = Vec::with_capacity(num_levels);
 
@@ -618,9 +661,11 @@ impl GpuPyramidPipeline {
         levels.push(level0);
 
         // --- Levels 1..(num_levels-1): blur + downsample via compute ---
-        let mut encoder = gpu.device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor { label: Some("GpuPyramid::build") },
-        );
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("GpuPyramid::build"),
+            });
 
         for lvl_idx in 1..num_levels {
             let prev = &levels[lvl_idx - 1];
@@ -632,11 +677,13 @@ impl GpuPyramidPipeline {
 
             // Build the uniform buffer for this level's kernel params.
             let params = PyramidParams::new(dst_w, dst_h, &kernel);
-            let params_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("PyramidParams"),
-                contents: bytemuck::bytes_of(&params),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
+            let params_buf = gpu
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("PyramidParams"),
+                    contents: bytemuck::bytes_of(&params),
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                });
 
             // Create a bind group for this level pair.
             let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -660,11 +707,10 @@ impl GpuPyramidPipeline {
 
             // Dispatch the compute pass for this level.
             {
-                let mut pass =
-                    encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("blur_downsample"),
-                        timestamp_writes: None,
-                    });
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("blur_downsample"),
+                    timestamp_writes: None,
+                });
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &bind_group, &[]);
 
@@ -677,7 +723,10 @@ impl GpuPyramidPipeline {
 
         gpu.queue.submit(std::iter::once(encoder.finish()));
 
-        GpuPyramid { levels, persistent: None }
+        GpuPyramid {
+            levels,
+            persistent: None,
+        }
     }
 }
 
@@ -717,15 +766,19 @@ fn upload_f32_level(gpu: &GpuDevice, dst: &GpuPyramidLevel, src: &Image<u8>) {
         }
     }
 
-    let staging_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("pyramid level 0 staging"),
-        contents: &staging,
-        usage: wgpu::BufferUsages::COPY_SRC,
-    });
+    let staging_buf = gpu
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("pyramid level 0 staging"),
+            contents: &staging,
+            usage: wgpu::BufferUsages::COPY_SRC,
+        });
 
-    let mut encoder = gpu.device.create_command_encoder(
-        &wgpu::CommandEncoderDescriptor { label: Some("upload_f32_level") },
-    );
+    let mut encoder = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("upload_f32_level"),
+        });
     encoder.copy_buffer_to_texture(
         wgpu::ImageCopyBuffer {
             buffer: &staging_buf,
@@ -741,7 +794,11 @@ fn upload_f32_level(gpu: &GpuDevice, dst: &GpuPyramidLevel, src: &Image<u8>) {
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
-        wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
     );
     gpu.queue.submit(std::iter::once(encoder.finish()));
 }
@@ -799,8 +856,10 @@ mod tests {
         let params = PyramidParams::new(320, 240, &kernel);
         assert_eq!(params.half_size, half_size as u32);
         // coeffs[0][0] should be the centre weight (largest).
-        assert!(params.coeffs[0][0] > params.coeffs[0][1],
-            "centre weight should be largest");
+        assert!(
+            params.coeffs[0][0] > params.coeffs[0][1],
+            "centre weight should be largest"
+        );
         // All weights should be positive.
         for row in &params.coeffs {
             for &c in row {
@@ -822,8 +881,10 @@ mod tests {
         // Must be symmetric.
         let half = expected_half_size;
         for i in 0..half {
-            assert!((k[i] - k[k.len() - 1 - i]).abs() < 1e-7,
-                "kernel not symmetric at index {i}");
+            assert!(
+                (k[i] - k[k.len() - 1 - i]).abs() < 1e-7,
+                "kernel not symmetric at index {i}"
+            );
         }
     }
 
@@ -837,8 +898,13 @@ mod tests {
     fn run_gpu_test_in_subprocess(test_name: &str) -> String {
         let output = std::process::Command::new("cargo")
             .args([
-                "test", "--lib", "--",
-                test_name, "--exact", "--ignored", "--nocapture",
+                "test",
+                "--lib",
+                "--",
+                test_name,
+                "--exact",
+                "--ignored",
+                "--nocapture",
             ])
             .output()
             .unwrap_or_else(|e| panic!("subprocess failed for {test_name}: {e}"));
@@ -875,8 +941,11 @@ mod tests {
         assert_eq!(readback.len(), 100);
         for (i, (&expected, &got)) in pixels.iter().zip(readback.iter()).enumerate() {
             let diff = (expected as f32 - got).abs();
-            assert!(diff < 1e-3,
-                "level0 pixel {i}: expected {}, got {got}", expected as f32);
+            assert!(
+                diff < 1e-3,
+                "level0 pixel {i}: expected {}, got {got}",
+                expected as f32
+            );
         }
         println!("GPU_TEST_OK");
         drop(pyr);
@@ -893,11 +962,16 @@ mod tests {
         let pipeline = GpuPyramidPipeline::new(&gpu);
         let pyr = pipeline.build(&gpu, &src, 5, 1.0);
 
-        assert_eq!(pyr.levels[0].width,  640); assert_eq!(pyr.levels[0].height, 480);
-        assert_eq!(pyr.levels[1].width,  320); assert_eq!(pyr.levels[1].height, 240);
-        assert_eq!(pyr.levels[2].width,  160); assert_eq!(pyr.levels[2].height, 120);
-        assert_eq!(pyr.levels[3].width,   80); assert_eq!(pyr.levels[3].height,  60);
-        assert_eq!(pyr.levels[4].width,   40); assert_eq!(pyr.levels[4].height,  30);
+        assert_eq!(pyr.levels[0].width, 640);
+        assert_eq!(pyr.levels[0].height, 480);
+        assert_eq!(pyr.levels[1].width, 320);
+        assert_eq!(pyr.levels[1].height, 240);
+        assert_eq!(pyr.levels[2].width, 160);
+        assert_eq!(pyr.levels[2].height, 120);
+        assert_eq!(pyr.levels[3].width, 80);
+        assert_eq!(pyr.levels[3].height, 60);
+        assert_eq!(pyr.levels[4].width, 40);
+        assert_eq!(pyr.levels[4].height, 30);
 
         println!("GPU_TEST_OK");
         drop(pyr);
@@ -917,8 +991,10 @@ mod tests {
         for lvl in 0..4 {
             let data = pyr.readback_level(&gpu, lvl);
             for (i, &v) in data.iter().enumerate() {
-                assert!((v - 128.0).abs() < 0.5,
-                    "level {lvl} pixel {i}: expected 128, got {v}");
+                assert!(
+                    (v - 128.0).abs() < 0.5,
+                    "level {lvl} pixel {i}: expected 128, got {v}"
+                );
             }
         }
         println!("GPU_TEST_OK");
@@ -940,7 +1016,10 @@ mod tests {
         // Simple LCG for deterministic test data without extra deps.
         let mut rng = 12345u32;
         let pixels: Vec<u8> = (0..128 * 128)
-            .map(|_| { rng = rng.wrapping_mul(1664525).wrapping_add(1013904223); (rng >> 24) as u8 })
+            .map(|_| {
+                rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+                (rng >> 24) as u8
+            })
             .collect();
 
         let src = Image::<u8>::from_vec(128, 128, pixels.clone());
@@ -956,14 +1035,23 @@ mod tests {
             let cpu_level = cpu_pyr.level(lvl);
             let cpu_data = cpu_level.as_slice();
 
-            assert_eq!(gpu_data.len(), cpu_data.len(),
-                "level {lvl} length mismatch: GPU {} vs CPU {}", gpu_data.len(), cpu_data.len());
+            assert_eq!(
+                gpu_data.len(),
+                cpu_data.len(),
+                "level {lvl} length mismatch: GPU {} vs CPU {}",
+                gpu_data.len(),
+                cpu_data.len()
+            );
 
             for (i, (&g, &c)) in gpu_data.iter().zip(cpu_data.iter()).enumerate() {
                 let diff = (g - c).abs();
-                if diff > max_err { max_err = diff; }
-                assert!(diff < 0.5,
-                    "level {lvl} pixel {i}: GPU={g:.4} CPU={c:.4} diff={diff:.4}");
+                if diff > max_err {
+                    max_err = diff;
+                }
+                assert!(
+                    diff < 0.5,
+                    "level {lvl} pixel {i}: GPU={g:.4} CPU={c:.4} diff={diff:.4}"
+                );
             }
         }
         eprintln!("[test] max GPU/CPU pyramid error: {max_err:.4}");
@@ -980,7 +1068,10 @@ mod tests {
         // the same levels as build(), including when a slot is rebuilt with a
         // different image (no stale data from the previous contents).
         let mut rng = 4242u32;
-        let mut next = || { rng = rng.wrapping_mul(1664525).wrapping_add(1013904223); (rng >> 24) as u8 };
+        let mut next = || {
+            rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+            (rng >> 24) as u8
+        };
         let img_a = Image::<u8>::from_vec(150, 94, (0..150 * 94).map(|_| next()).collect());
         let img_b = Image::<u8>::from_vec(150, 94, (0..150 * 94).map(|_| next()).collect());
 

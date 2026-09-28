@@ -166,11 +166,13 @@ impl GpuImage {
 
         // Upload the staging buffer as an initialised buffer (avoids a
         // separate write_buffer call).
-        let staging_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("GpuImage::staging"),
-            contents: &staging,
-            usage: wgpu::BufferUsages::COPY_SRC,
-        });
+        let staging_buf = gpu
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("GpuImage::staging"),
+                contents: &staging,
+                usage: wgpu::BufferUsages::COPY_SRC,
+            });
 
         // --- Submit copy command ---
         let mut encoder = gpu
@@ -203,7 +205,12 @@ impl GpuImage {
 
         gpu.queue.submit(std::iter::once(encoder.finish()));
 
-        GpuImage { texture, view, width, height }
+        GpuImage {
+            texture,
+            view,
+            width,
+            height,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -271,7 +278,9 @@ impl GpuImage {
 
         // Poll until the GPU copy is done and the map callback fires.
         gpu.device.poll(wgpu::Maintain::Wait);
-        receiver.recv().expect("readback map callback never fired")
+        receiver
+            .recv()
+            .expect("readback map callback never fired")
             .expect("readback map failed");
 
         // Extract pixel data, stripping the alignment padding from each row.
@@ -280,9 +289,8 @@ impl GpuImage {
         for y in 0..self.height as usize {
             let src_start = y * aligned_bytes_per_row as usize;
             let dst_start = y * self.width as usize;
-            out[dst_start..dst_start + self.width as usize].copy_from_slice(
-                &mapped[src_start..src_start + self.width as usize],
-            );
+            out[dst_start..dst_start + self.width as usize]
+                .copy_from_slice(&mapped[src_start..src_start + self.width as usize]);
         }
         drop(mapped);
         readback_buf.unmap();
@@ -350,8 +358,8 @@ mod tests {
     fn test_staging_compaction_no_padding() {
         // stride == width: no padding, rows should copy verbatim.
         let img = Image::<u8>::from_vec(
-            2,   // width
-            3,   // height
+            2, // width
+            3, // height
             vec![1, 2, 3, 4, 5, 6],
         );
         let aligned = align_to(2, 256);
@@ -376,11 +384,10 @@ mod tests {
         // stride = 4, width = 3: one padding byte per row.
         // Pixel data: row0=[10,20,30,_], row1=[40,50,60,_].
         let img = Image::<u8>::from_vec_with_stride(
-            3,   // width
-            2,   // height
-            4,   // stride > width
-            vec![10, 20, 30, 0,
-                 40, 50, 60, 0],
+            3, // width
+            2, // height
+            4, // stride > width
+            vec![10, 20, 30, 0, 40, 50, 60, 0],
         );
         let aligned = align_to(3, 256); // = 256
         let mut staging = vec![0u8; (aligned * 2) as usize];
@@ -391,9 +398,15 @@ mod tests {
                 .copy_from_slice(&img.as_slice()[src_start..src_start + 3]);
         }
         assert_eq!(&staging[0..3], &[10, 20, 30]);
-        assert_eq!(&staging[aligned as usize..aligned as usize + 3], &[40, 50, 60]);
+        assert_eq!(
+            &staging[aligned as usize..aligned as usize + 3],
+            &[40, 50, 60]
+        );
         // Padding region of first row should be zeros (never written).
-        assert_eq!(&staging[3..aligned as usize], &vec![0u8; (aligned - 3) as usize]);
+        assert_eq!(
+            &staging[3..aligned as usize],
+            &vec![0u8; (aligned - 3) as usize]
+        );
     }
 
     // ---- GPU round-trip tests (subprocess-isolated) ------------------------
@@ -406,8 +419,13 @@ mod tests {
     fn run_gpu_test_in_subprocess(test_name: &str) -> String {
         let output = std::process::Command::new("cargo")
             .args([
-                "test", "--lib", "--",
-                test_name, "--exact", "--ignored", "--nocapture",
+                "test",
+                "--lib",
+                "--",
+                test_name,
+                "--exact",
+                "--ignored",
+                "--nocapture",
             ])
             .output()
             .unwrap_or_else(|e| panic!("failed to spawn subprocess for {test_name}: {e}"));
@@ -446,19 +464,19 @@ mod tests {
     fn inner_upload_round_trip_with_padding() {
         // 3×2 image with stride=5 (2 padding bytes per row).
         // Active pixels: row0=[10,20,30], row1=[40,50,60].
-        let src = Image::<u8>::from_vec_with_stride(
-            3, 2, 5,
-            vec![10, 20, 30, 0, 0,
-                 40, 50, 60, 0, 0],
-        );
+        let src =
+            Image::<u8>::from_vec_with_stride(3, 2, 5, vec![10, 20, 30, 0, 0, 40, 50, 60, 0, 0]);
 
         let gpu = GpuDevice::new().expect("need Vulkan GPU");
         let gpu_img = GpuImage::upload(&gpu, &src);
 
         let readback = gpu_img.readback(&gpu);
         // Readback is compact (stride == width), padding should be gone.
-        assert_eq!(readback, vec![10, 20, 30, 40, 50, 60],
-            "round-trip mismatch (with padding)");
+        assert_eq!(
+            readback,
+            vec![10, 20, 30, 40, 50, 60],
+            "round-trip mismatch (with padding)"
+        );
 
         println!("GPU_TEST_OK");
         drop(gpu_img);
@@ -469,9 +487,7 @@ mod tests {
     #[ignore = "GPU integration: run via outer subprocess wrapper"]
     fn inner_upload_large_gradient() {
         // 640×480 ramp — stress test for alignment and larger transfers.
-        let pixels: Vec<u8> = (0..(640 * 480))
-            .map(|i| (i % 256) as u8)
-            .collect();
+        let pixels: Vec<u8> = (0..(640 * 480)).map(|i| (i % 256) as u8).collect();
         let src = Image::<u8>::from_vec(640, 480, pixels.clone());
 
         let gpu = GpuDevice::new().expect("need Vulkan GPU");
@@ -490,27 +506,23 @@ mod tests {
     #[test]
     #[ignore = "requires a real Vulkan GPU"]
     fn test_upload_round_trip_no_padding() {
-        let out = run_gpu_test_in_subprocess(
-            "gpu::image::tests::inner_upload_round_trip_no_padding",
-        );
+        let out =
+            run_gpu_test_in_subprocess("gpu::image::tests::inner_upload_round_trip_no_padding");
         assert!(out.contains("GPU_TEST_OK"), "inner test failed:\n{out}");
     }
 
     #[test]
     #[ignore = "requires a real Vulkan GPU"]
     fn test_upload_round_trip_with_padding() {
-        let out = run_gpu_test_in_subprocess(
-            "gpu::image::tests::inner_upload_round_trip_with_padding",
-        );
+        let out =
+            run_gpu_test_in_subprocess("gpu::image::tests::inner_upload_round_trip_with_padding");
         assert!(out.contains("GPU_TEST_OK"), "inner test failed:\n{out}");
     }
 
     #[test]
     #[ignore = "requires a real Vulkan GPU"]
     fn test_upload_large_gradient() {
-        let out = run_gpu_test_in_subprocess(
-            "gpu::image::tests::inner_upload_large_gradient",
-        );
+        let out = run_gpu_test_in_subprocess("gpu::image::tests::inner_upload_large_gradient");
         assert!(out.contains("GPU_TEST_OK"), "inner test failed:\n{out}");
     }
 }

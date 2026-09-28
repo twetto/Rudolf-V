@@ -50,7 +50,7 @@
 use crate::fast::Feature;
 use crate::gpu::device::GpuDevice;
 use crate::gpu::pyramid::GpuPyramid;
-use crate::klt::{TrackedFeature, TrackStatus};
+use crate::klt::{TrackStatus, TrackedFeature};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -146,7 +146,7 @@ pub enum KltDispatch {
     Scalar,
     /// 1 workgroup = 1 feature. WG_SIZE threads cooperate on patch pixels.
     /// Requires power-of-2 workgroup size for shared memory reduction.
-    Warp(u32),  // workgroup size (must be power of 2, e.g. 16, 32, 64)
+    Warp(u32), // workgroup size (must be power of 2, e.g. 16, 32, 64)
 }
 
 // ---------------------------------------------------------------------------
@@ -157,15 +157,20 @@ pub enum KltDispatch {
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuKltFeature {
-    pub x:     f32,
-    pub y:     f32,
+    pub x: f32,
+    pub y: f32,
     pub score: f32,
-    pub _pad:  f32,
+    pub _pad: f32,
 }
 
 impl From<&Feature> for GpuKltFeature {
     fn from(f: &Feature) -> Self {
-        GpuKltFeature { x: f.x, y: f.y, score: f.score, _pad: 0.0 }
+        GpuKltFeature {
+            x: f.x,
+            y: f.y,
+            score: f.score,
+            _pad: 0.0,
+        }
     }
 }
 
@@ -173,24 +178,24 @@ impl From<&Feature> for GpuKltFeature {
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuTrackResult {
-    x:      f32,
-    y:      f32,
-    status: u32,  // 0 = Tracked, 1 = Lost, 2 = OutOfBounds
-    _pad:   u32,
+    x: f32,
+    y: f32,
+    status: u32, // 0 = Tracked, 1 = Lost, 2 = OutOfBounds
+    _pad: u32,
 }
 
 /// Uniform parameters for one level pass (must match KltParams in klt.wgsl).
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct KltParams {
-    n_features:     u32,
+    n_features: u32,
     max_iterations: u32,
-    epsilon_sq:     f32,
-    level:          u32,
-    level_scale:    f32,
-    img0_width:     u32,
-    img0_height:    u32,
-    _pad:           u32,
+    epsilon_sq: f32,
+    level: u32,
+    level_scale: f32,
+    img0_width: u32,
+    img0_height: u32,
+    _pad: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -202,46 +207,46 @@ struct KltParams {
 /// Create once with `GpuKltTracker::new()`; call `track()` every frame.
 /// The compute pipeline is compiled at construction time.
 pub struct GpuKltTracker {
-    pipeline:       wgpu::ComputePipeline,
-    bgl:            wgpu::BindGroupLayout,
-    dispatch:       KltDispatch,
+    pipeline: wgpu::ComputePipeline,
+    bgl: wgpu::BindGroupLayout,
+    dispatch: KltDispatch,
     // Linear sampler at binding 10 when hardware sampling is active.
-    sampler:        Option<wgpu::Sampler>,
-    pub window_size:    usize,
+    sampler: Option<wgpu::Sampler>,
+    pub window_size: usize,
     pub max_iterations: usize,
-    pub epsilon:        f32,
-    pub max_levels:     usize,
+    pub epsilon: f32,
+    pub max_levels: usize,
 
     // Pre-allocated GPU buffers — reused every frame to avoid VRAM allocation
     // overhead. Sized for max_features at construction.
-    max_features:   usize,
-    patch_size:     usize,          // SIDE² = (2*window_size+1)²
-    feature_buf:    wgpu::Buffer,   // STORAGE | COPY_DST  — feature positions
-    disp_buf:       wgpu::Buffer,   // STORAGE | COPY_DST  — displacements (zeroed each frame)
-    results_buf:    wgpu::Buffer,   // STORAGE | COPY_SRC  — track results
-    rb_buf:         wgpu::Buffer,   // MAP_READ | COPY_DST — CPU readback
-    params_bufs:    Vec<wgpu::Buffer>, // one UNIFORM | COPY_DST per level
+    max_features: usize,
+    patch_size: usize,              // SIDE² = (2*window_size+1)²
+    feature_buf: wgpu::Buffer,      // STORAGE | COPY_DST  — feature positions
+    disp_buf: wgpu::Buffer,         // STORAGE | COPY_DST  — displacements (zeroed each frame)
+    results_buf: wgpu::Buffer,      // STORAGE | COPY_SRC  — track results
+    rb_buf: wgpu::Buffer,           // MAP_READ | COPY_DST — CPU readback
+    params_bufs: Vec<wgpu::Buffer>, // one UNIFORM | COPY_DST per level
     // Per-feature patch data in storage buffers (not private shader memory).
     // Each is max_features × PATCH floats. Avoids VideoCore VI private-memory
     // corruption and enables future wavefront-per-patch (§4).
-    t_buf:          wgpu::Buffer,   // STORAGE — template pixel values
-    gx_buf:         wgpu::Buffer,   // STORAGE — template x-gradients
-    gy_buf:         wgpu::Buffer,   // STORAGE — template y-gradients
-    h_inv_buf:      wgpu::Buffer,   // STORAGE — per-feature Hessian inverse (vec4)
+    t_buf: wgpu::Buffer,     // STORAGE — template pixel values
+    gx_buf: wgpu::Buffer,    // STORAGE — template x-gradients
+    gy_buf: wgpu::Buffer,    // STORAGE — template y-gradients
+    h_inv_buf: wgpu::Buffer, // STORAGE — per-feature Hessian inverse (vec4)
 
     // State set by prepare(), consumed by record_into()/arm_readback()/collect_results().
-    n_prepared:     usize,
+    n_prepared: usize,
     result_bytes_p: u64,
-    disp_bytes_p:   u64,
-    workgroups_p:   u32,
+    disp_bytes_p: u64,
+    workgroups_p: u32,
     // Per-level bind groups keyed by (prev level-0 texture id, curr level-0
     // texture id, level count). A frontend that ping-pongs two persistent
     // pyramids hits this cache every frame after the first two, so no bind
     // groups are created in steady state. Bounded to BG_CACHE_CAP entries;
     // the oldest entry (and the textures it keeps alive) is evicted first.
-    bg_cache:       Vec<((u64, u64, usize), Vec<wgpu::BindGroup>)>,
-    bg_sel:         usize,
-    readback_rx:    Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+    bg_cache: Vec<((u64, u64, usize), Vec<wgpu::BindGroup>)>,
+    bg_sel: usize,
+    readback_rx: Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
 }
 
 impl GpuKltTracker {
@@ -250,15 +255,20 @@ impl GpuKltTracker {
     /// `window_size` is the patch half-width W (patch = (2W+1)²).
     /// Typical values: 4 (GAP8 / small images), 7 (vilib / HD cameras).
     pub fn new(
-        gpu:            &GpuDevice,
-        window_size:    usize,
+        gpu: &GpuDevice,
+        window_size: usize,
         max_iterations: usize,
-        epsilon:        f32,
-        max_levels:     usize,
-        max_features:   usize,
+        epsilon: f32,
+        max_levels: usize,
+        max_features: usize,
     ) -> Self {
         Self::new_with_dispatch(
-            gpu, window_size, max_iterations, epsilon, max_levels, max_features,
+            gpu,
+            window_size,
+            max_iterations,
+            epsilon,
+            max_levels,
+            max_features,
             KltDispatch::Warp(WG_WARP),
         )
     }
@@ -266,32 +276,43 @@ impl GpuKltTracker {
     /// Create a GPU KLT tracker with the default Warp(64) dispatch and an
     /// explicit sampling strategy.
     pub fn new_with_sampling(
-        gpu:            &GpuDevice,
-        window_size:    usize,
+        gpu: &GpuDevice,
+        window_size: usize,
         max_iterations: usize,
-        epsilon:        f32,
-        max_levels:     usize,
-        max_features:   usize,
-        sampling:       KltSampling,
+        epsilon: f32,
+        max_levels: usize,
+        max_features: usize,
+        sampling: KltSampling,
     ) -> Self {
         Self::new_with_options(
-            gpu, window_size, max_iterations, epsilon, max_levels, max_features,
-            KltDispatch::Warp(WG_WARP), sampling,
+            gpu,
+            window_size,
+            max_iterations,
+            epsilon,
+            max_levels,
+            max_features,
+            KltDispatch::Warp(WG_WARP),
+            sampling,
         )
     }
 
     /// Create a GPU KLT tracker with the Scalar dispatch (fallback).
     /// 1 thread = 1 feature, no shared memory, no barriers.
     pub fn new_scalar(
-        gpu:            &GpuDevice,
-        window_size:    usize,
+        gpu: &GpuDevice,
+        window_size: usize,
         max_iterations: usize,
-        epsilon:        f32,
-        max_levels:     usize,
-        max_features:   usize,
+        epsilon: f32,
+        max_levels: usize,
+        max_features: usize,
     ) -> Self {
         Self::new_with_dispatch(
-            gpu, window_size, max_iterations, epsilon, max_levels, max_features,
+            gpu,
+            window_size,
+            max_iterations,
+            epsilon,
+            max_levels,
+            max_features,
             KltDispatch::Scalar,
         )
     }
@@ -302,17 +323,23 @@ impl GpuKltTracker {
     ///   - `Scalar`: 1 thread per feature (klt.wgsl)
     ///   - `Warp(wg)`: 1 workgroup of `wg` threads per feature (klt_warp.wgsl)
     pub fn new_with_dispatch(
-        gpu:            &GpuDevice,
-        window_size:    usize,
+        gpu: &GpuDevice,
+        window_size: usize,
         max_iterations: usize,
-        epsilon:        f32,
-        max_levels:     usize,
-        max_features:   usize,
-        dispatch:       KltDispatch,
+        epsilon: f32,
+        max_levels: usize,
+        max_features: usize,
+        dispatch: KltDispatch,
     ) -> Self {
         Self::new_with_options(
-            gpu, window_size, max_iterations, epsilon, max_levels, max_features,
-            dispatch, KltSampling::Manual,
+            gpu,
+            window_size,
+            max_iterations,
+            epsilon,
+            max_levels,
+            max_features,
+            dispatch,
+            KltSampling::Manual,
         )
     }
 
@@ -321,38 +348,44 @@ impl GpuKltTracker {
     /// Hardware sampling applies to the `Warp` shader only; `Scalar` always
     /// interpolates manually.
     pub fn new_with_options(
-        gpu:            &GpuDevice,
-        window_size:    usize,
+        gpu: &GpuDevice,
+        window_size: usize,
         max_iterations: usize,
-        epsilon:        f32,
-        max_levels:     usize,
-        max_features:   usize,
-        dispatch:       KltDispatch,
-        sampling:       KltSampling,
+        epsilon: f32,
+        max_levels: usize,
+        max_features: usize,
+        dispatch: KltDispatch,
+        sampling: KltSampling,
     ) -> Self {
-        let filterable = gpu.device.features().contains(wgpu::Features::FLOAT32_FILTERABLE);
+        let filterable = gpu
+            .device
+            .features()
+            .contains(wgpu::Features::FLOAT32_FILTERABLE);
         let is_warp = matches!(dispatch, KltDispatch::Warp(_));
         let hw_sampling = match sampling {
-            KltSampling::Auto     => filterable && is_warp,
-            KltSampling::Manual   => false,
+            KltSampling::Auto => filterable && is_warp,
+            KltSampling::Manual => false,
             KltSampling::Hardware => {
-                assert!(filterable,
-                    "KltSampling::Hardware needs FLOAT32_FILTERABLE, which this device lacks");
+                assert!(
+                    filterable,
+                    "KltSampling::Hardware needs FLOAT32_FILTERABLE, which this device lacks"
+                );
                 assert!(is_warp, "KltSampling::Hardware needs KltDispatch::Warp");
                 true
             }
         };
 
-        let side  = 2 * window_size + 1;
+        let side = 2 * window_size + 1;
         let patch = side * side;
 
         // Select shader source and workgroup size based on dispatch mode.
         let (shader_template, wg_size) = match dispatch {
-            KltDispatch::Scalar => {
-                (include_str!("../shaders/klt.wgsl"), WG_SIZE)
-            }
+            KltDispatch::Scalar => (include_str!("../shaders/klt.wgsl"), WG_SIZE),
             KltDispatch::Warp(wg) => {
-                assert!(wg.is_power_of_two(), "Warp WG_SIZE must be power of 2, got {wg}");
+                assert!(
+                    wg.is_power_of_two(),
+                    "Warp WG_SIZE must be power of 2, got {wg}"
+                );
                 assert!(wg >= 4, "Warp WG_SIZE must be >= 4, got {wg}");
                 (include_str!("../shaders/klt_warp.wgsl"), wg)
             }
@@ -360,133 +393,145 @@ impl GpuKltTracker {
 
         // Bake all compile-time constants into the shader source.
         let shader_src = shader_template
-            .replace("{{HALF}}",    &window_size.to_string())
-            .replace("{{SIDE}}",    &side.to_string())
-            .replace("{{PATCH}}",   &patch.to_string())
+            .replace("{{HALF}}", &window_size.to_string())
+            .replace("{{SIDE}}", &side.to_string())
+            .replace("{{PATCH}}", &patch.to_string())
             .replace("{{WG_SIZE}}", &wg_size.to_string())
-            .replace("{{BILINEAR_FN}}",
-                if hw_sampling { BILINEAR_HARDWARE } else { BILINEAR_MANUAL });
+            .replace(
+                "{{BILINEAR_FN}}",
+                if hw_sampling {
+                    BILINEAR_HARDWARE
+                } else {
+                    BILINEAR_MANUAL
+                },
+            );
 
-        let shader = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label:  Some(match dispatch {
-                KltDispatch::Scalar => "klt.wgsl",
-                KltDispatch::Warp(_) => "klt_warp.wgsl",
-            }),
-            source: wgpu::ShaderSource::Wgsl(shader_src.into()),
-        });
+        let shader = gpu
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(match dispatch {
+                    KltDispatch::Scalar => "klt.wgsl",
+                    KltDispatch::Warp(_) => "klt_warp.wgsl",
+                }),
+                source: wgpu::ShaderSource::Wgsl(shader_src.into()),
+            });
 
         // Bind group layout mirrors @group(0) in klt.wgsl.
         let mut bgl_entries = vec![
-                // 0 — prev_tex (texture_2d<f32>)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        multisampled: false,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        sample_type: wgpu::TextureSampleType::Float { filterable: hw_sampling },
+            // 0 — prev_tex (texture_2d<f32>)
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float {
+                        filterable: hw_sampling,
                     },
-                    count: None,
                 },
-                // 1 — curr_tex
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        multisampled: false,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        sample_type: wgpu::TextureSampleType::Float { filterable: hw_sampling },
+                count: None,
+            },
+            // 1 — curr_tex
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float {
+                        filterable: hw_sampling,
                     },
-                    count: None,
                 },
-                // 2 — features (storage read)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
+                count: None,
+            },
+            // 2 — features (storage read)
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
                 },
-                // 3 — displacements (storage read_write)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
+                count: None,
+            },
+            // 3 — displacements (storage read_write)
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
                 },
-                // 4 — results (storage read_write)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
+                count: None,
+            },
+            // 4 — results (storage read_write)
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
                 },
-                // 5 — params (uniform)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
+                count: None,
+            },
+            // 5 — params (uniform)
+            wgpu::BindGroupLayoutEntry {
+                binding: 5,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
                 },
-                // 6 — t_buf (storage read_write: template pixel values)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
+                count: None,
+            },
+            // 6 — t_buf (storage read_write: template pixel values)
+            wgpu::BindGroupLayoutEntry {
+                binding: 6,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
                 },
-                // 7 — gx_buf (storage read_write: template x-gradients)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 7,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
+                count: None,
+            },
+            // 7 — gx_buf (storage read_write: template x-gradients)
+            wgpu::BindGroupLayoutEntry {
+                binding: 7,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
                 },
-                // 8 — gy_buf (storage read_write: template y-gradients)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 8,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
+                count: None,
+            },
+            // 8 — gy_buf (storage read_write: template y-gradients)
+            wgpu::BindGroupLayoutEntry {
+                binding: 8,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
                 },
-                // 9 — h_inv (storage read_write: per-feature Hessian inverse)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 9,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
+                count: None,
+            },
+            // 9 — h_inv (storage read_write: per-feature Hessian inverse)
+            wgpu::BindGroupLayoutEntry {
+                binding: 9,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
                 },
+                count: None,
+            },
         ];
         if hw_sampling {
             // 10 — linear sampler (hardware bilinear only)
@@ -497,71 +542,84 @@ impl GpuKltTracker {
                 count: None,
             });
         }
-        let bgl = gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("GpuKlt BGL"),
-            entries: &bgl_entries,
+        let bgl = gpu
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("GpuKlt BGL"),
+                entries: &bgl_entries,
+            });
+        let sampler = hw_sampling.then(|| {
+            gpu.device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("GpuKlt linear sampler"),
+                address_mode_u: wgpu::AddressMode::ClampToEdge,
+                address_mode_v: wgpu::AddressMode::ClampToEdge,
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                mipmap_filter: wgpu::FilterMode::Nearest,
+                ..Default::default()
+            })
         });
-        let sampler = hw_sampling.then(|| gpu.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("GpuKlt linear sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        }));
 
-        let pipeline_layout =
-            gpu.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        let pipeline_layout = gpu
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("GpuKlt pipeline layout"),
                 bind_group_layouts: &[&bgl],
                 push_constant_ranges: &[],
             });
 
-        let pipeline =
-            gpu.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label:               Some("track_level"),
-                layout:              Some(&pipeline_layout),
-                module:              &shader,
-                entry_point:         "track_level",
+        let pipeline = gpu
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("track_level"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: "track_level",
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
-                cache:               None,
+                cache: None,
             });
 
         // Pre-allocate buffers sized for max_features.
         // write_buffer / clear_buffer are used each frame to update content —
         // both go through the queue's staging ring and avoid VRAM re-allocation.
-        let feat_bytes   = (max_features * std::mem::size_of::<GpuKltFeature>()) as u64;
-        let disp_bytes   = (max_features * 2 * std::mem::size_of::<f32>()) as u64;
+        let feat_bytes = (max_features * std::mem::size_of::<GpuKltFeature>()) as u64;
+        let disp_bytes = (max_features * 2 * std::mem::size_of::<f32>()) as u64;
         let result_bytes = (max_features * std::mem::size_of::<GpuTrackResult>()) as u64;
 
         let feature_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("GpuKlt features"), size: feat_bytes,
+            label: Some("GpuKlt features"),
+            size: feat_bytes,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let disp_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("GpuKlt displacements"), size: disp_bytes,
+            label: Some("GpuKlt displacements"),
+            size: disp_bytes,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let results_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("GpuKlt results"), size: result_bytes,
+            label: Some("GpuKlt results"),
+            size: result_bytes,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let rb_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("GpuKlt readback"), size: result_bytes,
+            label: Some("GpuKlt readback"),
+            size: result_bytes,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         // One params buffer per level — content updated via write_buffer each frame.
         let params_bufs: Vec<wgpu::Buffer> = (0..max_levels)
-            .map(|_| gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("GpuKlt params"), size: std::mem::size_of::<KltParams>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }))
+            .map(|_| {
+                gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("GpuKlt params"),
+                    size: std::mem::size_of::<KltParams>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            })
             .collect();
 
         // Per-feature patch storage buffers: max_features × PATCH floats each.
@@ -569,36 +627,58 @@ impl GpuKltTracker {
         // VideoCore VI's private memory corruption on RPi 4.
         let patch_buf_bytes = (max_features * patch * std::mem::size_of::<f32>()) as u64;
         let t_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("GpuKlt t_buf"), size: patch_buf_bytes,
+            label: Some("GpuKlt t_buf"),
+            size: patch_buf_bytes,
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
         let gx_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("GpuKlt gx_buf"), size: patch_buf_bytes,
+            label: Some("GpuKlt gx_buf"),
+            size: patch_buf_bytes,
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
         let gy_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("GpuKlt gy_buf"), size: patch_buf_bytes,
+            label: Some("GpuKlt gy_buf"),
+            size: patch_buf_bytes,
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
         // Per-feature Hessian inverse: vec4<f32> per feature (16 bytes each).
         let h_inv_bytes = (max_features * 4 * std::mem::size_of::<f32>()) as u64;
         let h_inv_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("GpuKlt h_inv"), size: h_inv_bytes,
+            label: Some("GpuKlt h_inv"),
+            size: h_inv_bytes,
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
 
         GpuKltTracker {
-            pipeline, bgl, dispatch, sampler,
-            window_size, max_iterations, epsilon, max_levels,
-            max_features, patch_size: patch,
-            feature_buf, disp_buf, results_buf, rb_buf, params_bufs,
-            t_buf, gx_buf, gy_buf, h_inv_buf,
-            n_prepared: 0, result_bytes_p: 0, disp_bytes_p: 0, workgroups_p: 0,
-            bg_cache: Vec::new(), bg_sel: 0,
+            pipeline,
+            bgl,
+            dispatch,
+            sampler,
+            window_size,
+            max_iterations,
+            epsilon,
+            max_levels,
+            max_features,
+            patch_size: patch,
+            feature_buf,
+            disp_buf,
+            results_buf,
+            rb_buf,
+            params_bufs,
+            t_buf,
+            gx_buf,
+            gy_buf,
+            h_inv_buf,
+            n_prepared: 0,
+            result_bytes_p: 0,
+            disp_bytes_p: 0,
+            workgroups_p: 0,
+            bg_cache: Vec::new(),
+            bg_sel: 0,
             readback_rx: None,
         }
     }
@@ -609,8 +689,8 @@ impl GpuKltTracker {
     /// Must be called before `record_into()`.
     pub fn prepare(
         &mut self,
-        gpu:          &GpuDevice,
-        features:     &[Feature],
+        gpu: &GpuDevice,
+        features: &[Feature],
         prev_pyramid: &GpuPyramid,
         curr_pyramid: &GpuPyramid,
     ) -> bool {
@@ -619,37 +699,43 @@ impl GpuKltTracker {
             return false;
         }
         let n = features.len();
-        assert!(n <= self.max_features,
-            "GpuKltTracker: {} features exceeds max_features={}", n, self.max_features);
+        assert!(
+            n <= self.max_features,
+            "GpuKltTracker: {} features exceeds max_features={}",
+            n,
+            self.max_features
+        );
 
         let n_u32 = n as u32;
-        let num_levels = self.max_levels
+        let num_levels = self
+            .max_levels
             .min(prev_pyramid.levels.len())
             .min(curr_pyramid.levels.len());
         let img0_w = prev_pyramid.levels[0].width;
         let img0_h = prev_pyramid.levels[0].height;
 
         // Upload features via staging ring (no VRAM alloc).
-        let gpu_features: Vec<GpuKltFeature> =
-            features.iter().map(GpuKltFeature::from).collect();
-        gpu.queue.write_buffer(&self.feature_buf, 0, bytemuck::cast_slice(&gpu_features));
+        let gpu_features: Vec<GpuKltFeature> = features.iter().map(GpuKltFeature::from).collect();
+        gpu.queue
+            .write_buffer(&self.feature_buf, 0, bytemuck::cast_slice(&gpu_features));
 
         let result_bytes = (n * std::mem::size_of::<GpuTrackResult>()) as u64;
-        let disp_bytes   = (n * 2 * std::mem::size_of::<f32>()) as u64;
+        let disp_bytes = (n * 2 * std::mem::size_of::<f32>()) as u64;
 
         // Write params for each level.
         for (i, level) in (0..num_levels).rev().enumerate() {
             let params = KltParams {
-                n_features:     n_u32,
+                n_features: n_u32,
                 max_iterations: self.max_iterations as u32,
-                epsilon_sq:     self.epsilon * self.epsilon,
-                level:          level as u32,
-                level_scale:    1.0f32 / (1u32 << level) as f32,
-                img0_width:     img0_w,
-                img0_height:    img0_h,
-                _pad:           0,
+                epsilon_sq: self.epsilon * self.epsilon,
+                level: level as u32,
+                level_scale: 1.0f32 / (1u32 << level) as f32,
+                img0_width: img0_w,
+                img0_height: img0_h,
+                _pad: 0,
             };
-            gpu.queue.write_buffer(&self.params_bufs[i], 0, bytemuck::bytes_of(&params));
+            gpu.queue
+                .write_buffer(&self.params_bufs[i], 0, bytemuck::bytes_of(&params));
         }
 
         // Look up (or build) the per-level bind groups for this texture pair.
@@ -661,31 +747,58 @@ impl GpuKltTracker {
         self.bg_sel = match self.bg_cache.iter().position(|(k, _)| *k == key) {
             Some(pos) => pos,
             None => {
-                let bind_groups: Vec<wgpu::BindGroup> = (0..num_levels).rev()
+                let bind_groups: Vec<wgpu::BindGroup> = (0..num_levels)
+                    .rev()
                     .enumerate()
                     .map(|(i, level)| {
                         gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                            label:  Some("GpuKlt BG"),
+                            label: Some("GpuKlt BG"),
                             layout: &self.bgl,
                             entries: &[
                                 wgpu::BindGroupEntry {
                                     binding: 0,
                                     resource: wgpu::BindingResource::TextureView(
-                                        &prev_pyramid.levels[level].read_view),
+                                        &prev_pyramid.levels[level].read_view,
+                                    ),
                                 },
                                 wgpu::BindGroupEntry {
                                     binding: 1,
                                     resource: wgpu::BindingResource::TextureView(
-                                        &curr_pyramid.levels[level].read_view),
+                                        &curr_pyramid.levels[level].read_view,
+                                    ),
                                 },
-                                wgpu::BindGroupEntry { binding: 2, resource: self.feature_buf.as_entire_binding() },
-                                wgpu::BindGroupEntry { binding: 3, resource: self.disp_buf.as_entire_binding() },
-                                wgpu::BindGroupEntry { binding: 4, resource: self.results_buf.as_entire_binding() },
-                                wgpu::BindGroupEntry { binding: 5, resource: self.params_bufs[i].as_entire_binding() },
-                                wgpu::BindGroupEntry { binding: 6, resource: self.t_buf.as_entire_binding() },
-                                wgpu::BindGroupEntry { binding: 7, resource: self.gx_buf.as_entire_binding() },
-                                wgpu::BindGroupEntry { binding: 8, resource: self.gy_buf.as_entire_binding() },
-                                wgpu::BindGroupEntry { binding: 9, resource: self.h_inv_buf.as_entire_binding() },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: self.feature_buf.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 3,
+                                    resource: self.disp_buf.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 4,
+                                    resource: self.results_buf.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 5,
+                                    resource: self.params_bufs[i].as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 6,
+                                    resource: self.t_buf.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 7,
+                                    resource: self.gx_buf.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 8,
+                                    resource: self.gy_buf.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 9,
+                                    resource: self.h_inv_buf.as_entire_binding(),
+                                },
                             ]
                             .into_iter()
                             .chain(self.sampler.as_ref().map(|s| wgpu::BindGroupEntry {
@@ -704,12 +817,12 @@ impl GpuKltTracker {
             }
         };
 
-        self.n_prepared     = n;
+        self.n_prepared = n;
         self.result_bytes_p = result_bytes;
-        self.disp_bytes_p   = disp_bytes;
+        self.disp_bytes_p = disp_bytes;
         // Scalar: ceil(n / WG_SIZE) workgroups, multiple features per WG.
         // Warp:   n workgroups, one feature per WG.
-        self.workgroups_p   = match self.dispatch {
+        self.workgroups_p = match self.dispatch {
             KltDispatch::Scalar => (n_u32 + WG_SIZE - 1) / WG_SIZE,
             KltDispatch::Warp(_) => n_u32,
         };
@@ -728,14 +841,14 @@ impl GpuKltTracker {
         encoder.clear_buffer(&self.disp_buf, 0, Some(self.disp_bytes_p));
         for bg in &self.bg_cache[self.bg_sel].1 {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("track_level"), timestamp_writes: None,
+                label: Some("track_level"),
+                timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, bg, &[]);
             pass.dispatch_workgroups(self.workgroups_p, 1, 1);
         }
-        encoder.copy_buffer_to_buffer(
-            &self.results_buf, 0, &self.rb_buf, 0, self.result_bytes_p);
+        encoder.copy_buffer_to_buffer(&self.results_buf, 0, &self.rb_buf, 0, self.result_bytes_p);
     }
 
     /// Map the readback buffer asynchronously.
@@ -744,21 +857,26 @@ impl GpuKltTracker {
         let (tx, rx) = std::sync::mpsc::channel();
         self.rb_buf
             .slice(..self.result_bytes_p)
-            .map_async(wgpu::MapMode::Read, move |r| { tx.send(r).unwrap(); });
+            .map_async(wgpu::MapMode::Read, move |r| {
+                tx.send(r).unwrap();
+            });
         self.readback_rx = Some(rx);
     }
 
     /// Collect track results. Must be called after `device.poll(Wait)`.
     /// `features` must be the same slice passed to `prepare()`.
     pub fn collect_results(&mut self, features: &[Feature]) -> Vec<TrackedFeature> {
-        let rx = self.readback_rx.take()
+        let rx = self
+            .readback_rx
+            .take()
             .expect("call arm_readback() before collect_results()");
         rx.recv().unwrap().expect("KLT readback failed");
 
         let n = self.n_prepared;
         let mapped = self.rb_buf.slice(..self.result_bytes_p).get_mapped_range();
         let gpu_results: &[GpuTrackResult] = bytemuck::cast_slice(&mapped);
-        let tracked = gpu_results[..n].iter()
+        let tracked = gpu_results[..n]
+            .iter()
             .zip(features.iter())
             .map(|(r, f)| {
                 let status = match r.status {
@@ -767,7 +885,14 @@ impl GpuKltTracker {
                     _ => TrackStatus::OutOfBounds,
                 };
                 TrackedFeature {
-                    feature: Feature { x: r.x, y: r.y, score: f.score, level: f.level, id: f.id, descriptor: f.descriptor },
+                    feature: Feature {
+                        x: r.x,
+                        y: r.y,
+                        score: f.score,
+                        level: f.level,
+                        id: f.id,
+                        descriptor: f.descriptor,
+                    },
                     status,
                     residual: f32::NAN,
                 }
@@ -783,16 +908,19 @@ impl GpuKltTracker {
     /// For pipeline fusion use `prepare` → `record_into` → `arm_readback` → `collect_results`.
     pub fn track(
         &mut self,
-        gpu:          &GpuDevice,
+        gpu: &GpuDevice,
         prev_pyramid: &GpuPyramid,
         curr_pyramid: &GpuPyramid,
-        features:     &[Feature],
+        features: &[Feature],
     ) -> Vec<TrackedFeature> {
         if !self.prepare(gpu, features, prev_pyramid, curr_pyramid) {
             return Vec::new();
         }
-        let mut encoder = gpu.device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor { label: Some("GpuKlt standalone") });
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("GpuKlt standalone"),
+            });
         self.record_into(&mut encoder);
         gpu.queue.submit(std::iter::once(encoder.finish()));
         self.arm_readback();
@@ -800,7 +928,6 @@ impl GpuKltTracker {
         self.collect_results(features)
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -816,8 +943,13 @@ mod tests {
     fn run_gpu_test(test_name: &str) -> String {
         let output = std::process::Command::new("cargo")
             .args([
-                "test", "--lib", "--",
-                test_name, "--exact", "--ignored", "--nocapture",
+                "test",
+                "--lib",
+                "--",
+                test_name,
+                "--exact",
+                "--ignored",
+                "--nocapture",
             ])
             .output()
             .unwrap_or_else(|e| panic!("subprocess failed: {e}"));
@@ -842,7 +974,14 @@ mod tests {
 
     /// Make a feature at (x, y) for use in track() calls.
     fn feat(x: f32, y: f32) -> Feature {
-        Feature { x, y, score: 100.0, level: 0, id: 1, descriptor: 0 }
+        Feature {
+            x,
+            y,
+            score: 100.0,
+            level: 0,
+            id: 1,
+            descriptor: 0,
+        }
     }
 
     // ---- inner GPU tests (subprocess-isolated) ----------------------------
@@ -862,10 +1001,15 @@ mod tests {
         assert_eq!(results[0].status, TrackStatus::Tracked);
         let dx = results[0].feature.x - 41.0;
         let dy = results[0].feature.y - 41.0;
-        assert!(dx.abs() < 0.5 && dy.abs() < 0.5,
-            "zero motion: ({dx:.3}, {dy:.3}) should be ~0");
+        assert!(
+            dx.abs() < 0.5 && dy.abs() < 0.5,
+            "zero motion: ({dx:.3}, {dy:.3}) should be ~0"
+        );
         println!("GPU_TEST_OK");
-        drop(tracker); drop(pyr); drop(pipeline); drop(gpu);
+        drop(tracker);
+        drop(pyr);
+        drop(pipeline);
+        drop(gpu);
     }
 
     #[test]
@@ -882,14 +1026,25 @@ mod tests {
         let features = vec![feat(41.0, 41.0)];
         let results = tracker.track(&gpu, &pyr1, &pyr2, &features);
 
-        assert_eq!(results[0].status, TrackStatus::Tracked,
-            "status = {:?}", results[0].status);
+        assert_eq!(
+            results[0].status,
+            TrackStatus::Tracked,
+            "status = {:?}",
+            results[0].status
+        );
         let dx = results[0].feature.x - 41.0;
         let dy = results[0].feature.y - 41.0;
-        assert!((dx - 3.0).abs() < 1.5, "horizontal shift: dx={dx:.3}, expected ~3");
-        assert!(dy.abs() < 1.5,         "horizontal shift: dy={dy:.3}, expected ~0");
+        assert!(
+            (dx - 3.0).abs() < 1.5,
+            "horizontal shift: dx={dx:.3}, expected ~3"
+        );
+        assert!(dy.abs() < 1.5, "horizontal shift: dy={dy:.3}, expected ~0");
         println!("GPU_TEST_OK");
-        drop(tracker); drop(pyr1); drop(pyr2); drop(pipeline); drop(gpu);
+        drop(tracker);
+        drop(pyr1);
+        drop(pyr2);
+        drop(pipeline);
+        drop(gpu);
     }
 
     #[test]
@@ -904,10 +1059,16 @@ mod tests {
         let features = vec![feat(30.0, 30.0)];
         let results = tracker.track(&gpu, &pyr, &pyr, &features);
 
-        assert_eq!(results[0].status, TrackStatus::Lost,
-            "flat region should be Lost");
+        assert_eq!(
+            results[0].status,
+            TrackStatus::Lost,
+            "flat region should be Lost"
+        );
         println!("GPU_TEST_OK");
-        drop(tracker); drop(pyr); drop(pipeline); drop(gpu);
+        drop(tracker);
+        drop(pyr);
+        drop(pipeline);
+        drop(gpu);
     }
 
     #[test]
@@ -934,10 +1095,14 @@ mod tests {
         let cpu_tracker = KltTracker::with_method(7, 30, 0.01, 3, LkMethod::InverseCompositional);
         let cpu_results = cpu_tracker.track(&cpu_pyr1, &cpu_pyr2, &features);
 
-        eprintln!("[test] GPU: ({:.3}, {:.3}) status={:?}",
-            gpu_results[0].feature.x, gpu_results[0].feature.y, gpu_results[0].status);
-        eprintln!("[test] CPU: ({:.3}, {:.3}) status={:?}",
-            cpu_results[0].feature.x, cpu_results[0].feature.y, cpu_results[0].status);
+        eprintln!(
+            "[test] GPU: ({:.3}, {:.3}) status={:?}",
+            gpu_results[0].feature.x, gpu_results[0].feature.y, gpu_results[0].status
+        );
+        eprintln!(
+            "[test] CPU: ({:.3}, {:.3}) status={:?}",
+            cpu_results[0].feature.x, cpu_results[0].feature.y, cpu_results[0].status
+        );
 
         assert_eq!(gpu_results[0].status, TrackStatus::Tracked);
         assert_eq!(cpu_results[0].status, TrackStatus::Tracked);
@@ -947,13 +1112,21 @@ mod tests {
         let gpu_dy = gpu_results[0].feature.y - 41.0;
         let cpu_dy = cpu_results[0].feature.y - 41.0;
 
-        assert!((gpu_dx - cpu_dx).abs() < 0.5,
-            "dx mismatch: GPU={gpu_dx:.3} CPU={cpu_dx:.3}");
-        assert!((gpu_dy - cpu_dy).abs() < 0.5,
-            "dy mismatch: GPU={gpu_dy:.3} CPU={cpu_dy:.3}");
+        assert!(
+            (gpu_dx - cpu_dx).abs() < 0.5,
+            "dx mismatch: GPU={gpu_dx:.3} CPU={cpu_dx:.3}"
+        );
+        assert!(
+            (gpu_dy - cpu_dy).abs() < 0.5,
+            "dy mismatch: GPU={gpu_dy:.3} CPU={cpu_dy:.3}"
+        );
 
         println!("GPU_TEST_OK");
-        drop(tracker); drop(pyr1); drop(pyr2); drop(pipeline); drop(gpu);
+        drop(tracker);
+        drop(pyr1);
+        drop(pyr2);
+        drop(pipeline);
+        drop(gpu);
     }
 
     #[test]
@@ -990,7 +1163,11 @@ mod tests {
         assert!((dx - 1.5).abs() < 0.5, "subpixel dx={dx:.3}, expected ~1.5");
         assert!((dy - 0.5).abs() < 0.5, "subpixel dy={dy:.3}, expected ~0.5");
         println!("GPU_TEST_OK");
-        drop(tracker); drop(pyr1); drop(pyr2); drop(pipeline); drop(gpu);
+        drop(tracker);
+        drop(pyr1);
+        drop(pyr2);
+        drop(pipeline);
+        drop(gpu);
     }
 
     #[test]
@@ -1001,7 +1178,11 @@ mod tests {
         // rebuilt and consumed in the same command buffer, as in the Fused
         // frontend (the only structure verified on Tegra).
         let gpu = GpuDevice::new().unwrap();
-        if !gpu.device.features().contains(wgpu::Features::FLOAT32_FILTERABLE) {
+        if !gpu
+            .device
+            .features()
+            .contains(wgpu::Features::FLOAT32_FILTERABLE)
+        {
             eprintln!("[test] FLOAT32_FILTERABLE unsupported — skipping");
             println!("GPU_TEST_OK");
             return;
@@ -1019,7 +1200,10 @@ mod tests {
         };
         let (img1, img2) = (blob(48.0, 48.0), blob(49.3, 47.6));
         let pipeline = GpuPyramidPipeline::new(&gpu);
-        let (p1, p2) = (pipeline.allocate(&gpu, w, h, 3), pipeline.allocate(&gpu, w, h, 3));
+        let (p1, p2) = (
+            pipeline.allocate(&gpu, w, h, 3),
+            pipeline.allocate(&gpu, w, h, 3),
+        );
         let features = vec![feat(40.0, 44.0), feat(52.0, 50.0), feat(46.0, 55.0)];
 
         let mut run = |sampling: KltSampling| {
@@ -1040,10 +1224,14 @@ mod tests {
             assert_eq!(m.status, TrackStatus::Tracked);
             assert_eq!(hw.status, TrackStatus::Tracked);
             let (dx, dy) = (hw.feature.x - m.feature.x, hw.feature.y - m.feature.y);
-            eprintln!("[test] manual ({:.4}, {:.4})  hardware ({:.4}, {:.4})",
-                m.feature.x, m.feature.y, hw.feature.x, hw.feature.y);
-            assert!(dx.abs() < 0.05 && dy.abs() < 0.05,
-                "hardware vs manual differ by ({dx:.4}, {dy:.4}) px");
+            eprintln!(
+                "[test] manual ({:.4}, {:.4})  hardware ({:.4}, {:.4})",
+                m.feature.x, m.feature.y, hw.feature.x, hw.feature.y
+            );
+            assert!(
+                dx.abs() < 0.05 && dy.abs() < 0.05,
+                "hardware vs manual differ by ({dx:.4}, {dy:.4}) px"
+            );
         }
         println!("GPU_TEST_OK");
     }

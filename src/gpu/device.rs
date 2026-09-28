@@ -258,16 +258,22 @@ impl GpuDevice {
         // Tier 1: real hardware GPU.
         let adapter = all_adapters
             .into_iter()
-            .find(|a| matches!(
-                a.get_info().device_type,
-                wgpu::DeviceType::DiscreteGpu | wgpu::DeviceType::IntegratedGpu
-                    | wgpu::DeviceType::VirtualGpu | wgpu::DeviceType::Other
-            ))
+            .find(|a| {
+                matches!(
+                    a.get_info().device_type,
+                    wgpu::DeviceType::DiscreteGpu
+                        | wgpu::DeviceType::IntegratedGpu
+                        | wgpu::DeviceType::VirtualGpu
+                        | wgpu::DeviceType::Other
+                )
+            })
             // Tier 2 (last resort): take whatever exists, even if Cpu/software.
-            .or_else(|| instance
-                .enumerate_adapters(wgpu::Backends::VULKAN)
-                .into_iter()
-                .next())
+            .or_else(|| {
+                instance
+                    .enumerate_adapters(wgpu::Backends::VULKAN)
+                    .into_iter()
+                    .next()
+            })
             .ok_or(GpuError::NoSuitableAdapter)?;
 
         let raw_info = adapter.get_info();
@@ -502,7 +508,7 @@ mod tests {
         // Native default: 16×8
         let (dx, dy) = gpu.dispatch_size(640, 480);
         assert_eq!(dx, 640 / 16); // 40
-        assert_eq!(dy, 480 / 8);  // 60
+        assert_eq!(dy, 480 / 8); // 60
     }
 
     #[test]
@@ -619,7 +625,8 @@ mod tests {
     #[ignore = "GPU integration: run via outer subprocess wrapper"]
     fn inner_set_workgroup_size_valid() {
         let mut gpu = GpuDevice::new_with_profile(DeviceProfile::RaspberryPi).unwrap();
-        gpu.set_workgroup_size(16, 16).expect("256 should be valid on RPi profile");
+        gpu.set_workgroup_size(16, 16)
+            .expect("256 should be valid on RPi profile");
         assert_eq!(gpu.workgroup_size.total(), 256);
         println!("GPU_TEST_OK");
     }
@@ -629,7 +636,13 @@ mod tests {
     fn inner_set_workgroup_size_too_large() {
         let mut gpu = GpuDevice::new_with_profile(DeviceProfile::RaspberryPi).unwrap();
         let err = gpu.set_workgroup_size(16, 17).unwrap_err();
-        assert!(matches!(err, GpuError::WorkgroupTooLarge { total: 272, max: 256 }));
+        assert!(matches!(
+            err,
+            GpuError::WorkgroupTooLarge {
+                total: 272,
+                max: 256
+            }
+        ));
         println!("GPU_TEST_OK");
     }
 
@@ -639,32 +652,46 @@ mod tests {
     #[ignore = "requires a real Vulkan GPU"]
     fn test_gpu_device_init_native() {
         let out = run_gpu_test_in_subprocess("gpu::device::tests::inner_gpu_device_init_native");
-        assert!(out.contains("GPU_TEST_OK"), "inner test did not print GPU_TEST_OK:
-{out}");
+        assert!(
+            out.contains("GPU_TEST_OK"),
+            "inner test did not print GPU_TEST_OK:
+{out}"
+        );
     }
 
     #[test]
     #[ignore = "requires a real Vulkan GPU"]
     fn test_gpu_device_init_rpi_profile() {
-        let out = run_gpu_test_in_subprocess("gpu::device::tests::inner_gpu_device_init_rpi_profile");
-        assert!(out.contains("GPU_TEST_OK"), "inner test did not print GPU_TEST_OK:
-{out}");
+        let out =
+            run_gpu_test_in_subprocess("gpu::device::tests::inner_gpu_device_init_rpi_profile");
+        assert!(
+            out.contains("GPU_TEST_OK"),
+            "inner test did not print GPU_TEST_OK:
+{out}"
+        );
     }
 
     #[test]
     #[ignore = "requires a real Vulkan GPU"]
     fn test_set_workgroup_size_valid() {
         let out = run_gpu_test_in_subprocess("gpu::device::tests::inner_set_workgroup_size_valid");
-        assert!(out.contains("GPU_TEST_OK"), "inner test did not print GPU_TEST_OK:
-{out}");
+        assert!(
+            out.contains("GPU_TEST_OK"),
+            "inner test did not print GPU_TEST_OK:
+{out}"
+        );
     }
 
     #[test]
     #[ignore = "requires a real Vulkan GPU"]
     fn test_set_workgroup_size_too_large() {
-        let out = run_gpu_test_in_subprocess("gpu::device::tests::inner_set_workgroup_size_too_large");
-        assert!(out.contains("GPU_TEST_OK"), "inner test did not print GPU_TEST_OK:
-{out}");
+        let out =
+            run_gpu_test_in_subprocess("gpu::device::tests::inner_set_workgroup_size_too_large");
+        assert!(
+            out.contains("GPU_TEST_OK"),
+            "inner test did not print GPU_TEST_OK:
+{out}"
+        );
     }
 
     // ---- Stub for tests that don't need a real device ----
@@ -724,7 +751,10 @@ mod tests {
 
         let info = adapter.get_info();
         println!("=== Texture Format Support ===");
-        println!("Adapter: {} ({:?}, {:?})", info.name, info.backend, info.device_type);
+        println!(
+            "Adapter: {} ({:?}, {:?})",
+            info.name, info.backend, info.device_type
+        );
 
         // 1. Device-level feature flag
         let features = adapter.features();
@@ -765,9 +795,7 @@ mod tests {
     #[test]
     #[ignore = "requires a real Vulkan GPU"]
     fn test_texture_format_support() {
-        let out = run_gpu_test_in_subprocess(
-            "gpu::device::tests::inner_texture_format_support",
-        );
+        let out = run_gpu_test_in_subprocess("gpu::device::tests::inner_texture_format_support");
         assert!(
             out.contains("GPU_TEST_OK"),
             "inner test did not print GPU_TEST_OK:\n{out}"
