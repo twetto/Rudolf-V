@@ -112,6 +112,20 @@ pub struct GpuPyramid {
     /// Pyramid levels, finest (index 0) to coarsest. Level 0 is at the
     /// source image resolution; level n is approximately 1/2^n scale.
     pub levels: Vec<GpuPyramidLevel>,
+    /// Upload texture + pre-built bind groups, present only for pyramids
+    /// created by [`GpuPyramidPipeline::allocate`] (the per-frame reuse path).
+    persistent: Option<PersistentResources>,
+}
+
+/// Resources that let a pyramid be rebuilt in place every frame without any
+/// allocation: the R8Uint upload texture and the bind groups for the convert
+/// pass and each blur+downsample pass. Params buffers are kept alive here
+/// because the bind groups reference them.
+struct PersistentResources {
+    raw: wgpu::Texture,
+    convert_bg: wgpu::BindGroup,
+    level_bgs: Vec<wgpu::BindGroup>,
+    _params_bufs: Vec<wgpu::Buffer>,
 }
 
 impl GpuPyramid {
@@ -265,6 +279,8 @@ impl PyramidParams {
 pub struct GpuPyramidPipeline {
     pipeline: wgpu::ComputePipeline,
     bgl: wgpu::BindGroupLayout,
+    convert_pipeline: wgpu::ComputePipeline,
+    convert_bgl: wgpu::BindGroupLayout,
 }
 
 impl GpuPyramidPipeline {
@@ -348,7 +364,222 @@ impl GpuPyramidPipeline {
                 cache: None,
             });
 
-        GpuPyramidPipeline { pipeline, bgl }
+        // u8 → f32 level-0 conversion pass (persistent path only).
+        let convert_src = include_str!("../shaders/pyramid_convert.wgsl")
+            .replace("{{WG_X}}", &gpu.workgroup_size.x.to_string())
+            .replace("{{WG_Y}}", &gpu.workgroup_size.y.to_string());
+        let convert_shader = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("pyramid_convert.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(convert_src.into()),
+        });
+        let convert_bgl = gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("GpuPyramid convert BGL"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Uint,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::R32Float,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let convert_layout =
+            gpu.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("GpuPyramid convert layout"),
+                bind_group_layouts: &[&convert_bgl],
+                push_constant_ranges: &[],
+            });
+        let convert_pipeline =
+            gpu.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("convert_u8"),
+                layout: Some(&convert_layout),
+                module: &convert_shader,
+                entry_point: "convert_u8",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+
+        GpuPyramidPipeline { pipeline, bgl, convert_pipeline, convert_bgl }
+    }
+
+    /// Allocate a pyramid for in-place rebuilding with [`record_rebuild`].
+    ///
+    /// All textures, uniform buffers and bind groups are created here once;
+    /// rebuilding the pyramid for a new frame then costs one
+    /// `queue.write_texture` of the raw u8 pixels plus `num_levels` compute
+    /// passes recorded into the caller's encoder — no allocation.
+    ///
+    /// [`record_rebuild`]: GpuPyramidPipeline::record_rebuild
+    pub fn allocate(
+        &self,
+        gpu: &GpuDevice,
+        width: usize,
+        height: usize,
+        num_levels: usize,
+    ) -> GpuPyramid {
+        assert!(num_levels >= 1, "pyramid must have at least 1 level");
+        let kernel = [1.0 / 16.0, 4.0 / 16.0, 6.0 / 16.0, 4.0 / 16.0, 1.0 / 16.0];
+
+        let (w0, h0) = (width as u32, height as u32);
+        let raw = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("pyramid raw u8"),
+            size: wgpu::Extent3d { width: w0, height: h0, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Uint,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let raw_view = raw.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut levels = Vec::with_capacity(num_levels);
+        levels.push(GpuPyramidLevel::new(&gpu.device, w0, h0, "pyramid level 0"));
+        for lvl_idx in 1..num_levels {
+            let prev = &levels[lvl_idx - 1];
+            let (dst_w, dst_h) = ((prev.width / 2).max(1), (prev.height / 2).max(1));
+            let label = format!("pyramid level {lvl_idx}");
+            levels.push(GpuPyramidLevel::new(&gpu.device, dst_w, dst_h, &label));
+        }
+
+        let convert_bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("pyramid convert bind group"),
+            layout: &self.convert_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&raw_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&levels[0].write_view),
+                },
+            ],
+        });
+
+        let mut params_bufs = Vec::with_capacity(num_levels.saturating_sub(1));
+        let mut level_bgs = Vec::with_capacity(num_levels.saturating_sub(1));
+        for lvl_idx in 1..num_levels {
+            let (prev, curr) = (&levels[lvl_idx - 1], &levels[lvl_idx]);
+            let params = PyramidParams::new(curr.width, curr.height, &kernel);
+            let params_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("PyramidParams"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            level_bgs.push(gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("pyramid level bind group"),
+                layout: &self.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&prev.read_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&curr.write_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: params_buf.as_entire_binding(),
+                    },
+                ],
+            }));
+            params_bufs.push(params_buf);
+        }
+
+        GpuPyramid {
+            levels,
+            persistent: Some(PersistentResources {
+                raw,
+                convert_bg,
+                level_bgs,
+                _params_bufs: params_bufs,
+            }),
+        }
+    }
+
+    /// Rebuild a pyramid from [`allocate`] in place for a new frame.
+    ///
+    /// The u8 pixels are staged immediately via `queue.write_texture`; the
+    /// convert and blur+downsample passes are recorded into `encoder`, so the
+    /// whole pyramid runs in the same submit as the stages that consume it.
+    /// The caller must not rebuild a pyramid that an in-flight submission is
+    /// still reading (the frontend waits on every frame, so ping-ponging two
+    /// pyramids is safe).
+    ///
+    /// Output is identical to [`build`] for the same source image.
+    ///
+    /// [`allocate`]: GpuPyramidPipeline::allocate
+    /// [`build`]: GpuPyramidPipeline::build
+    pub fn record_rebuild(
+        &self,
+        gpu: &GpuDevice,
+        encoder: &mut wgpu::CommandEncoder,
+        src: &Image<u8>,
+        pyr: &GpuPyramid,
+    ) {
+        let res = pyr
+            .persistent
+            .as_ref()
+            .expect("record_rebuild needs a pyramid from GpuPyramidPipeline::allocate");
+        let (w, h) = (pyr.levels[0].width, pyr.levels[0].height);
+        assert_eq!(
+            (src.width() as u32, src.height() as u32),
+            (w, h),
+            "source image size does not match the allocated pyramid"
+        );
+
+        gpu.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &res.raw,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            src.as_slice(),
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(src.stride() as u32),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("pyramid convert_u8"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.convert_pipeline);
+            pass.set_bind_group(0, &res.convert_bg, &[]);
+            let (dx, dy) = gpu.dispatch_size(w, h);
+            pass.dispatch_workgroups(dx, dy, 1);
+        }
+        for (bg, lvl) in res.level_bgs.iter().zip(&pyr.levels[1..]) {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("blur_downsample"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, bg, &[]);
+            let (dx, dy) = gpu.dispatch_size(lvl.width, lvl.height);
+            pass.dispatch_workgroups(dx, dy, 1);
+        }
     }
 
     /// Build a GPU pyramid from a CPU source image.
@@ -446,7 +677,7 @@ impl GpuPyramidPipeline {
 
         gpu.queue.submit(std::iter::once(encoder.finish()));
 
-        GpuPyramid { levels }
+        GpuPyramid { levels, persistent: None }
     }
 }
 
@@ -742,7 +973,45 @@ mod tests {
         drop(gpu);
     }
 
+    #[test]
+    #[ignore = "GPU integration: run via outer subprocess wrapper"]
+    fn inner_rebuild_matches_build() {
+        // The persistent path (allocate + record_rebuild) must produce exactly
+        // the same levels as build(), including when a slot is rebuilt with a
+        // different image (no stale data from the previous contents).
+        let mut rng = 4242u32;
+        let mut next = || { rng = rng.wrapping_mul(1664525).wrapping_add(1013904223); (rng >> 24) as u8 };
+        let img_a = Image::<u8>::from_vec(150, 94, (0..150 * 94).map(|_| next()).collect());
+        let img_b = Image::<u8>::from_vec(150, 94, (0..150 * 94).map(|_| next()).collect());
+
+        let gpu = GpuDevice::new().expect("need Vulkan GPU");
+        let pipeline = GpuPyramidPipeline::new(&gpu);
+        let persistent = pipeline.allocate(&gpu, 150, 94, 4);
+
+        for img in [&img_a, &img_b, &img_a] {
+            let mut enc = gpu.device.create_command_encoder(&Default::default());
+            pipeline.record_rebuild(&gpu, &mut enc, img, &persistent);
+            gpu.queue.submit(std::iter::once(enc.finish()));
+            let reference = pipeline.build(&gpu, img, 4, 1.0);
+            for lvl in 0..4 {
+                assert_eq!(persistent.levels[lvl].width, reference.levels[lvl].width);
+                assert_eq!(persistent.levels[lvl].height, reference.levels[lvl].height);
+                let got = persistent.readback_level(&gpu, lvl);
+                let want = reference.readback_level(&gpu, lvl);
+                assert_eq!(got, want, "level {lvl} differs from build()");
+            }
+        }
+        println!("GPU_TEST_OK");
+    }
+
     // Outer wrappers ──────────────────────────────────────────────────────────
+
+    #[test]
+    #[ignore = "requires a real Vulkan GPU"]
+    fn test_rebuild_matches_build() {
+        let out = run_gpu_test_in_subprocess("gpu::pyramid::tests::inner_rebuild_matches_build");
+        assert!(out.contains("GPU_TEST_OK"), "inner test failed:\n{out}");
+    }
 
     #[test]
     #[ignore = "requires a real Vulkan GPU"]

@@ -10,22 +10,40 @@
 //   Stage              CPU or GPU   Notes
 //   ─────────────────  ───────────  ──────────────────────────────────────
 //   HistEq             CPU          Applied before GPU upload.
-//   Image upload       GPU          u8 → R32Float texture via staging buf.
+//   Image upload       GPU          u8 via write_texture, widened to R32Float on GPU.
 //   Pyramid build      GPU          GpuPyramidPipeline (Gaussian + downsample)
 //   KLT tracking       GPU          ┐
 //   FAST detection     GPU          ├─ Fused: one encoder, one submit, one poll
 //   NMS                GPU          ┘
+//   LBP verification   CPU          RI-LBP on the u8 input, same rules as CPU
+//   Reservoir pruning  CPU          TrackMeta scores, shared with frontend.rs
 //   Occupancy grid     CPU          OccupancyGrid — byte mask, trivial
 //   RANSAC             CPU          essential::estimate_essential_ransac — pure
 //                                   linear algebra on O(N) tracked positions
 //
 // PYRAMID LIFETIME
 // ─────────────────
-// Unlike the CPU frontend which double-buffers two Pyramid structs to avoid
-// re-allocation, GpuPyramid is cheap to recreate: it's just a set of
-// wgpu::Texture handles. The GPU driver manages the actual VRAM allocation
-// and typically reuses pages across frames. We store prev_pyramid as
-// Option<GpuPyramid> and build a fresh curr_pyramid each frame.
+// Like the CPU frontend, we double-buffer: two GpuPyramids are allocated once
+// (GpuPyramidPipeline::allocate) and alternate between "prev" and "curr".
+// Each frame rebuilds the curr slot in place (record_rebuild), so steady
+// state creates no textures, buffers or bind groups — the KLT and FAST bind
+// group caches only ever see these two pyramids. Reusing a slot is safe
+// because every frame waits for its submission before returning.
+//
+// SUBMISSION
+// ──────────
+// Fused (default, one wait per frame): upload + pyramid + KLT + FAST + NMS
+// are recorded into a single encoder. FAST always runs, even when the
+// reservoir is full before KLT: KLT losses (and RANSAC rejections) would
+// otherwise need a second blocking round-trip just for detection.
+//
+// Separate keeps the original flow: a fresh pyramid every frame (own
+// submit), then KLT and FAST as independent submits. It does not use the
+// persistent pyramids. On the Tegra Vulkan driver (wgpu 22), persistent
+// pyramid textures consumed by a *later* submit than the one that built them
+// intermittently read stale contents — output became nondeterministic.
+// Fused never does that: each pyramid is built and first consumed in one
+// command buffer. Keep that invariant if you restructure this.
 //
 // RANSAC NOTE
 // ────────────
@@ -40,10 +58,13 @@ use std::time::Instant;
 use crate::camera::CameraIntrinsics;
 use crate::essential::{self, BearingCorrespondence, RansacConfig};
 use crate::fast::Feature;
-use crate::frontend::{select_by_tile_deficit, FrameStats, TimingStats};
+use crate::frontend::{
+    compute_lbp_at, prune_low_reservoir_score, prune_overfull_tiles, select_by_tile_deficit,
+    FrameStats, LbpPolicy, TimingStats, TrackMeta,
+};
 use crate::gpu::device::GpuDevice;
 use crate::gpu::fast::{GpuFastDetector, NmsStrategy};
-use crate::gpu::klt::GpuKltTracker;
+use crate::gpu::klt::{GpuKltTracker, KltSampling};
 use crate::gpu::pyramid::{GpuPyramid, GpuPyramidPipeline};
 use crate::histeq::{self, HistEqMethod};
 use crate::image::Image;
@@ -59,17 +80,18 @@ use camera_geometry::{CameraModel, CameraProjection, Pixel};
 ///
 /// | Hardware                         | Recommended | Reason                                   |
 /// |----------------------------------|-------------|------------------------------------------|
-/// | iGPU / SoC (780M, Jetson, RPi5) | `Separate`  | Unified memory — driver scheduling wins  |
-/// | Discrete GPU (RTX, RX series)    | `Fused`     | Saves one PCIe `poll(Wait)` per frame    |
+/// `Fused` is the default and the fast path on every platform measured so
+/// far (Jetson Orin Nano: see README). `Separate` is the original pipeline,
+/// kept for comparison.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SubmitStrategy {
-    /// KLT and FAST submitted in separate encoders (default).
-    /// Better for iGPU / unified memory: driver schedules each independently,
-    /// GPU cache drains between stages.
-    #[default]
+    /// Original flow: fresh pyramid per frame, KLT and FAST in separate
+    /// submits with a CPU wait each.
     Separate,
-    /// KLT and FAST recorded into one encoder, one submit, one poll.
-    /// Better for discrete GPU where PCIe round-trips cost ~1–2 ms each.
+    /// Pyramid + KLT + FAST recorded into one encoder: one submit, one wait
+    /// per frame, persistent pyramids and bind groups (no per-frame
+    /// allocation). Default.
+    #[default]
     Fused,
 }
 
@@ -80,8 +102,8 @@ pub enum SubmitStrategy {
 /// GPU frontend always uses IC KLT and GPU FAST.
 #[derive(Clone)]
 pub struct GpuFrontendConfig {
-    /// GPU submit strategy: separate encoders (iGPU) or fused (discrete GPU).
-    /// See [`SubmitStrategy`] for guidance. Defaults to `Separate`.
+    /// GPU submit strategy: one fused submit per frame, or the original
+    /// separate submits. See [`SubmitStrategy`]. Defaults to `Fused`.
     pub submit_strategy: SubmitStrategy,
     /// NMS strategy: CPU readback (iGPU) or GPU NMS pass (discrete GPU).
     /// See [`NmsStrategy`] for guidance. Defaults to `Cpu`.
@@ -108,6 +130,23 @@ pub struct GpuFrontendConfig {
     pub klt_max_iter: usize,
     /// KLT convergence threshold in pixels.
     pub klt_epsilon: f32,
+    /// How KLT interpolates the pyramid: manual 4-tap bilinear (`Manual`,
+    /// default) or hardware texture filtering (`Hardware` / `Auto`, ~3% faster
+    /// frontend, slightly more KLT outliers; only verified with `Fused`).
+    /// See [`KltSampling`].
+    pub klt_sampling: KltSampling,
+    /// LBP descriptor verification (occlusion/drift detection), as in the
+    /// CPU frontend. Computed on the CPU from the (preprocessed) input image.
+    pub lbp_verification_enabled: bool,
+    /// Whether high LBP distance is metadata only or a hard reservoir reject.
+    pub lbp_policy: LbpPolicy,
+    /// Hamming distance threshold for `LbpPolicy::HardReject` (max bits).
+    pub lbp_threshold: u32,
+    /// Reject tracked reservoir points whose soft score falls below this
+    /// value. Negative infinity (default) disables score-based pruning.
+    pub min_reservoir_score: f32,
+    /// Prune only over-target coarse tiles by local reservoir score.
+    pub tile_reservoir_pruning_enabled: bool,
     /// Histogram equalization applied before GPU upload.
     /// Stabilizes brightness across frames when auto-exposure is active.
     pub histeq: HistEqMethod,
@@ -121,7 +160,7 @@ pub struct GpuFrontendConfig {
 impl Default for GpuFrontendConfig {
     fn default() -> Self {
         GpuFrontendConfig {
-            submit_strategy: SubmitStrategy::Separate,
+            submit_strategy: SubmitStrategy::Fused,
             nms_strategy: NmsStrategy::Cpu,
             fast_threshold: 20,
             fast_arc_length: 9,
@@ -134,6 +173,13 @@ impl Default for GpuFrontendConfig {
             klt_window: 7,
             klt_max_iter: 30,
             klt_epsilon: 0.01,
+            klt_sampling: KltSampling::Manual,
+            // Reservoir policy defaults match FrontendConfig::default().
+            lbp_verification_enabled: true,
+            lbp_policy: LbpPolicy::SoftPenalty,
+            lbp_threshold: 4,
+            min_reservoir_score: f32::NEG_INFINITY,
+            tile_reservoir_pruning_enabled: true,
             histeq: HistEqMethod::None,
             camera: None,
             ransac: RansacConfig::default(),
@@ -145,10 +191,31 @@ impl Default for GpuFrontendConfig {
 // GpuFrontend
 // ---------------------------------------------------------------------------
 
+/// State of a frame between `submit()` and `collect()`.
+struct PendingFrame {
+    /// histeq + pyramid timings measured in submit().
+    timing: TimingStats,
+    submit_secs: f64,
+    fused: bool,
+    /// KLT was run (fused: recorded) for this frame.
+    tracking: bool,
+    /// Features and metadata as they were at submit(), index-aligned with the
+    /// KLT results.
+    feats_snap: Vec<Feature>,
+    meta_snap: Vec<TrackMeta>,
+    /// Separate strategy only: this frame's fresh pyramid.
+    separate_pyr: Option<GpuPyramid>,
+    /// IDs dropped via drop_tracks() while in flight.
+    dropped: Vec<u64>,
+    /// Set by reset(); drained by the next submit().
+    discarded: bool,
+}
+
 /// GPU visual frontend.
 ///
-/// Create once with `GpuFrontend::new()`; call `process()` every frame.
-/// GPU pipelines are compiled at construction time.
+/// Create once with `GpuFrontend::new()`; call `process()` every frame, or
+/// split it into `submit()` + `collect()` to overlap the GPU work with other
+/// CPU work. GPU pipelines are compiled at construction time.
 ///
 /// # Example
 /// ```text
@@ -167,6 +234,11 @@ impl Default for GpuFrontendConfig {
 ///     // features: &[Feature] with persistent IDs, ready for VIO backend
 ///     println!("{}", stats.timing);
 /// }
+///
+/// // Overlapped: run the backend on frame N while the GPU works on N+1.
+/// frontend.submit(&gpu, &frame_n1);
+/// backend.update(&features_n);          // may call frontend.drop_tracks(..)
+/// let (features_n1, _) = frontend.collect(&gpu);
 /// ```
 pub struct GpuFrontend {
     config: GpuFrontendConfig,
@@ -180,13 +252,24 @@ pub struct GpuFrontend {
     // CPU post-processing.
     grid: OccupancyGrid,
 
-    // Per-frame state.
-    prev_pyramid: Option<GpuPyramid>,
+    // Per-frame state. `pyramids[curr_slot]` is rebuilt each frame; the
+    // other slot holds the previous frame's pyramid.
+    pyramids: [GpuPyramid; 2],
+    curr_slot: usize,
+    // `SubmitStrategy::Separate` keeps the original flow instead: a fresh
+    // pyramid per frame, with the previous one held here. See SUBMISSION.
+    separate_prev: Option<GpuPyramid>,
     features: Vec<Feature>,
+    // Index-aligned with `features` (same semantics as the CPU frontend).
+    track_meta: Vec<TrackMeta>,
     prev_features: Vec<Feature>,
     next_id: u64,
-    histeq_buf: Image<u8>,
+    // This frame's (preprocessed) input, kept from submit() to collect() for
+    // LBP verification and new-feature descriptors.
+    input_buf: Image<u8>,
     has_prev: bool,
+    // Frame between submit() and collect().
+    pending: Option<PendingFrame>,
 
     img_w: usize,
     img_h: usize,
@@ -209,15 +292,20 @@ impl GpuFrontend {
             config.cell_size,
             config.nms_strategy,
         );
-        let klt = GpuKltTracker::new(
+        let klt = GpuKltTracker::new_with_sampling(
             gpu,
             config.klt_window,
             config.klt_max_iter,
             config.klt_epsilon,
             config.pyramid_levels,
             config.max_features,
+            config.klt_sampling,
         );
         let grid = OccupancyGrid::new(img_w, img_h, config.cell_size);
+        let pyramids = [
+            pyr_pipeline.allocate(gpu, img_w, img_h, config.pyramid_levels),
+            pyr_pipeline.allocate(gpu, img_w, img_h, config.pyramid_levels),
+        ];
 
         GpuFrontend {
             config,
@@ -226,9 +314,13 @@ impl GpuFrontend {
             fast,
             klt,
             grid,
-            prev_pyramid: None,
-            histeq_buf: Image::new(img_w, img_h),
+            pyramids,
+            curr_slot: 0,
+            separate_prev: None,
+            input_buf: Image::new(img_w, img_h),
             features: Vec::new(),
+            track_meta: Vec::new(),
+            pending: None,
             prev_features: Vec::new(),
             next_id: 1,
             has_prev: false,
@@ -237,41 +329,169 @@ impl GpuFrontend {
         }
     }
 
-    /// Process one frame. Returns the tracked feature list and statistics.
+    /// Process one frame (blocking). Returns the tracked feature list and
+    /// statistics. Equivalent to [`submit`] followed by [`collect`].
     ///
-    /// The returned `&[Feature]` slice is valid until the next `process()`
-    /// call. Feature IDs are persistent: a feature keeps its ID as long as
-    /// it tracks successfully.
+    /// The returned `&[Feature]` slice is valid until the next `process()` /
+    /// `collect()` call. Feature IDs are persistent: a feature keeps its ID as
+    /// long as it tracks successfully.
+    ///
+    /// [`submit`]: GpuFrontend::submit
+    /// [`collect`]: GpuFrontend::collect
     pub fn process<'a>(
         &'a mut self,
         gpu: &GpuDevice,
         image: &Image<u8>,
     ) -> (&'a [Feature], FrameStats) {
+        self.submit(gpu, image);
+        self.collect(gpu)
+    }
+
+    /// Start processing a frame without waiting for the GPU.
+    ///
+    /// Copies (or histogram-equalizes) `image` into an internal buffer, then —
+    /// with `SubmitStrategy::Fused` — records pyramid + KLT + FAST + NMS and
+    /// submits them. Returns as soon as the work is queued, so the calling
+    /// thread can do other work (e.g. the VIO backend on the previous frame's
+    /// features) while the GPU runs. Finish the frame with [`collect`].
+    ///
+    /// Tracks the features as they are *now*. [`drop_tracks`] may be called
+    /// between `submit` and `collect`; dropped IDs are removed from this
+    /// frame's results too.
+    ///
+    /// With `SubmitStrategy::Separate` only the pyramid is submitted here; KLT
+    /// and FAST run (blocking) inside `collect`.
+    ///
+    /// # Panics
+    /// If the previous submitted frame has not been collected.
+    ///
+    /// [`collect`]: GpuFrontend::collect
+    /// [`drop_tracks`]: GpuFrontend::drop_tracks
+    pub fn submit(&mut self, gpu: &GpuDevice, image: &Image<u8>) {
+        if let Some(p) = &self.pending {
+            assert!(p.discarded, "GpuFrontend::submit: previous frame was not collected");
+            self.drain_discarded(gpu);
+        }
         assert_eq!(image.width(), self.img_w, "image width mismatch");
         assert_eq!(image.height(), self.img_h, "image height mismatch");
 
-        let t_total = Instant::now();
+        let t_start = Instant::now();
         let mut timing = TimingStats::default();
 
-        // ── Step 0: Histogram equalization (CPU, before GPU upload) ──────────
+        // ── Step 0: Histogram equalization / input copy (CPU) ────────────────
+        // `input_buf` holds this frame's (preprocessed) image until collect():
+        // LBP verification and new-feature descriptors read it there.
         let t0 = Instant::now();
-        let input: &Image<u8> = if self.config.histeq != HistEqMethod::None {
-            histeq::apply_histeq_into(image, self.config.histeq, &mut self.histeq_buf);
-            &self.histeq_buf
+        if self.config.histeq != HistEqMethod::None {
+            histeq::apply_histeq_into(image, self.config.histeq, &mut self.input_buf);
+        } else if self.input_buf.stride() == image.stride() {
+            self.input_buf.as_mut_slice().copy_from_slice(image.as_slice());
         } else {
-            image
-        };
+            self.input_buf = image.clone();
+        }
         timing.histeq = t0.elapsed().as_secs_f64();
 
-        // ── Step 1: Build GPU pyramid ────────────────────────────────────────
+        // ── Step 1: GPU pyramid (+ KLT + FAST when fused) ────────────────────
+        // Fused: rebuild the persistent curr slot and record KLT + FAST in the
+        //   same encoder; one submit, no wait.
+        // Separate: build a fresh pyramid with its own submit (original path);
+        //   KLT and FAST run in collect().
         let t0 = Instant::now();
-        let curr_pyramid = self.pyr_pipeline.build(
-            gpu,
-            input,
-            self.config.pyramid_levels,
-            self.config.pyramid_sigma,
-        );
+        let fused = self.config.submit_strategy == SubmitStrategy::Fused;
+        let curr = self.curr_slot;
+        let prev = 1 - curr;
+        let can_track = self.has_prev && !self.features.is_empty();
+        let feats_snap: Vec<Feature> = if can_track { self.features.clone() } else { Vec::new() };
+        let meta_snap: Vec<TrackMeta> = if can_track { self.track_meta.clone() } else { Vec::new() };
+        let mut tracking = false;
+        let mut separate_pyr = None;
+
+        if fused {
+            let mut encoder = gpu
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("GpuFrontend frame"),
+                });
+            self.pyr_pipeline
+                .record_rebuild(gpu, &mut encoder, &self.input_buf, &self.pyramids[curr]);
+            tracking = can_track
+                && self.klt.prepare(
+                    gpu,
+                    &feats_snap,
+                    &self.pyramids[prev],
+                    &self.pyramids[curr],
+                );
+            if tracking {
+                self.klt.record_into(&mut encoder);
+            }
+            self.fast
+                .record_into(gpu, &mut encoder, &self.pyramids[curr].levels[0]);
+            gpu.queue.submit(std::iter::once(encoder.finish()));
+            if tracking {
+                self.klt.arm_readback();
+            }
+            self.fast.arm_readback();
+        } else {
+            separate_pyr = Some(self.pyr_pipeline.build(
+                gpu,
+                &self.input_buf,
+                self.config.pyramid_levels,
+                self.config.pyramid_sigma,
+            ));
+            tracking = can_track && self.separate_prev.is_some();
+        }
         timing.pyramid = t0.elapsed().as_secs_f64();
+
+        self.pending = Some(PendingFrame {
+            timing,
+            submit_secs: t_start.elapsed().as_secs_f64(),
+            fused,
+            tracking,
+            feats_snap,
+            meta_snap,
+            separate_pyr,
+            dropped: Vec::new(),
+            discarded: false,
+        });
+    }
+
+    /// Non-blocking check: `true` once the GPU work of the submitted frame has
+    /// finished, i.e. [`collect`] will not wait for the GPU.
+    ///
+    /// [`collect`]: GpuFrontend::collect
+    pub fn poll_ready(&self, gpu: &GpuDevice) -> bool {
+        gpu.device.poll(wgpu::Maintain::Poll).is_queue_empty()
+    }
+
+    /// Whether a frame has been submitted and not yet collected.
+    pub fn is_pending(&self) -> bool {
+        self.pending.as_ref().is_some_and(|p| !p.discarded)
+    }
+
+    /// Finish the frame started by [`submit`]: wait for the GPU (if it is still
+    /// running), then LBP verification, RANSAC, reservoir pruning and
+    /// replenishment on the CPU. Returns the tracked feature list and stats.
+    ///
+    /// `stats.timing.total` counts only time spent inside `submit` and
+    /// `collect`, not the caller's work in between.
+    ///
+    /// On the Jetson Orin Nano the driver's GPU wait spins a CPU core; to use
+    /// the GPU time for other work, call `collect` late or check
+    /// [`poll_ready`] first.
+    ///
+    /// # Panics
+    /// If no frame was submitted.
+    ///
+    /// [`submit`]: GpuFrontend::submit
+    /// [`poll_ready`]: GpuFrontend::poll_ready
+    pub fn collect<'a>(&'a mut self, gpu: &GpuDevice) -> (&'a [Feature], FrameStats) {
+        let p = self
+            .pending
+            .take()
+            .filter(|p| !p.discarded)
+            .expect("GpuFrontend::collect: no frame submitted");
+        let t_collect = Instant::now();
+        let mut timing = p.timing.clone();
 
         let mut stats = FrameStats {
             tracked: 0,
@@ -284,87 +504,74 @@ impl GpuFrontend {
             timing: TimingStats::default(),
         };
 
-        // ── Step 2: KLT tracking ─────────────────────────────────────────────
-        //
-        // `Separate` (default): one submit per stage — better for iGPU/unified
-        //   memory where poll(Wait) is cheap and driver scheduling helps.
-        // `Fused`: KLT + FAST in one encoder, one submit, one poll — better for
-        //   discrete GPU where each PCIe round-trip costs ~1–2 ms.
-
+        // ── Step 2: KLT results (+ LBP verification, CPU) ────────────────────
         let t0 = Instant::now();
-        let slots_before_klt = self.config.max_features.saturating_sub(self.features.len());
-
-        // `winners` is populated differently depending on strategy:
-        // Separate — filled in Step 4 after KLT.
-        // Fused    — filled here alongside KLT results.
-        let fused_winners: Option<Vec<Feature>> = if self.config.submit_strategy
-            == SubmitStrategy::Fused
-            && self.has_prev
-            && !self.features.is_empty()
-        {
-            let feats_snap: Vec<Feature> = self.features.clone();
-            let prev = self.prev_pyramid.as_ref().unwrap();
-
-            self.klt.prepare(gpu, &feats_snap, prev, &curr_pyramid);
-
-            let mut encoder = gpu
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("GpuFrontend fused"),
-                });
-            self.klt.record_into(&mut encoder);
-            if slots_before_klt > 0 {
-                self.fast
-                    .record_into(gpu, &mut encoder, &curr_pyramid.levels[0]);
-            }
-            gpu.queue.submit(std::iter::once(encoder.finish()));
-
-            self.klt.arm_readback();
-            if slots_before_klt > 0 {
-                self.fast.arm_readback();
-            }
+        let (results, fused_winners) = if p.fused {
             gpu.device.poll(wgpu::Maintain::Wait);
-
-            let results = self.klt.collect_results(&feats_snap);
-            let detected = if slots_before_klt > 0 {
-                self.fast.collect_winners(0)
+            let results = if p.tracking {
+                self.klt.collect_results(&p.feats_snap)
             } else {
                 Vec::new()
             };
-
-            let mut write = 0;
-            for result in &results {
-                if result.status == TrackStatus::Tracked {
-                    self.features[write] = result.feature.clone();
-                    write += 1;
-                    stats.tracked += 1;
-                } else {
-                    stats.lost += 1;
-                }
-            }
-            self.features.truncate(write);
-            Some(detected)
+            (results, Some(self.fast.collect_winners(0)))
         } else {
-            // Separate: run KLT standalone; FAST runs independently in Step 4.
-            if self.has_prev && !self.features.is_empty() {
-                let feats_snap: Vec<Feature> = self.features.clone();
-                let prev = self.prev_pyramid.as_ref().unwrap();
-                let results = self.klt.track(gpu, prev, &curr_pyramid, &feats_snap);
+            let curr_pyr = p.separate_pyr.as_ref().expect("separate pyramid built in submit");
+            let results = match (p.tracking, self.separate_prev.as_ref()) {
+                (true, Some(prev_pyr)) => self.klt.track(gpu, prev_pyr, curr_pyr, &p.feats_snap),
+                _ => Vec::new(),
+            };
+            (results, None)
+        };
 
-                let mut write = 0;
-                for result in &results {
-                    if result.status == TrackStatus::Tracked {
-                        self.features[write] = result.feature.clone();
-                        write += 1;
-                        stats.tracked += 1;
-                    } else {
-                        stats.lost += 1;
+        if p.tracking {
+            // Same rules as Frontend::process (CPU): LBP descriptor distance is
+            // track metadata under SoftPenalty and a hard reject under
+            // HardReject; a track whose LBP cannot be computed (too close to
+            // the border) is rejected under both.
+            let mut features = Vec::with_capacity(results.len());
+            let mut track_meta = Vec::with_capacity(results.len());
+            for (result, meta) in results.iter().zip(&p.meta_snap) {
+                if p.dropped.contains(&result.feature.id) {
+                    continue; // dropped by the caller while the frame was in flight
+                }
+                if result.status != TrackStatus::Tracked {
+                    stats.lost += 1;
+                    continue;
+                }
+                let feat = &result.feature;
+                let mut lbp_distance = 0u16;
+                if self.config.lbp_verification_enabled {
+                    let Some(new_desc) = compute_lbp_at(&self.input_buf, feat.x, feat.y) else {
+                        stats.rejected += 1;
+                        continue;
+                    };
+                    let dist = (new_desc ^ feat.descriptor).count_ones();
+                    lbp_distance = dist.min(u16::MAX as u32) as u16;
+                    if self.config.lbp_policy == LbpPolicy::HardReject
+                        && dist > self.config.lbp_threshold
+                    {
+                        stats.rejected += 1;
+                        continue;
                     }
                 }
-                self.features.truncate(write);
+                // The GPU tracker computes no residual; this matches the CPU
+                // frontend with klt_residual_enabled = false (its default).
+                track_meta.push(meta.advanced(
+                    feat,
+                    1.0,
+                    lbp_distance,
+                    self.img_w,
+                    self.img_h,
+                    self.config.cell_size,
+                    self.config.coarse_tile_cols,
+                    self.config.coarse_tile_rows,
+                ));
+                features.push(feat.clone());
+                stats.tracked += 1;
             }
-            None
-        };
+            self.features = features;
+            self.track_meta = track_meta;
+        }
         timing.klt = t0.elapsed().as_secs_f64();
 
         // ── Step 2b: Geometric verification (RANSAC, CPU) ────────────────────
@@ -405,29 +612,57 @@ impl GpuFrontend {
                         &self.config.ransac,
                     ) {
                         let mut inliers = Vec::new();
+                        let mut inlier_meta = Vec::new();
+                        let mut ransac_rejected = 0usize;
                         for (ci, (feat_idx, _)) in corrs.iter().enumerate() {
                             if result.inliers[ci] {
                                 inliers.push(self.features[*feat_idx].clone());
+                                inlier_meta.push(self.track_meta[*feat_idx].clone());
                             } else {
-                                stats.rejected += 1;
+                                ransac_rejected += 1;
                             }
                         }
                         let matched_ids: Vec<u64> = corrs
                             .iter()
                             .map(|(idx, _)| self.features[*idx].id)
                             .collect();
-                        for f in &self.features {
+                        for (idx, f) in self.features.iter().enumerate() {
                             if !matched_ids.contains(&f.id) {
                                 inliers.push(f.clone());
+                                inlier_meta.push(self.track_meta[idx].clone());
                             }
                         }
-                        stats.tracked = stats.tracked.saturating_sub(stats.rejected);
+                        stats.rejected += ransac_rejected;
+                        stats.tracked = stats.tracked.saturating_sub(ransac_rejected);
                         self.features = inliers;
+                        self.track_meta = inlier_meta;
                     }
                 }
             }
         }
         timing.ransac = t0.elapsed().as_secs_f64();
+
+        // ── Step 2c: Reservoir pruning (same as the CPU frontend) ────────────
+        let pruned = prune_low_reservoir_score(
+            &mut self.features,
+            &mut self.track_meta,
+            self.config.min_reservoir_score,
+        );
+        stats.rejected += pruned;
+        stats.tracked = stats.tracked.saturating_sub(pruned);
+        if self.config.tile_reservoir_pruning_enabled {
+            let pruned = prune_overfull_tiles(
+                &mut self.features,
+                &mut self.track_meta,
+                self.config.max_features,
+                self.img_w,
+                self.img_h,
+                self.config.coarse_tile_cols,
+                self.config.coarse_tile_rows,
+            );
+            stats.rejected += pruned;
+            stats.tracked = stats.tracked.saturating_sub(pruned);
+        }
 
         // ── Step 3: Update occupancy grid from surviving tracked features ─────
         self.grid.clear();
@@ -436,28 +671,34 @@ impl GpuFrontend {
         }
 
         // ── Step 4: Detect + replenish ────────────────────────────────────────
-        // slots computed after KLT — reflects true feature gap.
-        // Fused: winners already collected above; FAST ran in parallel with KLT.
+        // slots computed after KLT/RANSAC/pruning — reflects true feature gap.
+        // Fused: winners were computed on the GPU in the same submit as KLT.
         // Separate: run FAST now as its own submit.
         let t0 = Instant::now();
         let slots = self.config.max_features.saturating_sub(self.features.len());
 
         let winners = if let Some(w) = fused_winners {
-            w // already collected in fused KLT block above
+            w
         } else if slots > 0 {
-            self.fast.detect(gpu, &curr_pyramid.levels[0], 0)
+            let curr_pyr = p.separate_pyr.as_ref().expect("separate pyramid built in submit");
+            self.fast.detect(gpu, &curr_pyr.levels[0], 0)
         } else {
             Vec::new()
         };
 
         if slots > 0 {
-            let mask = self.grid.unoccupied_mask();
+            // Look winners up in the occupancy grid directly — same result as
+            // `unoccupied_mask()`, without filling a full-resolution mask image
+            // (that alone cost ~0.7 ms/frame on Jetson Orin Nano).
+            let cells = self.grid.grid_cells();
+            let cols = self.grid.grid_cols();
+            let cs = self.grid.cell_size();
             let unoccupied: Vec<Feature> = winners
                 .iter()
                 .filter_map(|f| {
                     let x = f.x as usize;
                     let y = f.y as usize;
-                    if x < mask.width() && y < mask.height() && mask.get(x, y) > 0 {
+                    if x < self.img_w && y < self.img_h && !cells[(y / cs) * cols + x / cs] {
                         Some(Feature {
                             x: f.x,
                             y: f.y,
@@ -481,33 +722,46 @@ impl GpuFrontend {
                 self.config.coarse_tile_cols,
                 self.config.coarse_tile_rows,
             );
-            let mut added = 0;
-            for f in &selected {
-                if added >= slots {
-                    break;
-                }
-                self.features.push(Feature {
+            for f in selected.iter().take(slots) {
+                // GPU FAST provides no descriptor; compute the RI-LBP on the
+                // (preprocessed) input exactly as the CPU frontend does for
+                // detectors without one.
+                let new_feat = Feature {
                     x: f.x,
                     y: f.y,
                     score: f.score,
                     level: f.level,
                     id: self.next_id,
-                    descriptor: 0,
-                });
+                    descriptor: compute_lbp_at(&self.input_buf, f.x, f.y).unwrap_or(0),
+                };
                 self.next_id += 1;
-                self.grid.mark(f.x, f.y);
+                self.track_meta.push(TrackMeta::new(
+                    &new_feat,
+                    1,
+                    0,
+                    self.img_w,
+                    self.img_h,
+                    self.config.cell_size,
+                    self.config.coarse_tile_cols,
+                    self.config.coarse_tile_rows,
+                ));
+                self.grid.mark(new_feat.x, new_feat.y);
+                self.features.push(new_feat);
                 stats.new_detections += 1;
-                added += 1;
             }
         }
         timing.detect = t0.elapsed().as_secs_f64();
 
         // ── Step 5: Advance state ─────────────────────────────────────────────
-        self.prev_pyramid = Some(curr_pyramid);
+        if p.fused {
+            self.curr_slot = 1 - self.curr_slot;
+        } else {
+            self.separate_prev = p.separate_pyr;
+        }
         self.prev_features = self.features.clone();
         self.has_prev = true;
 
-        timing.total = t_total.elapsed().as_secs_f64();
+        timing.total = p.submit_secs + t_collect.elapsed().as_secs_f64();
         stats.total = self.features.len();
         stats.occupied_cells = self.grid.total_cells() - self.grid.count_empty();
         stats.timing = timing;
@@ -515,9 +769,32 @@ impl GpuFrontend {
         (&self.features, stats)
     }
 
+    /// Finish a frame that was discarded by `reset()` while in flight: wait
+    /// for its GPU work and unmap its readback buffers, so the next frame can
+    /// reuse them.
+    fn drain_discarded(&mut self, gpu: &GpuDevice) {
+        let Some(p) = self.pending.take() else { return };
+        debug_assert!(p.discarded);
+        if p.fused {
+            gpu.device.poll(wgpu::Maintain::Wait);
+            if p.tracking {
+                let _ = self.klt.collect_results(&p.feats_snap);
+            }
+            let _ = self.fast.collect_winners(0);
+        }
+    }
+
     /// Currently tracked features (without processing a new frame).
     pub fn features(&self) -> &[Feature] {
         &self.features
+    }
+
+    /// Metadata for the current feature list, index-aligned with
+    /// [`features`](GpuFrontend::features). Same semantics as
+    /// [`Frontend::track_meta`](crate::frontend::Frontend::track_meta); the
+    /// GPU tracker has no residual, so `klt_quality` is always 1.0.
+    pub fn track_meta(&self) -> &[TrackMeta] {
+        &self.track_meta
     }
 
     /// Drop frontend tracks by feature ID.
@@ -527,14 +804,36 @@ impl GpuFrontend {
     /// tracked on the next frame and will disappear from the next vision
     /// measurement, allowing the backend to marginalize matching landmarks.
     ///
+    /// May be called between [`submit`](GpuFrontend::submit) and
+    /// [`collect`](GpuFrontend::collect): the IDs are then also removed from
+    /// the in-flight frame's results.
+    ///
     /// Returns the number of active tracks removed.
     pub fn drop_tracks(&mut self, ids: &[u64]) -> usize {
-        if ids.is_empty() || self.features.is_empty() {
+        if ids.is_empty() {
+            return 0;
+        }
+        if let Some(p) = self.pending.as_mut().filter(|p| !p.discarded) {
+            p.dropped.extend_from_slice(ids);
+        }
+        if self.features.is_empty() {
             return 0;
         }
 
         let before = self.features.len();
-        self.features.retain(|feature| !ids.contains(&feature.id));
+        let mut write = 0usize;
+        for read in 0..self.features.len() {
+            if ids.contains(&self.features[read].id) {
+                continue;
+            }
+            if write != read {
+                self.features[write] = self.features[read].clone();
+                self.track_meta[write] = self.track_meta[read].clone();
+            }
+            write += 1;
+        }
+        self.features.truncate(write);
+        self.track_meta.truncate(write);
         self.prev_features
             .retain(|feature| !ids.contains(&feature.id));
 
@@ -543,7 +842,7 @@ impl GpuFrontend {
             self.grid.mark(feature.x, feature.y);
         }
 
-        before - self.features.len()
+        before - write
     }
 
     /// Whether at least one frame has been processed.
@@ -554,11 +853,18 @@ impl GpuFrontend {
     /// Reset frontend state (features, previous frame, occupancy grid).
     /// Does NOT reset next_id — feature IDs remain globally unique.
     /// Does NOT recompile shaders.
+    ///
+    /// A frame submitted but not yet collected is discarded (its GPU work is
+    /// drained on the next `submit`).
     pub fn reset(&mut self) {
+        if let Some(p) = self.pending.as_mut() {
+            p.discarded = true;
+        }
         self.has_prev = false;
         self.features.clear();
+        self.track_meta.clear();
         self.prev_features.clear();
-        self.prev_pyramid = None;
+        self.separate_prev = None;
         self.grid.clear();
     }
 
@@ -779,6 +1085,140 @@ mod tests {
         println!("GPU_TEST_OK");
     }
 
+    /// Scene with enough texture that LBP descriptors are well defined.
+    fn textured_scene(shift_x: usize, shift_y: usize) -> Image<u8> {
+        let (w, h) = (160usize, 120usize);
+        let mut img = make_scene(w, h, shift_x, shift_y);
+        for y in 0..h {
+            for x in 0..w {
+                let (sx, sy) = (x.wrapping_sub(shift_x), y.wrapping_sub(shift_y));
+                let v = img.get(x, y) as u32 + ((sx.wrapping_mul(7) ^ sy.wrapping_mul(13)) % 23) as u32;
+                img.set(x, y, v.min(255) as u8);
+            }
+        }
+        img
+    }
+
+    fn snapshot(fe: &GpuFrontend) -> Vec<(u64, u32, u32, u16, u16)> {
+        fe.features()
+            .iter()
+            .zip(fe.track_meta())
+            .map(|(f, m)| (f.id, f.x.to_bits(), f.y.to_bits(), f.descriptor, m.age))
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "GPU integration"]
+    fn inner_split_matches_process() {
+        let gpu = GpuDevice::new().unwrap();
+        let config = GpuFrontendConfig { max_features: 40, ..Default::default() };
+        let mut a = GpuFrontend::new(&gpu, config.clone(), 160, 120);
+        let mut b = GpuFrontend::new(&gpu, config, 160, 120);
+        for i in 0..6usize {
+            let img = textured_scene(i * 2, i);
+            a.process(&gpu, &img);
+            b.submit(&gpu, &img);
+            assert!(b.is_pending());
+            b.collect(&gpu);
+            assert!(!b.is_pending());
+            assert_eq!(snapshot(&a), snapshot(&b), "frame {i}: split differs from process");
+        }
+        println!("GPU_TEST_OK");
+    }
+
+    #[test]
+    #[ignore = "GPU integration"]
+    fn inner_track_meta_aligned() {
+        let gpu = GpuDevice::new().unwrap();
+        let config = GpuFrontendConfig { max_features: 40, ..Default::default() };
+        let mut fe = GpuFrontend::new(&gpu, config, 160, 120);
+        for i in 0..5usize {
+            fe.process(&gpu, &textured_scene(i * 2, i));
+            assert_eq!(fe.features().len(), fe.track_meta().len());
+            for (f, m) in fe.features().iter().zip(fe.track_meta()) {
+                assert_eq!(f.id, m.id, "meta not index-aligned");
+                assert!(m.age >= 1);
+            }
+        }
+        // Tracks surviving 5 frames have aged.
+        assert!(fe.track_meta().iter().any(|m| m.age > 1), "no track aged");
+        // New GPU-detected features get an RI-LBP descriptor on the CPU.
+        assert!(fe.features().iter().any(|f| f.descriptor != 0), "no descriptors computed");
+        println!("GPU_TEST_OK");
+    }
+
+    #[test]
+    #[ignore = "GPU integration"]
+    fn inner_drop_tracks_in_flight() {
+        let gpu = GpuDevice::new().unwrap();
+        let config = GpuFrontendConfig { max_features: 40, ..Default::default() };
+        let mut fe = GpuFrontend::new(&gpu, config, 160, 120);
+        fe.process(&gpu, &textured_scene(0, 0));
+        let ids: Vec<u64> = fe.features().iter().take(3).map(|f| f.id).collect();
+        assert_eq!(ids.len(), 3);
+
+        fe.submit(&gpu, &textured_scene(2, 1));
+        assert_eq!(fe.drop_tracks(&ids), 3);
+        let (features, _) = fe.collect(&gpu);
+        assert!(features.iter().all(|f| !ids.contains(&f.id)),
+            "dropped IDs came back from the in-flight frame");
+        assert_eq!(fe.features().len(), fe.track_meta().len());
+        println!("GPU_TEST_OK");
+    }
+
+    #[test]
+    #[ignore = "GPU integration"]
+    fn inner_reset_while_pending() {
+        let gpu = GpuDevice::new().unwrap();
+        let mut fe = GpuFrontend::new(&gpu, GpuFrontendConfig::default(), 160, 120);
+        fe.process(&gpu, &textured_scene(0, 0));
+        fe.submit(&gpu, &textured_scene(2, 1));
+        fe.reset();
+        assert!(!fe.is_pending());
+        // The discarded frame is drained; processing continues normally.
+        let (features, stats) = fe.process(&gpu, &textured_scene(0, 0));
+        assert!(!features.is_empty());
+        assert_eq!(stats.tracked, 0, "first frame after reset tracks nothing");
+        let (_, stats) = fe.process(&gpu, &textured_scene(2, 1));
+        assert!(stats.tracked > 0);
+        println!("GPU_TEST_OK");
+    }
+
+    #[test]
+    #[ignore = "GPU integration"]
+    fn inner_lbp_policies() {
+        // Mirrors frontend.rs test_lbp_{soft,hard}_policy_*: corrupt every
+        // stored descriptor, then re-process the same image.
+        let gpu = GpuDevice::new().unwrap();
+        let img = textured_scene(0, 0);
+        for policy in [LbpPolicy::SoftPenalty, LbpPolicy::HardReject] {
+            let config = GpuFrontendConfig {
+                max_features: 40,
+                lbp_policy: policy,
+                lbp_threshold: 0,
+                tile_reservoir_pruning_enabled: false,
+                ..Default::default()
+            };
+            let mut fe = GpuFrontend::new(&gpu, config, 160, 120);
+            fe.process(&gpu, &img);
+            for f in &mut fe.features {
+                f.descriptor = !f.descriptor;
+            }
+            let (_, stats) = fe.process(&gpu, &img);
+            match policy {
+                LbpPolicy::SoftPenalty => {
+                    assert!(stats.tracked > 0, "soft policy must not reject on LBP alone");
+                    assert!(fe.track_meta().iter().any(|m| m.lbp_distance > 0));
+                }
+                LbpPolicy::HardReject => {
+                    assert_eq!(stats.tracked, 0, "hard policy should reject mismatched descriptors");
+                    assert!(stats.rejected > 0);
+                }
+            }
+        }
+        println!("GPU_TEST_OK");
+    }
+
     // ---- outer subprocess wrappers ----------------------------------------
 
     macro_rules! gpu_test {
@@ -800,4 +1240,9 @@ mod tests {
     gpu_test!(test_replenishment, inner_replenishment_after_loss);
     gpu_test!(test_reset, inner_reset_clears_state);
     gpu_test!(test_three_frame_sequence, inner_three_frame_sequence);
+    gpu_test!(test_split_matches_process, inner_split_matches_process);
+    gpu_test!(test_track_meta_aligned, inner_track_meta_aligned);
+    gpu_test!(test_drop_tracks_in_flight, inner_drop_tracks_in_flight);
+    gpu_test!(test_reset_while_pending, inner_reset_while_pending);
+    gpu_test!(test_lbp_policies, inner_lbp_policies);
 }

@@ -164,6 +164,10 @@ back only per-cell winners (~17 KB), saving PCIe bandwidth on discrete hardware.
 | i5-12400F + RTX 3060 | 1.39ms | 1.95ms | Fused+Gpu | CPU |
 | AMD Radeon 780M (iGPU) | 1.00ms | 1.82ms | Fused+Gpu | CPU |
 | Raspberry Pi 4 | ~50ms | ~141ms | — | CPU (2.6×) |
+| Jetson Orin Nano (JetPack 6.2, V1_01_easy) | 3.55ms | 2.56ms | Fused+Gpu | **GPU (1.4×)** |
+
+The Jetson row is after the Phase 3c overhead removal below (before it: GPU
+~5.1ms). Other rows predate Phase 3c and have not been re-measured.
 
 **Why GPU is slower at this resolution:** At 752×480, individual GPU kernels
 complete in <0.1ms — well below wgpu's fixed per-dispatch overhead (~50–100μs
@@ -209,8 +213,81 @@ compute. Optimizations attempted and their outcomes:
 | `MAPPABLE_PRIMARY_BUFFERS` (STORAGE\|MAP_READ) | Eliminate readback copy on iGPU | No effect — copy was already free on unified memory |
 | Comparison with vilib CUDA architecture | Identify fundamental gaps | Confirmed: mapped pinned memory, ~5μs launch, no bind groups |
 
-Conclusion: at 752×480, the CPU pipeline wins on all current targets. GPU
-pipeline is retained for future higher-resolution use cases.
+Conclusion (at the time): at 752×480, the CPU pipeline won on all targets
+tested. Phase 3c revisited this and removed most of the per-frame host
+overhead.
+
+**Phase 3c — GPU per-frame overhead removal:**
+
+`SubmitStrategy::Fused` (now the default) no longer allocates anything per
+frame, and does one submit and one wait per frame:
+
+* Two persistent pyramids used alternately (`GpuPyramidPipeline::allocate` +
+  `record_rebuild`). The frame is uploaded as u8 via `queue.write_texture`
+  and widened to f32 on the GPU. Before this, the CPU converted it and a
+  1.4 MB staging buffer was allocated every frame.
+* KLT bind groups are cached per pyramid pair.
+* FAST is recorded into the fused submit every frame. KLT or RANSAC losses
+  no longer trigger a second blocking round-trip, which also fixes missed
+  replenishment after RANSAC rejections.
+* Replenishment looks winners up in the occupancy grid directly instead of
+  filling a full-resolution mask image (~0.7ms/frame on Jetson).
+
+Output is bit-identical to the original `Separate` pipeline over all 2912
+frames of EuRoC V1_01_easy. `Separate` keeps the original flow (fresh
+pyramid per frame). The persistent pyramids must be built and first
+consumed in the same command buffer. On the Tegra Vulkan driver (wgpu 22),
+reading them from a later submit intermittently returned stale texels. See
+the SUBMISSION note in `gpu/frontend.rs`.
+
+On Jetson, the GPU clock governor stays at the lowest clocks for this bursty
+load (306–510 MHz of 1020 MHz). Benchmark with `sudo jetson_clocks` to
+measure at locked clocks.
+
+**Phase 3e — CPU offload: split API + reservoir parity:**
+
+`GpuFrontend` is now a drop-in for the CPU `Frontend`'s default reservoir
+policy. It has LBP verification (soft/hard), per-track `TrackMeta`
+(`track_meta()`), reservoir-score and over-full-tile pruning, and
+`drop_tracks`. These run on the CPU through the same helpers as `frontend.rs`,
+with the same defaults.
+
+`process()` is now `submit()` + `collect()`. Work done between the two
+overlaps with the GPU. `drop_tracks()` may be called in between, and also
+removes the IDs from the frame in flight. On Jetson Orin Nano (V1_01_easy):
+
+| Backend work between submit/collect | 0 ms | 1 ms | 2 ms | 3 ms | 4 ms |
+|---|---|---|---|---|---|
+| Frame time | 3.01 | 3.01 | 3.04 | 3.87 | 4.87 |
+
+Up to ~2 ms of backend work per frame is free (3.0 ms instead of ~5 ms back
+to back). The CPU frontend spends 8.5–9 ms of CPU time per frame across ~2.5
+cores. The GPU frontend's CPU work is ~1 ms. Calling `collect()` too early
+wastes a core, because the Tegra driver spins while waiting. `poll_ready()`
+checks without blocking.
+
+Not ported yet: the forward-backward gate (`klt_fb_threshold_px`), the
+pose-prior epipolar gate, and non-FAST detectors.
+
+**Phase 3d — KLT hardware bilinear sampling (opt-in):**
+
+`KltSampling::Hardware` samples the pyramid through the texture unit instead
+of 4 `textureLoad`s. It needs `FLOAT32_FILTERABLE`, which `GpuDevice` now
+requests when the adapter has it. Results on Jetson Orin Nano:
+
+* KLT GPU time: 0.63 → 0.52 ms. Frontend: 2.57 → 2.49 ms.
+* Accuracy vs CPU IC-KLT: median 0.0015 px, p99 0.004 px. About 2× as many
+  ill-conditioned tracks run away (≈0.1% of tracks).
+* RANSAC rejects 0.6% more tracks over the whole sequence.
+
+It stays opt-in (`Manual` is the default) because the gain is small, and
+because it was badly nondeterministic outside `Fused` on Tegra (stale texture
+reads).
+
+This work also fixed a latent race in `klt_warp.wgsl`. Thread 0 wrote the
+Hessian inverse to a storage buffer and the other threads read it back after
+`workgroupBarrier()`. That barrier does not order storage memory, so it is
+now broadcast through workgroup memory.
 
 **Phase 3b — CPU SIMD optimization (active):**
 

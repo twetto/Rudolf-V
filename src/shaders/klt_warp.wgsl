@@ -93,32 +93,21 @@ var<workgroup> sh_c: array<f32, {{WG_SIZE}}>;   // reduction scratch C
 var<workgroup> sh_dx: f32;                       // broadcast dx
 var<workgroup> sh_dy: f32;                       // broadcast dy
 var<workgroup> sh_stop: u32;                     // 0=continue, 1=lost, 2=converged
+var<workgroup> sh_hinv: vec4<f32>;               // broadcast Hessian inverse
 
 // ---------------------------------------------------------------------------
-// Bilinear interpolation (identical to klt.wgsl)
+// Bilinear interpolation
 // ---------------------------------------------------------------------------
+//
+// `bilinear(tex, x, y)` samples at pixel coordinates (x, y) with
+// clamp-to-edge borders. gpu/klt.rs substitutes one of two implementations
+// (see KltSampling):
+//   manual   — 4 textureLoads + weights in f32 (identical to klt.wgsl)
+//   hardware — one textureSampleLevel through a linear sampler (binding 10);
+//              needs a filterable R32Float texture (FLOAT32_FILTERABLE).
+//              Texture units interpolate with ~8-bit fractional weights.
 
-fn bilinear(tex: texture_2d<f32>, x: f32, y: f32) -> f32 {
-    let dims = textureDimensions(tex);
-    let max_x = f32(dims.x) - 1.0;
-    let max_y = f32(dims.y) - 1.0;
-    let cx = clamp(x, 0.0, max_x);
-    let cy = clamp(y, 0.0, max_y);
-    let x0 = i32(floor(cx));
-    let y0 = i32(floor(cy));
-    let x1 = min(x0 + 1, i32(dims.x) - 1);
-    let y1 = min(y0 + 1, i32(dims.y) - 1);
-    let fx = cx - f32(x0);
-    let fy = cy - f32(y0);
-    let v00 = textureLoad(tex, vec2<i32>(x0, y0), 0).r;
-    let v10 = textureLoad(tex, vec2<i32>(x1, y0), 0).r;
-    let v01 = textureLoad(tex, vec2<i32>(x0, y1), 0).r;
-    let v11 = textureLoad(tex, vec2<i32>(x1, y1), 0).r;
-    return v00 * (1.0 - fx) * (1.0 - fy)
-         + v10 * fx          * (1.0 - fy)
-         + v01 * (1.0 - fx) * fy
-         + v11 * fx          * fy;
-}
+{{BILINEAR_FN}}
 
 // ---------------------------------------------------------------------------
 // Shared-memory tree reduction (3-wide: reduces sh_a, sh_b, sh_c in lockstep)
@@ -236,8 +225,14 @@ fn track_level(
         } else {
             sh_stop = 0u;
             let inv_det = 1.0 / det;
-            h_inv[feat_idx] = vec4<f32>(
-                inv_det * h11, -inv_det * h01, inv_det * h00, 0.0);
+            let hinv = vec4<f32>(inv_det * h11, -inv_det * h01, inv_det * h00, 0.0);
+            // Broadcast via workgroup memory: workgroupBarrier() does not make
+            // storage-buffer writes visible to other invocations, so reading
+            // h_inv[feat_idx] back after the barrier could return a stale
+            // value from an earlier level/frame (diverging tracks). The
+            // storage copy is kept for debugging/readback only.
+            sh_hinv = hinv;
+            h_inv[feat_idx] = hinv;
         }
         sh_dx = disp.x;
         sh_dy = disp.y;
@@ -247,7 +242,7 @@ fn track_level(
     if sh_stop != 0u { return; }
 
     // All threads read shared Hessian inverse and initial displacement.
-    let hv = h_inv[feat_idx];
+    let hv = sh_hinv;
     var dx = sh_dx;
     var dy = sh_dy;
 

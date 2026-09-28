@@ -295,11 +295,16 @@ impl GpuDevice {
 
         // wgpu 22: request_device returns (Device, Queue) directly; the tuple
         // type must be spelled out to help the type inferencer.
+        // Optional features, enabled only where the adapter has them:
+        //   FLOAT32_FILTERABLE — lets the KLT shader sample the R32Float
+        //   pyramid with hardware bilinear filtering (KltSampling::Auto).
+        //   Missing on RPi 4 (V3DV), which keeps the manual path.
+        let optional_features = wgpu::Features::FLOAT32_FILTERABLE;
         let (device, queue): (wgpu::Device, wgpu::Queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("rudolf-v"),
-                    required_features: wgpu::Features::empty(),
+                    required_features: adapter.features() & optional_features,
                     required_limits: limits,
                     memory_hints: wgpu::MemoryHints::default(),
                 },

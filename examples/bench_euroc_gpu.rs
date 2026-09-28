@@ -20,12 +20,23 @@
 //   RUDOLF_WINDOW=7                   Override KLT window half-size
 //   RUDOLF_LEVELS=3                   Override pyramid levels
 //   RUDOLF_CELL=32                    Override cell size
+//   RUDOLF_SUBMIT=fused|separate      Override submit strategy (default: fused)
+//   RUDOLF_NMS=gpu|cpu                Override NMS strategy (default: gpu)
+//   RUDOLF_KLT_SAMPLING=manual|hardware|auto   KLT interpolation (default: manual)
+//   RUDOLF_LBP=soft|hard|off          LBP verification policy (default: soft)
+//   RUDOLF_TILE_PRUNE=1|0             Over-full tile reservoir pruning (default: 1)
+//   RUDOLF_RANSAC_THRESH=1e-5         RANSAC threshold (bench_euroc_cpu uses the
+//                                     RansacConfig default, 5e-4)
+//   RUDOLF_OVERLAP_MS=0               Simulated backend CPU work (ms) run between
+//                                     submit() and collect() each frame
 
 use rudolf_v::camera::CameraIntrinsics;
 use rudolf_v::essential::RansacConfig;
 use rudolf_v::gpu::device::GpuDevice;
 use rudolf_v::gpu::frontend::{GpuFrontend, GpuFrontendConfig, SubmitStrategy};
 use rudolf_v::gpu::fast::NmsStrategy;
+use rudolf_v::frontend::LbpPolicy;
+use rudolf_v::gpu::klt::KltSampling;
 use rudolf_v::histeq::HistEqMethod;
 use rudolf_v::image::Image;
 
@@ -45,6 +56,13 @@ fn main() {
         eprintln!("  RUDOLF_WINDOW=7");
         eprintln!("  RUDOLF_LEVELS=3");
         eprintln!("  RUDOLF_CELL=32");
+        eprintln!("  RUDOLF_SUBMIT=fused|separate");
+        eprintln!("  RUDOLF_NMS=gpu|cpu");
+        eprintln!("  RUDOLF_KLT_SAMPLING=manual|hardware|auto");
+        eprintln!("  RUDOLF_LBP=soft|hard|off");
+        eprintln!("  RUDOLF_TILE_PRUNE=1|0");
+        eprintln!("  RUDOLF_RANSAC_THRESH=1e-5");
+        eprintln!("  RUDOLF_OVERLAP_MS=0");
         std::process::exit(1);
     }
 
@@ -99,6 +117,30 @@ fn main() {
     let cell_size: usize = env::var("RUDOLF_CELL")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(32);
 
+    let submit_strategy = match env::var("RUDOLF_SUBMIT").as_deref() {
+        Ok("separate") => SubmitStrategy::Separate,
+        _              => SubmitStrategy::Fused,
+    };
+    let nms_strategy = match env::var("RUDOLF_NMS").as_deref() {
+        Ok("cpu") => NmsStrategy::Cpu,
+        _         => NmsStrategy::Gpu,
+    };
+
+    let klt_sampling = match env::var("RUDOLF_KLT_SAMPLING").as_deref() {
+        Ok("hardware") => KltSampling::Hardware,
+        Ok("auto")     => KltSampling::Auto,
+        _              => KltSampling::Manual,
+    };
+
+    let (lbp_verification_enabled, lbp_policy) = match env::var("RUDOLF_LBP").as_deref() {
+        Ok("off")  => (false, LbpPolicy::SoftPenalty),
+        Ok("hard") => (true, LbpPolicy::HardReject),
+        _          => (true, LbpPolicy::SoftPenalty),
+    };
+    let tile_reservoir_pruning_enabled = env::var("RUDOLF_TILE_PRUNE").as_deref() != Ok("0");
+    let overlap_ms: f64 = env::var("RUDOLF_OVERLAP_MS")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+
     let sensor_yaml = cam0_dir.join("sensor.yaml");
     let camera = CameraIntrinsics::from_euroc_yaml(&sensor_yaml).ok();
     if camera.is_some() {
@@ -108,18 +150,23 @@ fn main() {
     }
 
     let config = GpuFrontendConfig {
-        submit_strategy: SubmitStrategy::Fused,
-        nms_strategy: NmsStrategy::Gpu,
+        submit_strategy,
+        nms_strategy,
         max_features,
         cell_size,
         pyramid_levels,
         klt_window,
         klt_max_iter: 30,
         klt_epsilon:  0.01,
+        klt_sampling,
+        lbp_verification_enabled,
+        lbp_policy,
+        tile_reservoir_pruning_enabled,
         histeq,
         camera,
         ransac: RansacConfig {
-            threshold:      1e-5,
+            threshold:      env::var("RUDOLF_RANSAC_THRESH")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(1e-5),
             max_iterations: 200,
             confidence:     0.99,
         },
@@ -128,7 +175,11 @@ fn main() {
 
     println!("Config: features={} cell={} levels={} window={} histeq={:?}",
         max_features, cell_size, pyramid_levels, klt_window, histeq);
-    println!("Submit: {:?}  NMS: {:?}", config.submit_strategy, config.nms_strategy);
+    println!("Submit: {:?}  NMS: {:?}  KLT sampling: {:?}",
+        config.submit_strategy, config.nms_strategy, config.klt_sampling);
+    println!("LBP: {} {:?}  tile pruning: {}  simulated backend: {} ms/frame",
+        config.lbp_verification_enabled, config.lbp_policy,
+        config.tile_reservoir_pruning_enabled, overlap_ms);
 
     let mut frontend = GpuFrontend::new(&gpu, config, img_w, img_h);
 
@@ -166,7 +217,17 @@ fn main() {
     let bench_start = std::time::Instant::now();
 
     for (i, frame) in frames.iter().enumerate() {
-        let (_features, stats) = frontend.process(&gpu, frame);
+        let (_features, stats) = if overlap_ms > 0.0 {
+            // Stand-in for the VIO backend: CPU work while the GPU runs.
+            frontend.submit(&gpu, frame);
+            let t = std::time::Instant::now();
+            while t.elapsed().as_secs_f64() * 1e3 < overlap_ms {
+                std::hint::spin_loop();
+            }
+            frontend.collect(&gpu)
+        } else {
+            frontend.process(&gpu, frame)
+        };
         let t = &stats.timing;
 
         eprintln!("{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",

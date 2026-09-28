@@ -73,7 +73,7 @@ pub struct TrackMeta {
 }
 
 impl TrackMeta {
-    fn new(
+    pub(crate) fn new(
         feature: &Feature,
         age: u16,
         lbp_distance: u16,
@@ -97,7 +97,7 @@ impl TrackMeta {
         }
     }
 
-    fn advanced(
+    pub(crate) fn advanced(
         &self,
         feature: &Feature,
         klt_quality: f32,
@@ -238,7 +238,7 @@ fn border_penalty(feature: &Feature, img_w: usize, img_h: usize, margin: f32) ->
     ((margin - dist) / margin).clamp(0.0, 1.0)
 }
 
-fn prune_low_reservoir_score(
+pub(crate) fn prune_low_reservoir_score(
     features: &mut Vec<Feature>,
     track_meta: &mut Vec<TrackMeta>,
     min_score: f32,
@@ -290,7 +290,7 @@ fn tile_targets(
     target
 }
 
-fn prune_overfull_tiles(
+pub(crate) fn prune_overfull_tiles(
     features: &mut Vec<Feature>,
     track_meta: &mut Vec<TrackMeta>,
     capacity: usize,
@@ -2028,7 +2028,7 @@ const CIRCLE_OFFSETS: [(i32, i32); 16] = [
 /// All circle offsets are integers, so every sample shares the same fractional
 /// part (fx, fy) as the center. Precompute bilinear weights once, then do 17
 /// unchecked u8 lookups with fixed-point interpolation.
-fn compute_lbp_at(img: &Image<u8>, x: f32, y: f32) -> Option<u16> {
+pub(crate) fn compute_lbp_at(img: &Image<u8>, x: f32, y: f32) -> Option<u16> {
     let w = img.width();
     let h = img.height();
     let stride = img.stride();

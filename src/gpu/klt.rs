@@ -69,6 +69,70 @@ const WG_SIZE: u32 = 64;
 /// Benchmarked on RPi 4, Radeon 780M, GTX 1660Ti.
 const WG_WARP: u32 = 64;
 
+/// How the Warp KLT shader interpolates the pyramid textures.
+///
+/// Measured on Jetson Orin Nano, EuRoC V1_01_easy (200 features, 3 levels):
+/// hardware sampling cuts KLT GPU time ~18% (0.63 → 0.52 ms) and the frontend
+/// ~3%. Typical position difference vs the CPU IC tracker is 0.0015 px
+/// (p99 0.004 px), but ~2× as many ill-conditioned tracks run away (≈0.1% of
+/// tracks; RANSAC rejected +0.6% overall). Hardware sampling was also far more
+/// sensitive to the Tegra stale-texture issue (see gpu/frontend.rs SUBMISSION)
+/// — it is only verified deterministic inside `SubmitStrategy::Fused`, where
+/// each pyramid is built and first read in one command buffer. Hence `Manual`
+/// is the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KltSampling {
+    /// Hardware when the device supports filterable R32Float and the
+    /// dispatch is `Warp`, manual otherwise.
+    Auto,
+    /// 4 `textureLoad`s + f32 weights per sample. Works everywhere. Default.
+    #[default]
+    Manual,
+    /// One `textureSampleLevel` through a linear sampler per sample. The
+    /// texture unit interpolates with reduced (~8-bit) fractional precision.
+    /// Panics at construction if the device lacks `FLOAT32_FILTERABLE`.
+    Hardware,
+}
+
+/// Manual bilinear body for klt_warp.wgsl (`{{BILINEAR_FN}}`).
+const BILINEAR_MANUAL: &str = r#"fn bilinear(tex: texture_2d<f32>, x: f32, y: f32) -> f32 {
+    let dims = textureDimensions(tex);
+    let max_x = f32(dims.x) - 1.0;
+    let max_y = f32(dims.y) - 1.0;
+    let cx = clamp(x, 0.0, max_x);
+    let cy = clamp(y, 0.0, max_y);
+    let x0 = i32(floor(cx));
+    let y0 = i32(floor(cy));
+    let x1 = min(x0 + 1, i32(dims.x) - 1);
+    let y1 = min(y0 + 1, i32(dims.y) - 1);
+    let fx = cx - f32(x0);
+    let fy = cy - f32(y0);
+    let v00 = textureLoad(tex, vec2<i32>(x0, y0), 0).r;
+    let v10 = textureLoad(tex, vec2<i32>(x1, y0), 0).r;
+    let v01 = textureLoad(tex, vec2<i32>(x0, y1), 0).r;
+    let v11 = textureLoad(tex, vec2<i32>(x1, y1), 0).r;
+    return v00 * (1.0 - fx) * (1.0 - fy)
+         + v10 * fx          * (1.0 - fy)
+         + v01 * (1.0 - fx) * fy
+         + v11 * fx          * fy;
+}"#;
+
+/// Hardware bilinear body for klt_warp.wgsl (`{{BILINEAR_FN}}`).
+/// Texel centres sit at (i + 0.5) / size in normalised coordinates, so pixel
+/// coordinate x maps to (x + 0.5) / width. ClampToEdge reproduces the manual
+/// version's coordinate clamping at the borders.
+const BILINEAR_HARDWARE: &str = r#"@group(0) @binding(10) var lin_sampler: sampler;
+
+fn bilinear(tex: texture_2d<f32>, x: f32, y: f32) -> f32 {
+    let dims = vec2<f32>(textureDimensions(tex));
+    return textureSampleLevel(tex, lin_sampler, (vec2<f32>(x, y) + 0.5) / dims, 0.0).r;
+}"#;
+
+/// Maximum cached bind-group sets (one per prev/curr pyramid pair). Two
+/// covers a ping-ponged pyramid pair; callers that build a fresh pyramid every
+/// frame keep at most this many old pyramids alive.
+const BG_CACHE_CAP: usize = 2;
+
 /// Sentinel displacement value indicating a lost feature.
 /// Must match LOST_SENTINEL in klt.wgsl.
 
@@ -141,6 +205,8 @@ pub struct GpuKltTracker {
     pipeline:       wgpu::ComputePipeline,
     bgl:            wgpu::BindGroupLayout,
     dispatch:       KltDispatch,
+    // Linear sampler at binding 10 when hardware sampling is active.
+    sampler:        Option<wgpu::Sampler>,
     pub window_size:    usize,
     pub max_iterations: usize,
     pub epsilon:        f32,
@@ -168,7 +234,13 @@ pub struct GpuKltTracker {
     result_bytes_p: u64,
     disp_bytes_p:   u64,
     workgroups_p:   u32,
-    bind_groups_p:  Vec<wgpu::BindGroup>,
+    // Per-level bind groups keyed by (prev level-0 texture id, curr level-0
+    // texture id, level count). A frontend that ping-pongs two persistent
+    // pyramids hits this cache every frame after the first two, so no bind
+    // groups are created in steady state. Bounded to BG_CACHE_CAP entries;
+    // the oldest entry (and the textures it keeps alive) is evicted first.
+    bg_cache:       Vec<((u64, u64, usize), Vec<wgpu::BindGroup>)>,
+    bg_sel:         usize,
     readback_rx:    Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
 }
 
@@ -188,6 +260,23 @@ impl GpuKltTracker {
         Self::new_with_dispatch(
             gpu, window_size, max_iterations, epsilon, max_levels, max_features,
             KltDispatch::Warp(WG_WARP),
+        )
+    }
+
+    /// Create a GPU KLT tracker with the default Warp(64) dispatch and an
+    /// explicit sampling strategy.
+    pub fn new_with_sampling(
+        gpu:            &GpuDevice,
+        window_size:    usize,
+        max_iterations: usize,
+        epsilon:        f32,
+        max_levels:     usize,
+        max_features:   usize,
+        sampling:       KltSampling,
+    ) -> Self {
+        Self::new_with_options(
+            gpu, window_size, max_iterations, epsilon, max_levels, max_features,
+            KltDispatch::Warp(WG_WARP), sampling,
         )
     }
 
@@ -221,6 +310,39 @@ impl GpuKltTracker {
         max_features:   usize,
         dispatch:       KltDispatch,
     ) -> Self {
+        Self::new_with_options(
+            gpu, window_size, max_iterations, epsilon, max_levels, max_features,
+            dispatch, KltSampling::Manual,
+        )
+    }
+
+    /// Create a GPU KLT tracker with explicit dispatch and sampling strategy.
+    ///
+    /// Hardware sampling applies to the `Warp` shader only; `Scalar` always
+    /// interpolates manually.
+    pub fn new_with_options(
+        gpu:            &GpuDevice,
+        window_size:    usize,
+        max_iterations: usize,
+        epsilon:        f32,
+        max_levels:     usize,
+        max_features:   usize,
+        dispatch:       KltDispatch,
+        sampling:       KltSampling,
+    ) -> Self {
+        let filterable = gpu.device.features().contains(wgpu::Features::FLOAT32_FILTERABLE);
+        let is_warp = matches!(dispatch, KltDispatch::Warp(_));
+        let hw_sampling = match sampling {
+            KltSampling::Auto     => filterable && is_warp,
+            KltSampling::Manual   => false,
+            KltSampling::Hardware => {
+                assert!(filterable,
+                    "KltSampling::Hardware needs FLOAT32_FILTERABLE, which this device lacks");
+                assert!(is_warp, "KltSampling::Hardware needs KltDispatch::Warp");
+                true
+            }
+        };
+
         let side  = 2 * window_size + 1;
         let patch = side * side;
 
@@ -241,7 +363,9 @@ impl GpuKltTracker {
             .replace("{{HALF}}",    &window_size.to_string())
             .replace("{{SIDE}}",    &side.to_string())
             .replace("{{PATCH}}",   &patch.to_string())
-            .replace("{{WG_SIZE}}", &wg_size.to_string());
+            .replace("{{WG_SIZE}}", &wg_size.to_string())
+            .replace("{{BILINEAR_FN}}",
+                if hw_sampling { BILINEAR_HARDWARE } else { BILINEAR_MANUAL });
 
         let shader = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label:  Some(match dispatch {
@@ -252,9 +376,7 @@ impl GpuKltTracker {
         });
 
         // Bind group layout mirrors @group(0) in klt.wgsl.
-        let bgl = gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("GpuKlt BGL"),
-            entries: &[
+        let mut bgl_entries = vec![
                 // 0 — prev_tex (texture_2d<f32>)
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -262,7 +384,7 @@ impl GpuKltTracker {
                     ty: wgpu::BindingType::Texture {
                         multisampled: false,
                         view_dimension: wgpu::TextureViewDimension::D2,
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        sample_type: wgpu::TextureSampleType::Float { filterable: hw_sampling },
                     },
                     count: None,
                 },
@@ -273,7 +395,7 @@ impl GpuKltTracker {
                     ty: wgpu::BindingType::Texture {
                         multisampled: false,
                         view_dimension: wgpu::TextureViewDimension::D2,
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        sample_type: wgpu::TextureSampleType::Float { filterable: hw_sampling },
                     },
                     count: None,
                 },
@@ -365,8 +487,29 @@ impl GpuKltTracker {
                     },
                     count: None,
                 },
-            ],
+        ];
+        if hw_sampling {
+            // 10 — linear sampler (hardware bilinear only)
+            bgl_entries.push(wgpu::BindGroupLayoutEntry {
+                binding: 10,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            });
+        }
+        let bgl = gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("GpuKlt BGL"),
+            entries: &bgl_entries,
         });
+        let sampler = hw_sampling.then(|| gpu.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("GpuKlt linear sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        }));
 
         let pipeline_layout =
             gpu.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -449,13 +592,13 @@ impl GpuKltTracker {
         });
 
         GpuKltTracker {
-            pipeline, bgl, dispatch,
+            pipeline, bgl, dispatch, sampler,
             window_size, max_iterations, epsilon, max_levels,
             max_features, patch_size: patch,
             feature_buf, disp_buf, results_buf, rb_buf, params_bufs,
             t_buf, gx_buf, gy_buf, h_inv_buf,
             n_prepared: 0, result_bytes_p: 0, disp_bytes_p: 0, workgroups_p: 0,
-            bind_groups_p: Vec::new(),
+            bg_cache: Vec::new(), bg_sel: 0,
             readback_rx: None,
         }
     }
@@ -509,37 +652,57 @@ impl GpuKltTracker {
             gpu.queue.write_buffer(&self.params_bufs[i], 0, bytemuck::bytes_of(&params));
         }
 
-        // Build bind groups (cheap descriptor writes; wgpu resources are Arc-backed
-        // so storing them in self is safe — no Rust lifetime needed).
-        self.bind_groups_p = (0..num_levels).rev()
-            .enumerate()
-            .map(|(i, level)| {
-                gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label:  Some("GpuKlt BG"),
-                    layout: &self.bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(
-                                &prev_pyramid.levels[level].read_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(
-                                &curr_pyramid.levels[level].read_view),
-                        },
-                        wgpu::BindGroupEntry { binding: 2, resource: self.feature_buf.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 3, resource: self.disp_buf.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 4, resource: self.results_buf.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 5, resource: self.params_bufs[i].as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 6, resource: self.t_buf.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 7, resource: self.gx_buf.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 8, resource: self.gy_buf.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 9, resource: self.h_inv_buf.as_entire_binding() },
-                    ],
-                })
-            })
-            .collect();
+        // Look up (or build) the per-level bind groups for this texture pair.
+        let key = (
+            prev_pyramid.levels[0].texture.global_id().inner(),
+            curr_pyramid.levels[0].texture.global_id().inner(),
+            num_levels,
+        );
+        self.bg_sel = match self.bg_cache.iter().position(|(k, _)| *k == key) {
+            Some(pos) => pos,
+            None => {
+                let bind_groups: Vec<wgpu::BindGroup> = (0..num_levels).rev()
+                    .enumerate()
+                    .map(|(i, level)| {
+                        gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label:  Some("GpuKlt BG"),
+                            layout: &self.bgl,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: wgpu::BindingResource::TextureView(
+                                        &prev_pyramid.levels[level].read_view),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: wgpu::BindingResource::TextureView(
+                                        &curr_pyramid.levels[level].read_view),
+                                },
+                                wgpu::BindGroupEntry { binding: 2, resource: self.feature_buf.as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 3, resource: self.disp_buf.as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 4, resource: self.results_buf.as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 5, resource: self.params_bufs[i].as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 6, resource: self.t_buf.as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 7, resource: self.gx_buf.as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 8, resource: self.gy_buf.as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 9, resource: self.h_inv_buf.as_entire_binding() },
+                            ]
+                            .into_iter()
+                            .chain(self.sampler.as_ref().map(|s| wgpu::BindGroupEntry {
+                                binding: 10,
+                                resource: wgpu::BindingResource::Sampler(s),
+                            }))
+                            .collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect();
+                if self.bg_cache.len() >= BG_CACHE_CAP {
+                    self.bg_cache.remove(0);
+                }
+                self.bg_cache.push((key, bind_groups));
+                self.bg_cache.len() - 1
+            }
+        };
 
         self.n_prepared     = n;
         self.result_bytes_p = result_bytes;
@@ -563,7 +726,7 @@ impl GpuKltTracker {
     pub fn record_into(&self, encoder: &mut wgpu::CommandEncoder) {
         assert!(self.n_prepared > 0, "call prepare() before record_into()");
         encoder.clear_buffer(&self.disp_buf, 0, Some(self.disp_bytes_p));
-        for bg in &self.bind_groups_p {
+        for bg in &self.bg_cache[self.bg_sel].1 {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("track_level"), timestamp_writes: None,
             });
@@ -612,8 +775,6 @@ impl GpuKltTracker {
             .collect();
         drop(mapped);
         self.rb_buf.unmap();
-        // Release bind groups so textures from this frame can be freed.
-        self.bind_groups_p.clear();
         tracked
     }
 
@@ -832,7 +993,69 @@ mod tests {
         drop(tracker); drop(pyr1); drop(pyr2); drop(pipeline); drop(gpu);
     }
 
+    #[test]
+    #[ignore = "GPU integration: run via outer subprocess wrapper"]
+    fn inner_hardware_sampling_matches_manual() {
+        // Hardware (texture-unit) bilinear must agree with the manual 4-tap
+        // path to well within a pixel on a clean sub-pixel shift. Pyramids are
+        // rebuilt and consumed in the same command buffer, as in the Fused
+        // frontend (the only structure verified on Tegra).
+        let gpu = GpuDevice::new().unwrap();
+        if !gpu.device.features().contains(wgpu::Features::FLOAT32_FILTERABLE) {
+            eprintln!("[test] FLOAT32_FILTERABLE unsupported — skipping");
+            println!("GPU_TEST_OK");
+            return;
+        }
+        let (w, h) = (96usize, 96usize);
+        let blob = |cx: f32, cy: f32| {
+            let mut d = vec![0u8; w * h];
+            for y in 0..h {
+                for x in 0..w {
+                    let r = (x as f32 - cx).powi(2) + (y as f32 - cy).powi(2);
+                    d[y * w + x] = (40.0 + 200.0 * (-0.004 * r).exp()) as u8;
+                }
+            }
+            Image::from_vec(w, h, d)
+        };
+        let (img1, img2) = (blob(48.0, 48.0), blob(49.3, 47.6));
+        let pipeline = GpuPyramidPipeline::new(&gpu);
+        let (p1, p2) = (pipeline.allocate(&gpu, w, h, 3), pipeline.allocate(&gpu, w, h, 3));
+        let features = vec![feat(40.0, 44.0), feat(52.0, 50.0), feat(46.0, 55.0)];
+
+        let mut run = |sampling: KltSampling| {
+            let mut t = GpuKltTracker::new_with_sampling(&gpu, 7, 30, 0.01, 3, 16, sampling);
+            let mut enc = gpu.device.create_command_encoder(&Default::default());
+            pipeline.record_rebuild(&gpu, &mut enc, &img1, &p1);
+            pipeline.record_rebuild(&gpu, &mut enc, &img2, &p2);
+            assert!(t.prepare(&gpu, &features, &p1, &p2));
+            t.record_into(&mut enc);
+            gpu.queue.submit(std::iter::once(enc.finish()));
+            t.arm_readback();
+            gpu.device.poll(wgpu::Maintain::Wait);
+            t.collect_results(&features)
+        };
+        let manual = run(KltSampling::Manual);
+        let hardware = run(KltSampling::Hardware);
+        for (m, hw) in manual.iter().zip(&hardware) {
+            assert_eq!(m.status, TrackStatus::Tracked);
+            assert_eq!(hw.status, TrackStatus::Tracked);
+            let (dx, dy) = (hw.feature.x - m.feature.x, hw.feature.y - m.feature.y);
+            eprintln!("[test] manual ({:.4}, {:.4})  hardware ({:.4}, {:.4})",
+                m.feature.x, m.feature.y, hw.feature.x, hw.feature.y);
+            assert!(dx.abs() < 0.05 && dy.abs() < 0.05,
+                "hardware vs manual differ by ({dx:.4}, {dy:.4}) px");
+        }
+        println!("GPU_TEST_OK");
+    }
+
     // ---- outer wrappers (non-GPU CI, spawn subprocess) --------------------
+
+    #[test]
+    #[ignore = "requires a real Vulkan GPU"]
+    fn test_hardware_sampling_matches_manual() {
+        let out = run_gpu_test("gpu::klt::tests::inner_hardware_sampling_matches_manual");
+        assert!(out.contains("GPU_TEST_OK"), "inner test failed:\n{out}");
+    }
 
     #[test]
     #[ignore = "requires a real Vulkan GPU"]
