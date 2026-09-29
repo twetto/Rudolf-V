@@ -190,14 +190,17 @@ impl Pyramid {
             let dst_slice = self.u8_levels[0].as_mut_slice();
             let src_slice = src.as_slice();
             if let Some(lut) = lut {
-                for y in 0..sh {
-                    let dst_off = y * sw;
-                    let src_off = y * src_stride;
-                    unsafe {
-                        for x in 0..sw {
-                            *dst_slice.get_unchecked_mut(dst_off + x) =
-                                *lut.get_unchecked(*src_slice.get_unchecked(src_off + x) as usize);
-                        }
+                if src_stride == sw {
+                    crate::histeq::remap_lut(&src_slice[..sw * sh], dst_slice, lut);
+                } else {
+                    for y in 0..sh {
+                        let dst_off = y * sw;
+                        let src_off = y * src_stride;
+                        crate::histeq::remap_lut(
+                            &src_slice[src_off..src_off + sw],
+                            &mut dst_slice[dst_off..dst_off + sw],
+                            lut,
+                        );
                     }
                 }
             } else if src_stride == sw {
