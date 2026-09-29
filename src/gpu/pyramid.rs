@@ -133,12 +133,18 @@ pub struct GpuPyramid {
 /// because the bind groups reference them.
 struct PersistentResources {
     raw: wgpu::Texture,
+    raw_view: wgpu::TextureView,
     convert_bg: wgpu::BindGroup,
     level_bgs: Vec<wgpu::BindGroup>,
     _params_bufs: Vec<wgpu::Buffer>,
 }
 
 impl GpuPyramid {
+    /// The raw R8Uint upload texture's view (persistent pyramids only).
+    pub(crate) fn raw_view(&self) -> Option<&wgpu::TextureView> {
+        self.persistent.as_ref().map(|r| &r.raw_view)
+    }
+
     /// Read one pyramid level back to CPU memory.
     ///
     /// **Expensive and synchronous** — stalls the GPU. Use only in tests.
@@ -297,6 +303,14 @@ pub struct GpuPyramidPipeline {
     bgl: wgpu::BindGroupLayout,
     convert_pipeline: wgpu::ComputePipeline,
     convert_bgl: wgpu::BindGroupLayout,
+    /// Identity 256-entry LUT (u32 per entry) for pyramids allocated without
+    /// histogram equalization.
+    identity_lut: wgpu::Buffer,
+}
+
+/// Identity LUT contents: entry i maps to i.
+pub(crate) fn identity_lut_u32() -> [u32; 256] {
+    std::array::from_fn(|i| i as u32)
 }
 
 impl GpuPyramidPipeline {
@@ -421,6 +435,17 @@ impl GpuPyramidPipeline {
                         },
                         count: None,
                     },
+                    // Binding 2 — 256-entry u32 LUT applied during conversion
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
         let convert_layout = gpu
@@ -441,11 +466,20 @@ impl GpuPyramidPipeline {
                     cache: None,
                 });
 
+        let identity_lut = gpu
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("GpuPyramid identity LUT"),
+                contents: bytemuck::cast_slice(&identity_lut_u32()),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+
         GpuPyramidPipeline {
             pipeline,
             bgl,
             convert_pipeline,
             convert_bgl,
+            identity_lut,
         }
     }
 
@@ -463,6 +497,21 @@ impl GpuPyramidPipeline {
         width: usize,
         height: usize,
         num_levels: usize,
+    ) -> GpuPyramid {
+        self.allocate_with_lut(gpu, width, height, num_levels, &self.identity_lut)
+    }
+
+    /// Like [`allocate`](GpuPyramidPipeline::allocate), but level 0 is
+    /// converted through `lut` (a STORAGE buffer of 256 `u32`), e.g. a
+    /// histogram-equalization LUT that the GPU rebuilds each frame
+    /// ([`GpuGlobalHistEq`](crate::gpu::histeq::GpuGlobalHistEq)).
+    pub fn allocate_with_lut(
+        &self,
+        gpu: &GpuDevice,
+        width: usize,
+        height: usize,
+        num_levels: usize,
+        lut: &wgpu::Buffer,
     ) -> GpuPyramid {
         assert!(num_levels >= 1, "pyramid must have at least 1 level");
         let kernel = [1.0 / 16.0, 4.0 / 16.0, 6.0 / 16.0, 4.0 / 16.0, 1.0 / 16.0];
@@ -505,6 +554,10 @@ impl GpuPyramidPipeline {
                     binding: 1,
                     resource: wgpu::BindingResource::TextureView(&levels[0].write_view),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: lut.as_entire_binding(),
+                },
             ],
         });
 
@@ -545,6 +598,7 @@ impl GpuPyramidPipeline {
             levels,
             persistent: Some(PersistentResources {
                 raw,
+                raw_view,
                 convert_bg,
                 level_bgs,
                 _params_bufs: params_bufs,
@@ -561,9 +615,13 @@ impl GpuPyramidPipeline {
     /// still reading (the frontend waits on every frame, so ping-ponging two
     /// pyramids is safe).
     ///
+    /// Equivalent to [`upload`] + [`record_build`]; call those separately to
+    /// record passes that read the raw frame (e.g. a histogram) in between.
     /// Output is identical to [`build`] for the same source image.
     ///
     /// [`allocate`]: GpuPyramidPipeline::allocate
+    /// [`upload`]: GpuPyramidPipeline::upload
+    /// [`record_build`]: GpuPyramidPipeline::record_build
     /// [`build`]: GpuPyramidPipeline::build
     pub fn record_rebuild(
         &self,
@@ -572,10 +630,17 @@ impl GpuPyramidPipeline {
         src: &Image<u8>,
         pyr: &GpuPyramid,
     ) {
+        self.upload(gpu, src, pyr);
+        self.record_build(gpu, encoder, pyr);
+    }
+
+    /// Stage the raw u8 frame into the pyramid's upload texture
+    /// (`queue.write_texture`; lands before the next submitted command buffer).
+    pub fn upload(&self, gpu: &GpuDevice, src: &Image<u8>, pyr: &GpuPyramid) {
         let res = pyr
             .persistent
             .as_ref()
-            .expect("record_rebuild needs a pyramid from GpuPyramidPipeline::allocate");
+            .expect("upload needs a pyramid from GpuPyramidPipeline::allocate");
         let (w, h) = (pyr.levels[0].width, pyr.levels[0].height);
         assert_eq!(
             (src.width() as u32, src.height() as u32),
@@ -602,7 +667,21 @@ impl GpuPyramidPipeline {
                 depth_or_array_layers: 1,
             },
         );
+    }
 
+    /// Record the level-0 convert (through the pyramid's LUT) and the
+    /// blur+downsample passes, one compute pass each.
+    pub fn record_build(
+        &self,
+        gpu: &GpuDevice,
+        encoder: &mut wgpu::CommandEncoder,
+        pyr: &GpuPyramid,
+    ) {
+        let res = pyr
+            .persistent
+            .as_ref()
+            .expect("record_build needs a pyramid from GpuPyramidPipeline::allocate");
+        let (w, h) = (pyr.levels[0].width, pyr.levels[0].height);
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("pyramid convert_u8"),

@@ -25,6 +25,7 @@
 //   RUDOLF_KLT_SAMPLING=manual|hardware|auto   KLT interpolation (default: manual)
 //   RUDOLF_LBP=soft|hard|off          LBP verification policy (default: soft)
 //   RUDOLF_TILE_PRUNE=1|0             Over-full tile reservoir pruning (default: 1)
+//   RUDOLF_GPU_HISTEQ=1|0             Global histeq on the GPU (default: 1)
 //   RUDOLF_RANSAC_THRESH=1e-5         RANSAC threshold (bench_euroc_cpu uses the
 //                                     RansacConfig default, 5e-4)
 //   RUDOLF_OVERLAP_MS=0               Simulated backend CPU work (ms) run between
@@ -61,6 +62,7 @@ fn main() {
         eprintln!("  RUDOLF_KLT_SAMPLING=manual|hardware|auto");
         eprintln!("  RUDOLF_LBP=soft|hard|off");
         eprintln!("  RUDOLF_TILE_PRUNE=1|0");
+        eprintln!("  RUDOLF_GPU_HISTEQ=1|0");
         eprintln!("  RUDOLF_RANSAC_THRESH=1e-5");
         eprintln!("  RUDOLF_OVERLAP_MS=0");
         std::process::exit(1);
@@ -159,6 +161,7 @@ fn main() {
         _ => (true, LbpPolicy::SoftPenalty),
     };
     let tile_reservoir_pruning_enabled = env::var("RUDOLF_TILE_PRUNE").as_deref() != Ok("0");
+    let gpu_histeq = env::var("RUDOLF_GPU_HISTEQ").as_deref() != Ok("0");
     let overlap_ms: f64 = env::var("RUDOLF_OVERLAP_MS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -185,6 +188,7 @@ fn main() {
         lbp_verification_enabled,
         lbp_policy,
         tile_reservoir_pruning_enabled,
+        gpu_histeq,
         histeq,
         camera,
         ransac: RansacConfig {

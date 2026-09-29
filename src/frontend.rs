@@ -2021,6 +2021,20 @@ const CIRCLE_OFFSETS: [(i32, i32); 16] = [
 /// part (fx, fy) as the center. Precompute bilinear weights once, then do 17
 /// unchecked u8 lookups with fixed-point interpolation.
 pub(crate) fn compute_lbp_at(img: &Image<u8>, x: f32, y: f32) -> Option<u16> {
+    compute_lbp_at_lut(img, None, x, y)
+}
+
+/// [`compute_lbp_at`] on `lut[img]` without materializing the remapped image:
+/// each sampled pixel goes through `lut` before interpolation, which is
+/// exactly what sampling the LUT-remapped image gives. Used by the GPU
+/// frontend, whose histogram equalization runs on the GPU (it reads back only
+/// the 256-entry LUT).
+pub(crate) fn compute_lbp_at_lut(
+    img: &Image<u8>,
+    lut: Option<&[u8; 256]>,
+    x: f32,
+    y: f32,
+) -> Option<u16> {
     let w = img.width();
     let h = img.height();
     let stride = img.stride();
@@ -2048,11 +2062,17 @@ pub(crate) fn compute_lbp_at(img: &Image<u8>, x: f32, y: f32) -> Option<u16> {
     let bilerp = |px: usize, py: usize| -> u32 {
         let x1 = if px + 1 < w { px + 1 } else { px };
         let y1 = if py + 1 < h { py + 1 } else { py };
+        let map = |v: u8| -> u32 {
+            match lut {
+                Some(l) => l[v as usize] as u32,
+                None => v as u32,
+            }
+        };
         unsafe {
-            let p00 = *data.get_unchecked(py * stride + px) as u32;
-            let p10 = *data.get_unchecked(py * stride + x1) as u32;
-            let p01 = *data.get_unchecked(y1 * stride + px) as u32;
-            let p11 = *data.get_unchecked(y1 * stride + x1) as u32;
+            let p00 = map(*data.get_unchecked(py * stride + px));
+            let p10 = map(*data.get_unchecked(py * stride + x1));
+            let p01 = map(*data.get_unchecked(y1 * stride + px));
+            let p11 = map(*data.get_unchecked(y1 * stride + x1));
             w00 * p00 + w10 * p10 + w01 * p01 + w11 * p11
         }
     };

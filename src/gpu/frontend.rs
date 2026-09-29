@@ -59,11 +59,12 @@ use crate::camera::CameraIntrinsics;
 use crate::essential::{self, BearingCorrespondence, RansacConfig};
 use crate::fast::Feature;
 use crate::frontend::{
-    compute_lbp_at, prune_low_reservoir_score, prune_overfull_tiles, select_by_tile_deficit,
+    compute_lbp_at_lut, prune_low_reservoir_score, prune_overfull_tiles, select_by_tile_deficit,
     FrameStats, LbpPolicy, TimingStats, TrackMeta,
 };
 use crate::gpu::device::GpuDevice;
 use crate::gpu::fast::{GpuFastDetector, NmsStrategy};
+use crate::gpu::histeq::GpuGlobalHistEq;
 use crate::gpu::klt::{GpuKltTracker, KltSampling};
 use crate::gpu::pyramid::{GpuPyramid, GpuPyramidPipeline};
 use crate::histeq::{self, HistEqMethod};
@@ -147,6 +148,10 @@ pub struct GpuFrontendConfig {
     pub min_reservoir_score: f32,
     /// Prune only over-target coarse tiles by local reservoir score.
     pub tile_reservoir_pruning_enabled: bool,
+    /// Run `HistEqMethod::Global` on the GPU (histogram + LUT in the frame's
+    /// submit; bit-identical to the CPU equalization). Fused strategy only;
+    /// CLAHE and the Separate strategy always equalize on the CPU.
+    pub gpu_histeq: bool,
     /// Histogram equalization applied before GPU upload.
     /// Stabilizes brightness across frames when auto-exposure is active.
     pub histeq: HistEqMethod,
@@ -180,6 +185,7 @@ impl Default for GpuFrontendConfig {
             lbp_threshold: 4,
             min_reservoir_score: f32::NEG_INFINITY,
             tile_reservoir_pruning_enabled: true,
+            gpu_histeq: true,
             histeq: HistEqMethod::None,
             camera: None,
             ransac: RansacConfig::default(),
@@ -209,6 +215,8 @@ struct PendingFrame {
     dropped: Vec<u64>,
     /// Set by reset(); drained by the next submit().
     discarded: bool,
+    /// Global histogram equalization ran on the GPU; its LUT is being read back.
+    gpu_lut: bool,
 }
 
 /// GPU visual frontend.
@@ -267,6 +275,12 @@ pub struct GpuFrontend {
     // This frame's (preprocessed) input, kept from submit() to collect() for
     // LBP verification and new-feature descriptors.
     input_buf: Image<u8>,
+    // GPU global histogram equalization; its LUT buffer is bound to both
+    // pyramids' convert pass. Holds the identity when not equalizing on GPU.
+    histeq_gpu: GpuGlobalHistEq,
+    lut_is_identity: bool,
+    // LUT of the frame being collected (GPU Global equalization), else None.
+    frame_lut: Option<[u8; 256]>,
     has_prev: bool,
     // Frame between submit() and collect().
     pending: Option<PendingFrame>,
@@ -302,9 +316,22 @@ impl GpuFrontend {
             config.klt_sampling,
         );
         let grid = OccupancyGrid::new(img_w, img_h, config.cell_size);
+        let histeq_gpu = GpuGlobalHistEq::new(gpu, img_w, img_h);
         let pyramids = [
-            pyr_pipeline.allocate(gpu, img_w, img_h, config.pyramid_levels),
-            pyr_pipeline.allocate(gpu, img_w, img_h, config.pyramid_levels),
+            pyr_pipeline.allocate_with_lut(
+                gpu,
+                img_w,
+                img_h,
+                config.pyramid_levels,
+                histeq_gpu.lut_buffer(),
+            ),
+            pyr_pipeline.allocate_with_lut(
+                gpu,
+                img_w,
+                img_h,
+                config.pyramid_levels,
+                histeq_gpu.lut_buffer(),
+            ),
         ];
 
         GpuFrontend {
@@ -318,6 +345,9 @@ impl GpuFrontend {
             curr_slot: 0,
             separate_prev: None,
             input_buf: Image::new(img_w, img_h),
+            histeq_gpu,
+            lut_is_identity: true,
+            frame_lut: None,
             features: Vec::new(),
             track_meta: Vec::new(),
             pending: None,
@@ -382,10 +412,14 @@ impl GpuFrontend {
         let mut timing = TimingStats::default();
 
         // ── Step 0: Histogram equalization / input copy (CPU) ────────────────
-        // `input_buf` holds this frame's (preprocessed) image until collect():
-        // LBP verification and new-feature descriptors read it there.
+        // `input_buf` holds this frame's image until collect(): LBP
+        // verification and new-feature descriptors read it there. It is the
+        // CPU-equalized image, or — when Global equalization runs on the GPU —
+        // the raw image, with the GPU's LUT applied at the sampled pixels.
         let t0 = Instant::now();
-        if self.config.histeq != HistEqMethod::None {
+        let fused = self.config.submit_strategy == SubmitStrategy::Fused;
+        let gpu_lut = fused && self.config.gpu_histeq && self.config.histeq == HistEqMethod::Global;
+        if self.config.histeq != HistEqMethod::None && !gpu_lut {
             histeq::apply_histeq_into(image, self.config.histeq, &mut self.input_buf);
         } else if self.input_buf.stride() == image.stride() {
             self.input_buf
@@ -402,7 +436,6 @@ impl GpuFrontend {
         // Separate: build a fresh pyramid with its own submit (original path);
         //   KLT and FAST run in collect().
         let t0 = Instant::now();
-        let fused = self.config.submit_strategy == SubmitStrategy::Fused;
         let curr = self.curr_slot;
         let prev = 1 - curr;
         let can_track = self.has_prev && !self.features.is_empty();
@@ -425,12 +458,20 @@ impl GpuFrontend {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("GpuFrontend frame"),
                 });
-            self.pyr_pipeline.record_rebuild(
-                gpu,
-                &mut encoder,
-                &self.input_buf,
-                &self.pyramids[curr],
-            );
+            self.pyr_pipeline
+                .upload(gpu, &self.input_buf, &self.pyramids[curr]);
+            if gpu_lut {
+                // histogram → LUT, both before the convert pass reads the LUT.
+                self.histeq_gpu
+                    .record(gpu, &mut encoder, &self.pyramids[curr]);
+                self.lut_is_identity = false;
+            } else if !self.lut_is_identity {
+                // Equalization switched off or moved to the CPU at runtime.
+                self.histeq_gpu.write_identity(gpu);
+                self.lut_is_identity = true;
+            }
+            self.pyr_pipeline
+                .record_build(gpu, &mut encoder, &self.pyramids[curr]);
             tracking = can_track
                 && self
                     .klt
@@ -445,6 +486,9 @@ impl GpuFrontend {
                 self.klt.arm_readback();
             }
             self.fast.arm_readback();
+            if gpu_lut {
+                self.histeq_gpu.arm_readback();
+            }
         } else {
             separate_pyr = Some(self.pyr_pipeline.build(
                 gpu,
@@ -466,6 +510,7 @@ impl GpuFrontend {
             separate_pyr,
             dropped: Vec::new(),
             discarded: false,
+            gpu_lut,
         });
     }
 
@@ -522,6 +567,11 @@ impl GpuFrontend {
         let t0 = Instant::now();
         let (results, fused_winners) = if p.fused {
             gpu.device.poll(wgpu::Maintain::Wait);
+            if p.gpu_lut {
+                self.frame_lut = Some(self.histeq_gpu.collect_lut());
+            } else {
+                self.frame_lut = None;
+            }
             let results = if p.tracking {
                 self.klt.collect_results(&p.feats_snap)
             } else {
@@ -558,7 +608,12 @@ impl GpuFrontend {
                 let feat = &result.feature;
                 let mut lbp_distance = 0u16;
                 if self.config.lbp_verification_enabled {
-                    let Some(new_desc) = compute_lbp_at(&self.input_buf, feat.x, feat.y) else {
+                    let Some(new_desc) = compute_lbp_at_lut(
+                        &self.input_buf,
+                        self.frame_lut.as_ref(),
+                        feat.x,
+                        feat.y,
+                    ) else {
                         stats.rejected += 1;
                         continue;
                     };
@@ -752,7 +807,13 @@ impl GpuFrontend {
                     score: f.score,
                     level: f.level,
                     id: self.next_id,
-                    descriptor: compute_lbp_at(&self.input_buf, f.x, f.y).unwrap_or(0),
+                    descriptor: compute_lbp_at_lut(
+                        &self.input_buf,
+                        self.frame_lut.as_ref(),
+                        f.x,
+                        f.y,
+                    )
+                    .unwrap_or(0),
                 };
                 self.next_id += 1;
                 self.track_meta.push(TrackMeta::new(
@@ -801,6 +862,9 @@ impl GpuFrontend {
                 let _ = self.klt.collect_results(&p.feats_snap);
             }
             let _ = self.fast.collect_winners(0);
+            if p.gpu_lut {
+                let _ = self.histeq_gpu.collect_lut();
+            }
         }
     }
 

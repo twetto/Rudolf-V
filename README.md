@@ -269,6 +269,31 @@ checks without blocking.
 Not ported yet: the forward-backward gate (`klt_fb_threshold_px`), the
 pose-prior epipolar gate, and non-FAST detectors.
 
+**Phase 3f — histogram equalization:**
+
+CPU frontend, Global histeq. The histogram now uses 4 interleaved
+sub-histograms (0.41 → 0.30 ms). The LUT remap fused into pyramid level 0 is
+now a NEON `tbl` lookup (0.26 → 0.125 ms). The output is bit-identical (same
+determinism hash).
+
+GPU frontend, Global histeq. `GpuGlobalHistEq` builds the histogram and the
+LUT in the frame's submit. The pyramid's level-0 convert pass reads through
+the LUT, and only the 1 KB LUT is read back for CPU-side LBP. The LUT division
+is correctly rounded on the GPU, so the result is bit-identical to the CPU
+equalization: same frontend output over all 2912 frames. That costs ~4 µs of
+GPU time per frame.
+
+Jetson Orin Nano, locked clocks, EuRoC V1_01_easy, Global histeq:
+
+| | Frame time | CPU time |
+|---|---|---|
+| CPU frontend | 3.33–3.41 ms | 7.7 ms |
+| GPU frontend, histeq on CPU | 2.08–2.10 ms | 3.2 ms |
+| GPU frontend, histeq on GPU (default) | 1.85–1.90 ms | 1.9 ms |
+
+CLAHE still runs on the CPU (0.9–2.3 ms/frame with rayon). It is not
+ported yet.
+
 **Phase 3d — KLT hardware bilinear sampling (opt-in):**
 
 `KltSampling::Hardware` samples the pyramid through the texture unit instead
