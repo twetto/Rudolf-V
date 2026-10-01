@@ -79,11 +79,9 @@ use camera_geometry::{CameraModel, CameraProjection, Pixel};
 
 /// Controls how KLT and FAST are submitted to the GPU each frame.
 ///
-/// | Hardware                         | Recommended | Reason                                   |
-/// |----------------------------------|-------------|------------------------------------------|
-/// `Fused` is the default and the fast path on every platform measured so
-/// far (Jetson Orin Nano: see README). `Separate` is the original pipeline,
-/// kept for comparison.
+/// `Fused` is the default and the fast, verified path. `Pipelined` is faster
+/// still but only verified with a fixed GPU clock (see its docs). `Separate`
+/// is the original pipeline, kept for comparison.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SubmitStrategy {
     /// Original flow: fresh pyramid per frame, KLT and FAST in separate
@@ -94,6 +92,17 @@ pub enum SubmitStrategy {
     /// allocation). Default.
     #[default]
     Fused,
+    /// Like `Fused`, but FAST + NMS go in a second submit so the CPU runs LBP,
+    /// RANSAC and reservoir pruning while the GPU is still detecting (collect
+    /// waits for the first submit, then for the second only before
+    /// replenishment). Same results as `Fused`.
+    ///
+    /// Caveat: FAST reads the pyramid in a later submit than the one that
+    /// built it. On the Jetson Orin Nano (wgpu Vulkan) that pattern returned
+    /// stale texels while the GPU clock governor was switching frequencies;
+    /// it was deterministic with the clock fixed. Use only with a fixed GPU
+    /// clock (e.g. min_freq = max_freq, or jetson_clocks).
+    Pipelined,
 }
 
 /// Configuration for the GPU visual frontend.
@@ -203,6 +212,9 @@ struct PendingFrame {
     timing: TimingStats,
     submit_secs: f64,
     fused: bool,
+    /// Pipelined strategy: KLT (+ histeq, pyramid) were submitted first.
+    pipelined: bool,
+    first_submit: Option<wgpu::SubmissionIndex>,
     /// KLT was run (fused: recorded) for this frame.
     tracking: bool,
     /// Features and metadata as they were at submit(), index-aligned with the
@@ -281,6 +293,9 @@ pub struct GpuFrontend {
     lut_is_identity: bool,
     // LUT of the frame being collected (GPU Global equalization), else None.
     frame_lut: Option<[u8; 256]>,
+    // Track ID → bearing unprojected at the track's current position (RANSAC
+    // b2); reused as next frame's b1.
+    bearing_cache: std::collections::HashMap<u64, [f64; 3]>,
     has_prev: bool,
     // Frame between submit() and collect().
     pending: Option<PendingFrame>,
@@ -348,6 +363,7 @@ impl GpuFrontend {
             histeq_gpu,
             lut_is_identity: true,
             frame_lut: None,
+            bearing_cache: std::collections::HashMap::new(),
             features: Vec::new(),
             track_meta: Vec::new(),
             pending: None,
@@ -417,7 +433,12 @@ impl GpuFrontend {
         // CPU-equalized image, or — when Global equalization runs on the GPU —
         // the raw image, with the GPU's LUT applied at the sampled pixels.
         let t0 = Instant::now();
-        let fused = self.config.submit_strategy == SubmitStrategy::Fused;
+        let fused = matches!(
+            self.config.submit_strategy,
+            SubmitStrategy::Fused | SubmitStrategy::Pipelined
+        );
+        let pipelined = self.config.submit_strategy == SubmitStrategy::Pipelined;
+        let mut first_submit = None;
         let gpu_lut = fused && self.config.gpu_histeq && self.config.histeq == HistEqMethod::Global;
         if self.config.histeq != HistEqMethod::None && !gpu_lut {
             histeq::apply_histeq_into(image, self.config.histeq, &mut self.input_buf);
@@ -460,35 +481,83 @@ impl GpuFrontend {
                 });
             self.pyr_pipeline
                 .upload(gpu, &self.input_buf, &self.pyramids[curr]);
-            if gpu_lut {
-                // histogram → LUT, both before the convert pass reads the LUT.
-                self.histeq_gpu
-                    .record(gpu, &mut encoder, &self.pyramids[curr]);
-                self.lut_is_identity = false;
-            } else if !self.lut_is_identity {
+            if !gpu_lut && !self.lut_is_identity {
                 // Equalization switched off or moved to the CPU at runtime.
                 self.histeq_gpu.write_identity(gpu);
                 self.lut_is_identity = true;
             }
-            self.pyr_pipeline
-                .record_build(gpu, &mut encoder, &self.pyramids[curr]);
             tracking = can_track
                 && self
                     .klt
                     .prepare(gpu, &feats_snap, &self.pyramids[prev], &self.pyramids[curr]);
-            if tracking {
-                self.klt.record_into(&mut encoder);
+            // FAST joins the same pass when it uses the fused GPU-NMS kernel
+            // and is not deferred to a second submit (Pipelined).
+            let fast_in_pass = !pipelined && self.fast.uses_gpu_nms();
+
+            // One compute pass for the whole frame: histogram → LUT → pyramid
+            // → KLT levels → FAST+NMS. Every dispatch is its own
+            // synchronization scope, so wgpu orders the dependencies; one pass
+            // instead of five saves ~17 µs of CPU recording per pass.
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("GpuFrontend frame"),
+                    timestamp_writes: None,
+                });
+                if gpu_lut {
+                    self.histeq_gpu
+                        .record_dispatches(gpu, &mut pass, &self.pyramids[curr]);
+                    self.lut_is_identity = false;
+                }
+                self.pyr_pipeline
+                    .record_build_in_pass(gpu, &mut pass, &self.pyramids[curr]);
+                if tracking {
+                    self.klt.record_dispatches(&mut pass);
+                }
+                if fast_in_pass {
+                    self.fast
+                        .record_dispatch(gpu, &mut pass, &self.pyramids[curr].levels[0]);
+                }
             }
-            self.fast
-                .record_into(gpu, &mut encoder, &self.pyramids[curr].levels[0]);
-            gpu.queue.submit(std::iter::once(encoder.finish()));
+            if gpu_lut {
+                self.histeq_gpu.record_readback(&mut encoder);
+            }
             if tracking {
-                self.klt.arm_readback();
+                self.klt.record_readback(&mut encoder);
+            }
+            if fast_in_pass {
+                self.fast.record_readback(&mut encoder);
+            }
+            if pipelined {
+                // First submit: histeq + pyramid + KLT. collect() only waits
+                // for this before LBP / RANSAC / pruning.
+                first_submit = Some(gpu.queue.submit(std::iter::once(encoder.finish())));
+                if tracking {
+                    self.klt.arm_readback();
+                }
+                if gpu_lut {
+                    self.histeq_gpu.arm_readback();
+                }
+                encoder = gpu
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("GpuFrontend frame (FAST)"),
+                    });
+            }
+            if !fast_in_pass {
+                // Pipelined (second submit) or the dense CPU-NMS path.
+                self.fast
+                    .record_into(gpu, &mut encoder, &self.pyramids[curr].levels[0]);
+            }
+            gpu.queue.submit(std::iter::once(encoder.finish()));
+            if !pipelined {
+                if tracking {
+                    self.klt.arm_readback();
+                }
+                if gpu_lut {
+                    self.histeq_gpu.arm_readback();
+                }
             }
             self.fast.arm_readback();
-            if gpu_lut {
-                self.histeq_gpu.arm_readback();
-            }
         } else {
             separate_pyr = Some(self.pyr_pipeline.build(
                 gpu,
@@ -504,6 +573,8 @@ impl GpuFrontend {
             timing,
             submit_secs: t_start.elapsed().as_secs_f64(),
             fused,
+            pipelined,
+            first_submit,
             tracking,
             feats_snap,
             meta_snap,
@@ -519,7 +590,9 @@ impl GpuFrontend {
     ///
     /// [`collect`]: GpuFrontend::collect
     pub fn poll_ready(&self, gpu: &GpuDevice) -> bool {
-        gpu.device.poll(wgpu::Maintain::Poll).is_queue_empty()
+        gpu.device
+            .poll(wgpu::PollType::Poll)
+            .is_ok_and(|s| s.is_queue_empty())
     }
 
     /// Whether a frame has been submitted and not yet collected.
@@ -566,7 +639,14 @@ impl GpuFrontend {
         // ── Step 2: KLT results (+ LBP verification, CPU) ────────────────────
         let t0 = Instant::now();
         let (results, fused_winners) = if p.fused {
-            gpu.device.poll(wgpu::Maintain::Wait);
+            let wait = match &p.first_submit {
+                Some(idx) => wgpu::PollType::Wait {
+                    submission_index: Some(idx.clone()),
+                    timeout: None,
+                },
+                None => wgpu::PollType::wait_indefinitely(),
+            };
+            gpu.device.poll(wait).expect("GPU poll failed");
             if p.gpu_lut {
                 self.frame_lut = Some(self.histeq_gpu.collect_lut());
             } else {
@@ -577,7 +657,13 @@ impl GpuFrontend {
             } else {
                 Vec::new()
             };
-            (results, Some(self.fast.collect_winners(0)))
+            // Pipelined: FAST is still running; collected before replenishment.
+            let winners = if p.pipelined {
+                None
+            } else {
+                Some(self.fast.collect_winners(0))
+            };
+            (results, winners)
         } else {
             let curr_pyr = p
                 .separate_pyr
@@ -648,32 +734,39 @@ impl GpuFrontend {
 
         // ── Step 2b: Geometric verification (RANSAC, CPU) ────────────────────
         let t0 = Instant::now();
+        // Bearings unprojected this frame, by track ID. A track's position at
+        // the end of this frame is its "previous" position next frame, so its
+        // b1 then is exactly this b2 (same pixel, same deterministic
+        // unprojection). Rebuilt every frame; empty if RANSAC is skipped.
+        let prev_bearings = std::mem::take(&mut self.bearing_cache);
         if let Some(ref cam) = self.camera_projection {
             if self.features.len() >= 8 {
-                let corrs: Vec<(usize, BearingCorrespondence)> = self
-                    .features
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(idx, f)| {
-                        self.prev_features
-                            .iter()
-                            .find(|pf| pf.id == f.id)
-                            .and_then(|pf| {
-                                let b1 = cam
-                                    .unproject(Pixel::new(pf.x as f64, pf.y as f64))?
-                                    .vector();
-                                let b2 =
-                                    cam.unproject(Pixel::new(f.x as f64, f.y as f64))?.vector();
-                                Some((
-                                    idx,
-                                    BearingCorrespondence {
-                                        b1: [b1.x, b1.y, b1.z],
-                                        b2: [b2.x, b2.y, b2.z],
-                                    },
-                                ))
-                            })
-                    })
-                    .collect();
+                let prev_by_id: std::collections::HashMap<u64, &Feature> =
+                    self.prev_features.iter().map(|pf| (pf.id, pf)).collect();
+                let mut corrs: Vec<(usize, BearingCorrespondence)> =
+                    Vec::with_capacity(self.features.len());
+                for (idx, f) in self.features.iter().enumerate() {
+                    let Some(pf) = prev_by_id.get(&f.id) else {
+                        continue;
+                    };
+                    let b1 = match prev_bearings.get(&f.id) {
+                        Some(b) => *b,
+                        None => match cam.unproject(Pixel::new(pf.x as f64, pf.y as f64)) {
+                            Some(b) => {
+                                let v = b.vector();
+                                [v.x, v.y, v.z]
+                            }
+                            None => continue,
+                        },
+                    };
+                    let Some(b2) = cam.unproject(Pixel::new(f.x as f64, f.y as f64)) else {
+                        continue;
+                    };
+                    let b2 = b2.vector();
+                    let b2 = [b2.x, b2.y, b2.z];
+                    self.bearing_cache.insert(f.id, b2);
+                    corrs.push((idx, BearingCorrespondence { b1, b2 }));
+                }
 
                 if corrs.len() >= 8 {
                     let corr_only: Vec<BearingCorrespondence> =
@@ -751,6 +844,11 @@ impl GpuFrontend {
 
         let winners = if let Some(w) = fused_winners {
             w
+        } else if p.pipelined {
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("GPU poll failed");
+            self.fast.collect_winners(0)
         } else if slots > 0 {
             let curr_pyr = p
                 .separate_pyr
@@ -857,7 +955,9 @@ impl GpuFrontend {
         let Some(p) = self.pending.take() else { return };
         debug_assert!(p.discarded);
         if p.fused {
-            gpu.device.poll(wgpu::Maintain::Wait);
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("GPU poll failed");
             if p.tracking {
                 let _ = self.klt.collect_results(&p.feats_snap);
             }
@@ -948,6 +1048,7 @@ impl GpuFrontend {
         self.features.clear();
         self.track_meta.clear();
         self.prev_features.clear();
+        self.bearing_cache.clear();
         self.separate_prev = None;
         self.grid.clear();
     }

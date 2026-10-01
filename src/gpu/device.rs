@@ -218,7 +218,7 @@ impl GpuDevice {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
             flags,
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
 
         // Enumerate all Vulkan adapters, selecting the best available.
@@ -238,10 +238,9 @@ impl GpuDevice {
         //   3. Last resort: take anything — adapter name logged so you know.
         //
         // The adapter name is printed at startup to confirm which was chosen.
-        let all_adapters: Vec<wgpu::Adapter> = instance
-            .enumerate_adapters(wgpu::Backends::VULKAN)
-            .into_iter()
-            .collect();
+        let all_adapters: Vec<wgpu::Adapter> =
+            instance.enumerate_adapters(wgpu::Backends::VULKAN).await;
+        let fallback_adapter = all_adapters.first().cloned();
 
         if all_adapters.is_empty() {
             return Err(GpuError::NoSuitableAdapter);
@@ -268,12 +267,7 @@ impl GpuDevice {
                 )
             })
             // Tier 2 (last resort): take whatever exists, even if Cpu/software.
-            .or_else(|| {
-                instance
-                    .enumerate_adapters(wgpu::Backends::VULKAN)
-                    .into_iter()
-                    .next()
-            })
+            .or(fallback_adapter)
             .ok_or(GpuError::NoSuitableAdapter)?;
 
         let raw_info = adapter.get_info();
@@ -299,7 +293,7 @@ impl GpuDevice {
         // Build the requested limits from the (possibly auto-upgraded) profile.
         let limits = limits_for_profile(profile);
 
-        // wgpu 22: request_device returns (Device, Queue) directly; the tuple
+        // request_device returns (Device, Queue) directly; the tuple
         // type must be spelled out to help the type inferencer.
         // Optional features, enabled only where the adapter has them:
         //   FLOAT32_FILTERABLE — lets the KLT shader sample the R32Float
@@ -307,15 +301,14 @@ impl GpuDevice {
         //   Missing on RPi 4 (V3DV), which keeps the manual path.
         let optional_features = wgpu::Features::FLOAT32_FILTERABLE;
         let (device, queue): (wgpu::Device, wgpu::Queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("rudolf-v"),
-                    required_features: adapter.features() & optional_features,
-                    required_limits: limits,
-                    memory_hints: wgpu::MemoryHints::default(),
-                },
-                None,
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("rudolf-v"),
+                required_features: adapter.features() & optional_features,
+                required_limits: limits,
+                memory_hints: wgpu::MemoryHints::default(),
+                experimental_features: wgpu::ExperimentalFeatures::default(),
+                trace: wgpu::Trace::Off,
+            })
             .await
             .map_err(GpuError::DeviceRequest)?;
 
@@ -343,6 +336,32 @@ impl GpuDevice {
         }
         self.workgroup_size = WorkgroupSize { x, y };
         Ok(())
+    }
+
+    /// Create a compute shader module with wgpu's bounds checks kept and its
+    /// injected loop bounding turned off.
+    ///
+    /// wgpu (since ~v25) adds a counter and an exit branch to every shader
+    /// loop so that an infinite loop cannot cause undefined behavior. On the
+    /// Jetson Orin Nano that made the FAST + NMS stage ~1.8× slower (0.33 →
+    /// 0.59 ms/frame) compared with wgpu 22, which did not inject it.
+    pub fn create_compute_shader(
+        &self,
+        desc: wgpu::ShaderModuleDescriptor<'_>,
+    ) -> wgpu::ShaderModule {
+        // SAFETY: loop bounding only guards against non-terminating loops.
+        // Every loop in Rudolf-V's WGSL shaders terminates by construction:
+        // trip counts are compile-time constants or bounded by image / buffer
+        // sizes from uniforms, with non-zero strides. Bounds checks stay on.
+        unsafe {
+            self.device.create_shader_module_trusted(
+                desc,
+                wgpu::ShaderRuntimeChecks {
+                    force_loop_bounding: false,
+                    ..wgpu::ShaderRuntimeChecks::checked()
+                },
+            )
+        }
     }
 
     /// Compute the dispatch dimensions needed to cover an image of the
@@ -726,11 +745,12 @@ mod tests {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
             flags: wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER,
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
 
-        let adapter = instance
-            .enumerate_adapters(wgpu::Backends::VULKAN)
+        let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN));
+        let fallback = adapters.first().cloned();
+        let adapter = adapters
             .into_iter()
             .find(|a| {
                 matches!(
@@ -741,12 +761,7 @@ mod tests {
                         | wgpu::DeviceType::Other
                 )
             })
-            .or_else(|| {
-                instance
-                    .enumerate_adapters(wgpu::Backends::VULKAN)
-                    .into_iter()
-                    .next()
-            })
+            .or(fallback)
             .expect("no Vulkan adapter found");
 
         let info = adapter.get_info();

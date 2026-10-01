@@ -269,6 +269,57 @@ checks without blocking.
 Not ported yet: the forward-backward gate (`klt_fb_threshold_px`), the
 pose-prior epipolar gate, and non-FAST detectors.
 
+**Phase 3g — beating OpenCV CUDA on Jetson:**
+
+Measured with a Rust benchmark (`opencv` crate, OpenCV 4.12 built with CUDA
+for sm_87) running the same pipeline: pyramidal LK (200 pts, 15×15, 3
+levels), FAST 20 9/16 with best-per-32-px-cell replenishment, and RANSAC on
+undistorted points. OpenCV's fastest RANSAC here is `findFundamentalMat`
+`FM_RANSAC` (7-point). Jetson Orin Nano, locked clocks, EuRoC V1_01_easy,
+ms/frame, alternating back-to-back runs:
+
+| | No histeq | Global histeq |
+|---|---|---|
+| OpenCV CUDA (7-point RANSAC) | 1.37–1.40 | 1.30–1.33 |
+| Rudolf-V GPU, `Fused` (default) | **1.11–1.13** | **1.20–1.26** |
+| Rudolf-V GPU, `Pipelined` (fixed GPU clock only) | 0.95–1.02 | 1.11–1.15 |
+
+What got it there (frontend output bit-identical throughout):
+
+* **wgpu 22 → 30**, with wgpu's injected shader loop bounding turned off
+  (`GpuDevice::create_compute_shader`). Loop bounding made FAST + NMS 1.8×
+  slower; bounds checks stay on.
+* **Fused FAST + NMS** (`fast_nms_fused.wgsl`). One workgroup per cell, with
+  a shared-memory reduction and the same tie-break as the old score buffer
+  + NMS pass: 0.38 → 0.25 ms GPU.
+* **Pyramid**:
+  * Constant binomial weights instead of a uniform-driven generic kernel.
+  * Level 0 and level 1 in one dispatch, with level 1 computed from the raw
+    u8 frame through the LUT (`pyramid_l0l1.wgsl`).
+  * 0.20 → 0.11 ms GPU.
+* **KLT** keeps its template and gradients in workgroup memory.
+* **One compute pass per frame** (histogram, LUT, pyramid, KLT, FAST). There
+  are no encoder-level clears; zeroing goes through the queue. CPU
+  recording + submit fell from 0.37 to 0.23 ms.
+* **RANSAC input**:
+  * Bearings unprojected in one frame are reused as the next frame's
+    previous bearings.
+  * The previous position is found through a hash lookup instead of a
+    linear scan.
+  * 0.23 → 0.18 ms.
+* **`SubmitStrategy::Pipelined`** (opt-in). FAST goes in a second submit, so
+  LBP, RANSAC and pruning overlap with it on the GPU. It reads the pyramid
+  across submits, which was only deterministic with a fixed GPU clock here.
+
+Tried without gain: a shared-memory tile for FAST (the texture cache already
+serves the overlapping reads), and arithmetic circle offsets (slower than the
+table).
+
+Not yet validated with the GPU governor active: merging several dispatches
+into one pass. A single-pass pyramid was one of the configurations that read
+stale data with unlocked clocks during Phase 3c. Re-run the determinism
+checks without `jetson_clocks` before relying on this in deployment.
+
 **Phase 3f — histogram equalization:**
 
 CPU frontend, Global histeq. The histogram now uses 4 interleaved

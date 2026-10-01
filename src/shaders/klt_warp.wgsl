@@ -94,6 +94,14 @@ var<workgroup> sh_dx: f32;                       // broadcast dx
 var<workgroup> sh_dy: f32;                       // broadcast dy
 var<workgroup> sh_stop: u32;                     // 0=continue, 1=lost, 2=converged
 var<workgroup> sh_hinv: vec4<f32>;               // broadcast Hessian inverse
+// Template value and gradients per patch pixel, written in Phase 1 and read
+// in every Phase 2 iteration. Each invocation only touches its own strided
+// pixels, so no barrier is needed between the write and the reads. Kept in
+// workgroup memory (3 × PATCH floats, 2.7 KB at W=7) instead of the t/gx/gy
+// storage buffers — those remain bound but unused.
+var<workgroup> sh_t:  array<f32, {{PATCH}}>;
+var<workgroup> sh_gx: array<f32, {{PATCH}}>;
+var<workgroup> sh_gy: array<f32, {{PATCH}}>;
 
 // ---------------------------------------------------------------------------
 // Bilinear interpolation
@@ -164,7 +172,6 @@ fn track_level(
 
     let fx = feat.x * params.level_scale;
     let fy = feat.y * params.level_scale;
-    let buf_base = feat_idx * {{PATCH}}u;
     let half = {{HALF}};
 
     // ===================================================================
@@ -189,10 +196,9 @@ fn track_level(
         let gy = 0.5 * (bilinear(prev_tex, tx, ty + 1.0)
                        - bilinear(prev_tex, tx, ty - 1.0));
 
-        let si = buf_base + pidx;
-        t_buf[si]  = t_val;
-        gx_buf[si] = gx;
-        gy_buf[si] = gy;
+        sh_t[pidx]  = t_val;
+        sh_gx[pidx] = gx;
+        sh_gy[pidx] = gy;
 
         p_h00 += gx * gx;
         p_h01 += gx * gy;
@@ -263,10 +269,9 @@ fn track_level(
             let wy = fy + dy + f32(py);
 
             let i_val = bilinear(curr_tex, wx, wy);
-            let si = buf_base + pidx;
-            let e = t_buf[si] - i_val;
-            p_b0 += gx_buf[si] * e;
-            p_b1 += gy_buf[si] * e;
+            let e = sh_t[pidx] - i_val;
+            p_b0 += sh_gx[pidx] * e;
+            p_b1 += sh_gy[pidx] * e;
 
             pidx += {{WG_SIZE}}u;
         }

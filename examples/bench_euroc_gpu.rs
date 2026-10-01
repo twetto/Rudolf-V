@@ -20,7 +20,7 @@
 //   RUDOLF_WINDOW=7                   Override KLT window half-size
 //   RUDOLF_LEVELS=3                   Override pyramid levels
 //   RUDOLF_CELL=32                    Override cell size
-//   RUDOLF_SUBMIT=fused|separate      Override submit strategy (default: fused)
+//   RUDOLF_SUBMIT=fused|pipelined|separate   Submit strategy (default: fused)
 //   RUDOLF_NMS=gpu|cpu                Override NMS strategy (default: gpu)
 //   RUDOLF_KLT_SAMPLING=manual|hardware|auto   KLT interpolation (default: manual)
 //   RUDOLF_LBP=soft|hard|off          LBP verification policy (default: soft)
@@ -57,7 +57,7 @@ fn main() {
         eprintln!("  RUDOLF_WINDOW=7");
         eprintln!("  RUDOLF_LEVELS=3");
         eprintln!("  RUDOLF_CELL=32");
-        eprintln!("  RUDOLF_SUBMIT=fused|separate");
+        eprintln!("  RUDOLF_SUBMIT=fused|pipelined|separate");
         eprintln!("  RUDOLF_NMS=gpu|cpu");
         eprintln!("  RUDOLF_KLT_SAMPLING=manual|hardware|auto");
         eprintln!("  RUDOLF_LBP=soft|hard|off");
@@ -142,6 +142,7 @@ fn main() {
 
     let submit_strategy = match env::var("RUDOLF_SUBMIT").as_deref() {
         Ok("separate") => SubmitStrategy::Separate,
+        Ok("pipelined") => SubmitStrategy::Pipelined,
         _ => SubmitStrategy::Fused,
     };
     let nms_strategy = match env::var("RUDOLF_NMS").as_deref() {

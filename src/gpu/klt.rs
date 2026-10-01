@@ -239,12 +239,12 @@ pub struct GpuKltTracker {
     result_bytes_p: u64,
     disp_bytes_p: u64,
     workgroups_p: u32,
-    // Per-level bind groups keyed by (prev level-0 texture id, curr level-0
-    // texture id, level count). A frontend that ping-pongs two persistent
+    // Per-level bind groups keyed by (prev level-0 texture, curr level-0
+    // texture, level count). A frontend that ping-pongs two persistent
     // pyramids hits this cache every frame after the first two, so no bind
     // groups are created in steady state. Bounded to BG_CACHE_CAP entries;
     // the oldest entry (and the textures it keeps alive) is evicted first.
-    bg_cache: Vec<((u64, u64, usize), Vec<wgpu::BindGroup>)>,
+    bg_cache: Vec<((wgpu::Texture, wgpu::Texture, usize), Vec<wgpu::BindGroup>)>,
     bg_sel: usize,
     readback_rx: Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
 }
@@ -406,15 +406,13 @@ impl GpuKltTracker {
                 },
             );
 
-        let shader = gpu
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some(match dispatch {
-                    KltDispatch::Scalar => "klt.wgsl",
-                    KltDispatch::Warp(_) => "klt_warp.wgsl",
-                }),
-                source: wgpu::ShaderSource::Wgsl(shader_src.into()),
-            });
+        let shader = gpu.create_compute_shader(wgpu::ShaderModuleDescriptor {
+            label: Some(match dispatch {
+                KltDispatch::Scalar => "klt.wgsl",
+                KltDispatch::Warp(_) => "klt_warp.wgsl",
+            }),
+            source: wgpu::ShaderSource::Wgsl(shader_src.into()),
+        });
 
         // Bind group layout mirrors @group(0) in klt.wgsl.
         let mut bgl_entries = vec![
@@ -555,7 +553,7 @@ impl GpuKltTracker {
                 address_mode_v: wgpu::AddressMode::ClampToEdge,
                 mag_filter: wgpu::FilterMode::Linear,
                 min_filter: wgpu::FilterMode::Linear,
-                mipmap_filter: wgpu::FilterMode::Nearest,
+                mipmap_filter: wgpu::MipmapFilterMode::Nearest,
                 ..Default::default()
             })
         });
@@ -564,8 +562,8 @@ impl GpuKltTracker {
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("GpuKlt pipeline layout"),
-                bind_group_layouts: &[&bgl],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
             });
 
         let pipeline = gpu
@@ -574,7 +572,7 @@ impl GpuKltTracker {
                 label: Some("track_level"),
                 layout: Some(&pipeline_layout),
                 module: &shader,
-                entry_point: "track_level",
+                entry_point: Some("track_level"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             });
@@ -740,8 +738,8 @@ impl GpuKltTracker {
 
         // Look up (or build) the per-level bind groups for this texture pair.
         let key = (
-            prev_pyramid.levels[0].texture.global_id().inner(),
-            curr_pyramid.levels[0].texture.global_id().inner(),
+            prev_pyramid.levels[0].texture.clone(),
+            curr_pyramid.levels[0].texture.clone(),
             num_levels,
         );
         self.bg_sel = match self.bg_cache.iter().position(|(k, _)| *k == key) {
@@ -827,7 +825,9 @@ impl GpuKltTracker {
             KltDispatch::Warp(_) => n_u32,
         };
 
-        // Explicitly zero displacements — V3DV's clear_buffer may be unreliable.
+        // Zero displacements through the queue (lands before the submit). This
+        // is the only clear: V3DV's clear_buffer may be unreliable, and it
+        // keeps the dispatches recordable into a shared compute pass.
         let zeros = vec![0u8; disp_bytes as usize];
         gpu.queue.write_buffer(&self.disp_buf, 0, &zeros);
 
@@ -837,17 +837,32 @@ impl GpuKltTracker {
     /// Record KLT passes into `encoder`.
     /// Must be called after `prepare()` returned `true`.
     pub fn record_into(&self, encoder: &mut wgpu::CommandEncoder) {
-        assert!(self.n_prepared > 0, "call prepare() before record_into()");
-        encoder.clear_buffer(&self.disp_buf, 0, Some(self.disp_bytes_p));
-        for bg in &self.bg_cache[self.bg_sel].1 {
+        {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("track_level"),
+                label: Some("track_levels"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.pipeline);
+            self.record_dispatches(&mut pass);
+        }
+        self.record_readback(encoder);
+    }
+
+    /// The per-level tracking dispatches (coarse → fine) into an existing
+    /// compute pass. Displacements need no clear here: `prepare()` zeroes them
+    /// through the queue. Pair with [`record_readback`] after the pass.
+    ///
+    /// [`record_readback`]: GpuKltTracker::record_readback
+    pub fn record_dispatches(&self, pass: &mut wgpu::ComputePass<'_>) {
+        assert!(self.n_prepared > 0, "call prepare() before recording KLT");
+        pass.set_pipeline(&self.pipeline);
+        for bg in &self.bg_cache[self.bg_sel].1 {
             pass.set_bind_group(0, bg, &[]);
             pass.dispatch_workgroups(self.workgroups_p, 1, 1);
         }
+    }
+
+    /// Copy the results to the readback buffer (record after the pass).
+    pub fn record_readback(&self, encoder: &mut wgpu::CommandEncoder) {
         encoder.copy_buffer_to_buffer(&self.results_buf, 0, &self.rb_buf, 0, self.result_bytes_p);
     }
 
@@ -873,7 +888,11 @@ impl GpuKltTracker {
         rx.recv().unwrap().expect("KLT readback failed");
 
         let n = self.n_prepared;
-        let mapped = self.rb_buf.slice(..self.result_bytes_p).get_mapped_range();
+        let mapped = self
+            .rb_buf
+            .slice(..self.result_bytes_p)
+            .get_mapped_range()
+            .expect("buffer mapping failed");
         let gpu_results: &[GpuTrackResult] = bytemuck::cast_slice(&mapped);
         let tracked = gpu_results[..n]
             .iter()
@@ -924,7 +943,9 @@ impl GpuKltTracker {
         self.record_into(&mut encoder);
         gpu.queue.submit(std::iter::once(encoder.finish()));
         self.arm_readback();
-        gpu.device.poll(wgpu::Maintain::Wait);
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("GPU poll failed");
         self.collect_results(features)
     }
 }
@@ -1215,7 +1236,9 @@ mod tests {
             t.record_into(&mut enc);
             gpu.queue.submit(std::iter::once(enc.finish()));
             t.arm_readback();
-            gpu.device.poll(wgpu::Maintain::Wait);
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("GPU poll failed");
             t.collect_results(&features)
         };
         let manual = run(KltSampling::Manual);

@@ -10,14 +10,16 @@
 //   On unified memory the 1.4 MB "copy" is essentially free; CPU NMS on
 //   ~few-hundred corners is sub-microsecond.
 //
-// NmsStrategy::Gpu  (best for discrete GPU with PCIe)
+// NmsStrategy::Gpu  (best overall; required for small readbacks on PCIe)
 // ─────────────────────────────────────────────────────
-//   record_into: clear score_buf → FAST → nms_cells → copy winners (~17 KB) → rb
+//   record_into: fused FAST + cell NMS (fast_nms_fused.wgsl, one workgroup
+//                per cell) → copy winners (~17 KB) → rb
 //   collect:     read winners array directly — already one per cell
 //
-//   Pre-allocated buffers avoid per-frame VRAM allocation.
-//   Saves ~175 µs of PCIe transfer (1.4 MB @ 8 GB/s) at the cost of an
-//   extra compute pass that is negligible on a discrete GPU.
+//   No full-resolution score buffer: each workgroup scores its cell and
+//   reduces to the winner in shared memory. Output is identical to the old
+//   clear → FAST → nms_cells sequence (highest score, ties to the first pixel
+//   in row-major order), in one pass instead of three.
 
 use crate::fast::Feature;
 use crate::gpu::device::GpuDevice;
@@ -60,17 +62,40 @@ struct FastParams {
     arc_length: u32,
 }
 
+/// FAST sample from the level-0 texture with clamp-to-edge addressing.
+const LOAD_PIXEL_TEXTURE: &str = r#"fn load_pixel(x: i32, y: i32) -> f32 {
+    let c = vec2<i32>(
+        clamp(x, 0, i32(params.img_width)  - 1),
+        clamp(y, 0, i32(params.img_height) - 1),
+    );
+    return textureLoad(input_tex, c, 0).r;
+}"#;
+
+/// Build fast_nms_fused.wgsl (texture sampling; a shared-memory tile was
+/// tried and gave no gain on Orin — the texture cache already serves the
+/// overlapping FAST reads).
+fn fused_shader_source() -> String {
+    [
+        include_str!("../shaders/fast_nms_fused.wgsl"),
+        LOAD_PIXEL_TEXTURE,
+        "\n",
+        include_str!("../shaders/fast_common.wgsl"),
+    ]
+    .concat()
+}
+
+/// Uniform for fast_nms_fused.wgsl (must match `FusedParams` there).
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct NmsParams {
+struct FusedParams {
     img_width: u32,
     img_height: u32,
+    threshold: f32,
+    arc_length: u32,
     cell_size: u32,
     n_cells_x: u32,
     n_cells_y: u32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
+    _pad: u32,
 }
 
 #[repr(C)]
@@ -81,8 +106,6 @@ struct CellWinner {
     score: f32,
     _pad: f32,
 }
-
-const WG_SIZE_NMS: u32 = 64;
 
 // ---------------------------------------------------------------------------
 // Strategy-specific state
@@ -97,12 +120,10 @@ struct CpuNmsState {
 }
 
 struct GpuNmsState {
-    nms_pipeline: wgpu::ComputePipeline,
-    nms_bgl: wgpu::BindGroupLayout,
-    score_buf: wgpu::Buffer,
+    fused_pipeline: wgpu::ComputePipeline,
     winners_buf: wgpu::Buffer,
     rb_buf: wgpu::Buffer,
-    nms_params_buf: wgpu::Buffer,
+    fused_params_buf: wgpu::Buffer,
     n_cells_recorded: u32,
     img_w: u32,
     img_h: u32,
@@ -125,7 +146,6 @@ enum NmsState {
 pub struct GpuFastDetector {
     fast_pipeline: wgpu::ComputePipeline,
     fast_bgl: wgpu::BindGroupLayout,
-    fast_params_buf: wgpu::Buffer,
 
     pub threshold: u8,
     pub arc_length: usize,
@@ -156,15 +176,17 @@ impl GpuFastDetector {
         );
 
         // ── FAST shader (shared by both strategies) ───────────────────────────
-        let fast_src = include_str!("../shaders/fast.wgsl")
-            .replace("{{WG_X}}", &gpu.workgroup_size.x.to_string())
-            .replace("{{WG_Y}}", &gpu.workgroup_size.y.to_string());
-        let fast_shader = gpu
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("fast.wgsl"),
-                source: wgpu::ShaderSource::Wgsl(fast_src.into()),
-            });
+        let fast_src = [
+            include_str!("../shaders/fast.wgsl"),
+            include_str!("../shaders/fast_common.wgsl"),
+        ]
+        .concat()
+        .replace("{{WG_X}}", &gpu.workgroup_size.x.to_string())
+        .replace("{{WG_Y}}", &gpu.workgroup_size.y.to_string());
+        let fast_shader = gpu.create_compute_shader(wgpu::ShaderModuleDescriptor {
+            label: Some("fast.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(fast_src.into()),
+        });
 
         let fast_bgl = gpu
             .device
@@ -211,22 +233,15 @@ impl GpuFastDetector {
                     layout: Some(&gpu.device.create_pipeline_layout(
                         &wgpu::PipelineLayoutDescriptor {
                             label: None,
-                            bind_group_layouts: &[&fast_bgl],
-                            push_constant_ranges: &[],
+                            bind_group_layouts: &[Some(&fast_bgl)],
+                            immediate_size: 0,
                         },
                     )),
                     module: &fast_shader,
-                    entry_point: "detect_corners",
+                    entry_point: Some("detect_corners"),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     cache: None,
                 });
-
-        let fast_params_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("GpuFast params"),
-            size: std::mem::size_of::<FastParams>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
 
         // ── Strategy-specific setup ───────────────────────────────────────────
         let nms = match nms_strategy {
@@ -239,80 +254,33 @@ impl GpuFastDetector {
                 let n_cells_x = w.div_ceil(cs);
                 let n_cells_y = h.div_ceil(cs);
 
-                let nms_src = include_str!("../shaders/nms.wgsl")
-                    .replace("{{WG_SIZE}}", &WG_SIZE_NMS.to_string());
-                let nms_shader = gpu
-                    .device
-                    .create_shader_module(wgpu::ShaderModuleDescriptor {
-                        label: Some("nms.wgsl"),
-                        source: wgpu::ShaderSource::Wgsl(nms_src.into()),
-                    });
-
-                let nms_bgl =
-                    gpu.device
-                        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                            label: Some("GpuNms BGL"),
-                            entries: &[
-                                wgpu::BindGroupLayoutEntry {
-                                    binding: 0,
-                                    visibility: wgpu::ShaderStages::COMPUTE,
-                                    ty: wgpu::BindingType::Buffer {
-                                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                                        has_dynamic_offset: false,
-                                        min_binding_size: None,
-                                    },
-                                    count: None,
-                                },
-                                wgpu::BindGroupLayoutEntry {
-                                    binding: 1,
-                                    visibility: wgpu::ShaderStages::COMPUTE,
-                                    ty: wgpu::BindingType::Buffer {
-                                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                        has_dynamic_offset: false,
-                                        min_binding_size: None,
-                                    },
-                                    count: None,
-                                },
-                                wgpu::BindGroupLayoutEntry {
-                                    binding: 2,
-                                    visibility: wgpu::ShaderStages::COMPUTE,
-                                    ty: wgpu::BindingType::Buffer {
-                                        ty: wgpu::BufferBindingType::Uniform,
-                                        has_dynamic_offset: false,
-                                        min_binding_size: None,
-                                    },
-                                    count: None,
-                                },
-                            ],
-                        });
-
-                let nms_pipeline =
+                let fused_src = fused_shader_source();
+                let fused_shader = gpu.create_compute_shader(wgpu::ShaderModuleDescriptor {
+                    label: Some("fast_nms_fused.wgsl"),
+                    source: wgpu::ShaderSource::Wgsl(fused_src.into()),
+                });
+                // Same binding shape as the dense FAST pass: texture, storage
+                // (winners instead of scores), uniform params.
+                let fused_pipeline =
                     gpu.device
                         .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                            label: Some("nms_cells"),
+                            label: Some("detect_nms"),
                             layout: Some(&gpu.device.create_pipeline_layout(
                                 &wgpu::PipelineLayoutDescriptor {
                                     label: None,
-                                    bind_group_layouts: &[&nms_bgl],
-                                    push_constant_ranges: &[],
+                                    bind_group_layouts: &[Some(&fast_bgl)],
+                                    immediate_size: 0,
                                 },
                             )),
-                            module: &nms_shader,
-                            entry_point: "nms_cells",
+                            module: &fused_shader,
+                            entry_point: Some("detect_nms"),
                             compilation_options: wgpu::PipelineCompilationOptions::default(),
                             cache: None,
                         });
 
-                let score_bytes = (img_w * img_h) as u64 * 4;
                 let n_cells = (n_cells_x * n_cells_y) as u64;
                 let winners_bytes = n_cells * std::mem::size_of::<CellWinner>() as u64;
 
-                let score_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("GpuFast scores"),
-                    size: score_bytes,
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
                 let winners_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("GpuNms winners"),
                     size: winners_bytes,
@@ -325,20 +293,18 @@ impl GpuFastDetector {
                     usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });
-                let nms_params_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("GpuNms params"),
-                    size: std::mem::size_of::<NmsParams>() as u64,
+                let fused_params_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("GpuFast fused params"),
+                    size: std::mem::size_of::<FusedParams>() as u64,
                     usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });
 
                 NmsState::Gpu(GpuNmsState {
-                    nms_pipeline,
-                    nms_bgl,
-                    score_buf,
+                    fused_pipeline,
                     winners_buf,
                     rb_buf,
-                    nms_params_buf,
+                    fused_params_buf,
                     n_cells_recorded: 0,
                     img_w: w,
                     img_h: h,
@@ -349,7 +315,6 @@ impl GpuFastDetector {
         GpuFastDetector {
             fast_pipeline,
             fast_bgl,
-            fast_params_buf,
             threshold,
             arc_length,
             cell_size,
@@ -375,7 +340,6 @@ impl GpuFastDetector {
     ) {
         let w = level.width;
         let h = level.height;
-        let cs = self.cell_size as u32;
 
         match &mut self.nms {
             NmsState::Cpu(slot) => {
@@ -450,112 +414,98 @@ impl GpuFastDetector {
                 });
             }
 
-            NmsState::Gpu(s) => {
-                gpu.queue.write_buffer(
-                    &self.fast_params_buf,
-                    0,
-                    bytemuck::bytes_of(&FastParams {
-                        img_width: w,
-                        img_height: h,
-                        threshold: self.threshold as f32,
-                        arc_length: self.arc_length as u32,
-                    }),
-                );
-                assert!(
-                    w <= s.img_w && h <= s.img_h,
-                    "image ({w}×{h}) larger than pre-allocated buffers ({}×{})",
-                    s.img_w,
-                    s.img_h
-                );
-
-                let n_cells_x = w.div_ceil(cs);
-                let n_cells_y = h.div_ceil(cs);
-                let n_cells = n_cells_x * n_cells_y;
-                let score_bytes = (w * h) as u64 * 4;
-                let winners_bytes = n_cells as u64 * std::mem::size_of::<CellWinner>() as u64;
-
-                gpu.queue.write_buffer(
-                    &s.nms_params_buf,
-                    0,
-                    bytemuck::bytes_of(&NmsParams {
-                        img_width: w,
-                        img_height: h,
-                        cell_size: cs,
-                        n_cells_x,
-                        n_cells_y,
-                        _pad0: 0,
-                        _pad1: 0,
-                        _pad2: 0,
-                    }),
-                );
-
-                let fast_bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("GpuFast BG"),
-                    layout: &self.fast_bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(&level.read_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: s.score_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: self.fast_params_buf.as_entire_binding(),
-                        },
-                    ],
-                });
-                let nms_bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("GpuNms BG"),
-                    layout: &s.nms_bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: s.score_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: s.winners_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: s.nms_params_buf.as_entire_binding(),
-                        },
-                    ],
-                });
-
-                let (wg_x, wg_y) = gpu.dispatch_size(w, h);
-                let nms_wg = (n_cells + WG_SIZE_NMS - 1) / WG_SIZE_NMS;
-
-                // clear_buffer prevents cross-frame WAW barriers on the pre-allocated
-                // score_buf. Without it RADV stalls until the previous frame's NMS
-                // pass has finished reading, producing an alternating ~3 ms penalty.
-                encoder.clear_buffer(&s.score_buf, 0, Some(score_bytes));
+            NmsState::Gpu(_) => {
                 {
                     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("detect_corners"),
+                        label: Some("detect_nms"),
                         timestamp_writes: None,
                     });
-                    pass.set_pipeline(&self.fast_pipeline);
-                    pass.set_bind_group(0, &fast_bg, &[]);
-                    pass.dispatch_workgroups(wg_x, wg_y, 1);
+                    self.record_dispatch(gpu, &mut pass, level);
                 }
-                {
-                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("nms_cells"),
-                        timestamp_writes: None,
-                    });
-                    pass.set_pipeline(&s.nms_pipeline);
-                    pass.set_bind_group(0, &nms_bg, &[]);
-                    pass.dispatch_workgroups(nms_wg, 1, 1);
-                }
-                encoder.copy_buffer_to_buffer(&s.winners_buf, 0, &s.rb_buf, 0, winners_bytes);
-
-                s.n_cells_recorded = n_cells;
+                self.record_readback(encoder);
             }
         }
+    }
+
+    /// Whether this detector uses `NmsStrategy::Gpu` (the fused kernel that
+    /// [`record_dispatch`](GpuFastDetector::record_dispatch) records).
+    pub fn uses_gpu_nms(&self) -> bool {
+        matches!(self.nms, NmsState::Gpu(_))
+    }
+
+    /// `NmsStrategy::Gpu` only: the fused FAST + NMS dispatch into an existing
+    /// compute pass. Pair with [`record_readback`] after the pass.
+    ///
+    /// [`record_readback`]: GpuFastDetector::record_readback
+    pub fn record_dispatch(
+        &mut self,
+        gpu: &GpuDevice,
+        pass: &mut wgpu::ComputePass<'_>,
+        level: &GpuPyramidLevel,
+    ) {
+        let NmsState::Gpu(s) = &mut self.nms else {
+            panic!("record_dispatch requires NmsStrategy::Gpu");
+        };
+        let (w, h) = (level.width, level.height);
+        let cs = self.cell_size as u32;
+        assert!(
+            w <= s.img_w && h <= s.img_h,
+            "image ({w}×{h}) larger than pre-allocated buffers ({}×{})",
+            s.img_w,
+            s.img_h
+        );
+        let n_cells_x = w.div_ceil(cs);
+        let n_cells_y = h.div_ceil(cs);
+        let n_cells = n_cells_x * n_cells_y;
+
+        gpu.queue.write_buffer(
+            &s.fused_params_buf,
+            0,
+            bytemuck::bytes_of(&FusedParams {
+                img_width: w,
+                img_height: h,
+                threshold: self.threshold as f32,
+                arc_length: self.arc_length as u32,
+                cell_size: cs,
+                n_cells_x,
+                n_cells_y,
+                _pad: 0,
+            }),
+        );
+        let bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("GpuFast fused BG"),
+            layout: &self.fast_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&level.read_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: s.winners_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: s.fused_params_buf.as_entire_binding(),
+                },
+            ],
+        });
+        pass.set_pipeline(&s.fused_pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups(n_cells, 1, 1);
+        s.n_cells_recorded = n_cells;
+    }
+
+    /// `NmsStrategy::Gpu` only: copy the cell winners to the readback buffer
+    /// (record after the pass containing [`record_dispatch`]).
+    ///
+    /// [`record_dispatch`]: GpuFastDetector::record_dispatch
+    pub fn record_readback(&self, encoder: &mut wgpu::CommandEncoder) {
+        let NmsState::Gpu(s) = &self.nms else {
+            panic!("record_readback requires NmsStrategy::Gpu");
+        };
+        let bytes = s.n_cells_recorded as u64 * std::mem::size_of::<CellWinner>() as u64;
+        encoder.copy_buffer_to_buffer(&s.winners_buf, 0, &s.rb_buf, 0, bytes);
     }
 
     /// Map the readback buffer asynchronously.
@@ -598,7 +548,11 @@ impl GpuFastDetector {
             NmsState::Cpu(slot) => {
                 let s = slot.take().expect("record_into() state missing");
                 let score_bytes = (s.img_w * s.img_h) as u64 * 4;
-                let mapped = s.rb_buf.slice(..score_bytes).get_mapped_range();
+                let mapped = s
+                    .rb_buf
+                    .slice(..score_bytes)
+                    .get_mapped_range()
+                    .expect("buffer mapping failed");
                 let scores: &[f32] = bytemuck::cast_slice(&mapped);
 
                 // Cell-max NMS — mirrors nms.wgsl logic on CPU.
@@ -648,7 +602,11 @@ impl GpuFastDetector {
             NmsState::Gpu(s) => {
                 let winners_bytes =
                     s.n_cells_recorded as u64 * std::mem::size_of::<CellWinner>() as u64;
-                let mapped = s.rb_buf.slice(..winners_bytes).get_mapped_range();
+                let mapped = s
+                    .rb_buf
+                    .slice(..winners_bytes)
+                    .get_mapped_range()
+                    .expect("buffer mapping failed");
                 let winners: &[CellWinner] = bytemuck::cast_slice(&mapped);
                 let features = winners
                     .iter()
@@ -686,7 +644,9 @@ impl GpuFastDetector {
         self.record_into(gpu, &mut enc, level);
         gpu.queue.submit(std::iter::once(enc.finish()));
         self.arm_readback();
-        gpu.device.poll(wgpu::Maintain::Wait);
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("GPU poll failed");
         self.collect_winners(pyramid_level)
     }
 }

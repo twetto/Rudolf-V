@@ -41,7 +41,7 @@ pub struct GpuGlobalHistEq {
     lut_buf: wgpu::Buffer,
     rb_buf: wgpu::Buffer,
     // Histogram bind groups per source texture (the frontend's two pyramids).
-    bg_cache: Vec<(u64, wgpu::BindGroup)>,
+    bg_cache: Vec<(wgpu::Texture, wgpu::BindGroup)>,
     readback_rx: Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
 }
 
@@ -95,20 +95,20 @@ impl GpuGlobalHistEq {
         });
 
         let pipeline = |src: &str, label: &str, entry: &str, bgl: &wgpu::BindGroupLayout| {
-            let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
+            let module = gpu.create_compute_shader(wgpu::ShaderModuleDescriptor {
                 label: Some(label),
                 source: wgpu::ShaderSource::Wgsl(src.into()),
             });
             let layout = dev.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(label),
-                bind_group_layouts: &[bgl],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(bgl)],
+                immediate_size: 0,
             });
             dev.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(label),
                 layout: Some(&layout),
                 module: &module,
-                entry_point: entry,
+                entry_point: Some(entry),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             })
@@ -201,10 +201,32 @@ impl GpuGlobalHistEq {
         encoder: &mut wgpu::CommandEncoder,
         pyr: &GpuPyramid,
     ) {
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("histeq"),
+                timestamp_writes: None,
+            });
+            self.record_dispatches(gpu, &mut pass, pyr);
+        }
+        self.record_readback(encoder);
+    }
+
+    /// Histogram + LUT dispatches into an existing compute pass. Zeroes the
+    /// histogram through the queue (lands before the next submit), so no
+    /// encoder-level clear is needed. Pair with [`record_readback`] after the
+    /// pass.
+    ///
+    /// [`record_readback`]: GpuGlobalHistEq::record_readback
+    pub fn record_dispatches(
+        &mut self,
+        gpu: &GpuDevice,
+        pass: &mut wgpu::ComputePass<'_>,
+        pyr: &GpuPyramid,
+    ) {
         let raw_view = pyr
             .raw_view()
             .expect("GpuGlobalHistEq needs a pyramid from GpuPyramidPipeline::allocate*");
-        let key = pyr.levels[0].texture.global_id().inner();
+        let key = pyr.levels[0].texture.clone();
         let idx = match self.bg_cache.iter().position(|(k, _)| *k == key) {
             Some(i) => i,
             None => {
@@ -230,25 +252,18 @@ impl GpuGlobalHistEq {
             }
         };
 
-        encoder.clear_buffer(&self.hist_buf, 0, None);
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("histeq histogram"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.hist_pipeline);
-            pass.set_bind_group(0, &self.bg_cache[idx].1, &[]);
-            pass.dispatch_workgroups(HIST_WORKGROUPS, 1, 1);
-        }
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("histeq LUT"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.lut_pipeline);
-            pass.set_bind_group(0, &self.lut_bg, &[]);
-            pass.dispatch_workgroups(1, 1, 1);
-        }
+        gpu.queue
+            .write_buffer(&self.hist_buf, 0, &[0u8; LUT_BYTES as usize]);
+        pass.set_pipeline(&self.hist_pipeline);
+        pass.set_bind_group(0, &self.bg_cache[idx].1, &[]);
+        pass.dispatch_workgroups(HIST_WORKGROUPS, 1, 1);
+        pass.set_pipeline(&self.lut_pipeline);
+        pass.set_bind_group(0, &self.lut_bg, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+
+    /// Copy the LUT to the readback buffer (record after the pass).
+    pub fn record_readback(&self, encoder: &mut wgpu::CommandEncoder) {
         encoder.copy_buffer_to_buffer(&self.lut_buf, 0, &self.rb_buf, 0, LUT_BYTES);
     }
 
@@ -279,7 +294,11 @@ impl GpuGlobalHistEq {
             .take()
             .expect("call arm_readback() before collect_lut()");
         rx.recv().unwrap().expect("histeq LUT readback failed");
-        let mapped = self.rb_buf.slice(..).get_mapped_range();
+        let mapped = self
+            .rb_buf
+            .slice(..)
+            .get_mapped_range()
+            .expect("buffer mapping failed");
         let words: &[u32] = bytemuck::cast_slice(&mapped);
         let lut: [u8; 256] = std::array::from_fn(|i| words[i] as u8);
         drop(mapped);
@@ -300,7 +319,9 @@ impl GpuGlobalHistEq {
         self.record(gpu, &mut enc, pyr);
         gpu.queue.submit(std::iter::once(enc.finish()));
         self.arm_readback();
-        gpu.device.poll(wgpu::Maintain::Wait);
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("GPU poll failed");
         self.collect_lut()
     }
 }

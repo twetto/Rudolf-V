@@ -62,15 +62,13 @@ struct PyramidParams {
 // Kernel coefficient accessor
 // ---------------------------------------------------------------------------
 
-fn coeff(i: i32) -> f32 {
-    let vi = u32(i) / 4u;
-    let ei = u32(i) % 4u;
-    let v = params.coeffs[vi];
-    if      ei == 0u { return v.x; }
-    else if ei == 1u { return v.y; }
-    else if ei == 2u { return v.z; }
-    else             { return v.w; }
-}
+// The pyramid always uses the binomial kernel [1, 4, 6, 4, 1] / 16 (see
+// GpuPyramidPipeline); the weights are exact in f32. They are compile-time
+// constants here rather than read from `params.coeffs` through a branchy
+// accessor with uniform loop bounds — that generic form made level 1 cost
+// ~0.12 ms on Jetson Orin Nano. Summation order and the (wx * wy) * v
+// expression are unchanged, so results are bit-identical.
+const W5 = array<f32, 5>(0.0625, 0.25, 0.375, 0.25, 0.0625);
 
 // ---------------------------------------------------------------------------
 // Compute entry point
@@ -90,15 +88,13 @@ fn blur_downsample(@builtin(global_invocation_id) gid: vec3<u32>) {
     let max_x: i32 = i32(src_dims.x) - 1;
     let max_y: i32 = i32(src_dims.y) - 1;
 
-    let half: i32 = i32(params.half_size);
-
     var sum: f32 = 0.0;
-    for (var ky: i32 = -half; ky <= half; ky++) {
+    for (var ky: i32 = -2; ky <= 2; ky++) {
         let sy: i32 = clamp(cy + ky, 0, max_y);
-        let wy: f32 = coeff(abs(ky));
-        for (var kx: i32 = -half; kx <= half; kx++) {
+        let wy: f32 = W5[ky + 2];
+        for (var kx: i32 = -2; kx <= 2; kx++) {
             let sx: i32 = clamp(cx + kx, 0, max_x);
-            let wx: f32 = coeff(abs(kx));
+            let wx: f32 = W5[kx + 2];
             sum += wx * wy * textureLoad(input_tex, vec2<i32>(sx, sy), 0).r;
         }
     }
