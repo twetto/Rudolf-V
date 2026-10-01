@@ -105,6 +105,70 @@ pub enum SubmitStrategy {
     Pipelined,
 }
 
+/// How `collect()` waits for GPU work that has not finished yet.
+///
+/// Only matters when `collect()` is called before the GPU is done (e.g.
+/// `process()`, or a caller with little work between `submit()` and
+/// `collect()`); otherwise there is nothing to wait for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum GpuWait {
+    /// `SleepPoll { interval_us: 20 }` on NVIDIA Tegra (Jetson) adapters,
+    /// `Block` elsewhere.
+    #[default]
+    Auto,
+    /// The driver's blocking wait (`vkWaitSemaphores` via wgpu). On Jetson
+    /// Orin Nano the NVIDIA driver busy-waits inside it, keeping a CPU core
+    /// at 100% for the whole wait.
+    Block,
+    /// Check for completion without blocking (zero-timeout wait) and sleep
+    /// `interval_us` between checks, leaving the core to other threads.
+    /// Jetson Orin Nano, Global histeq, nothing between submit and collect:
+    /// CPU time 1.26 → 0.56 ms/frame for +0.04–0.06 ms frame time
+    /// (20–50 µs intervals).
+    SleepPoll { interval_us: u32 },
+}
+
+impl GpuWait {
+    /// The concrete strategy for this device (`Auto` resolved).
+    fn resolve(self, gpu: &GpuDevice) -> GpuWait {
+        match self {
+            GpuWait::Auto if gpu.adapter_info.name.contains("Tegra") => {
+                GpuWait::SleepPoll { interval_us: 20 }
+            }
+            GpuWait::Auto => GpuWait::Block,
+            other => other,
+        }
+    }
+
+    /// Wait until `submission` (or, if `None`, all submitted work) has
+    /// completed and its map callbacks have run.
+    fn wait(self, gpu: &GpuDevice, submission: Option<&wgpu::SubmissionIndex>) {
+        match self {
+            GpuWait::SleepPoll { interval_us } => {
+                let interval = std::time::Duration::from_micros(interval_us as u64);
+                loop {
+                    match gpu.device.poll(wgpu::PollType::Wait {
+                        submission_index: submission.cloned(),
+                        timeout: Some(std::time::Duration::ZERO),
+                    }) {
+                        Ok(_) => return,
+                        Err(wgpu::PollError::Timeout) => std::thread::sleep(interval),
+                        Err(e) => panic!("GPU poll failed: {e}"),
+                    }
+                }
+            }
+            GpuWait::Block | GpuWait::Auto => {
+                gpu.device
+                    .poll(wgpu::PollType::Wait {
+                        submission_index: submission.cloned(),
+                        timeout: None,
+                    })
+                    .expect("GPU poll failed");
+            }
+        }
+    }
+}
+
 /// Configuration for the GPU visual frontend.
 ///
 /// Mirrors `FrontendConfig` from frontend.rs. Fields that select between
@@ -161,6 +225,8 @@ pub struct GpuFrontendConfig {
     /// submit; bit-identical to the CPU equalization). Fused strategy only;
     /// CLAHE and the Separate strategy always equalize on the CPU.
     pub gpu_histeq: bool,
+    /// How `collect()` waits for unfinished GPU work. See [`GpuWait`].
+    pub gpu_wait: GpuWait,
     /// Histogram equalization applied before GPU upload.
     /// Stabilizes brightness across frames when auto-exposure is active.
     pub histeq: HistEqMethod,
@@ -195,6 +261,7 @@ impl Default for GpuFrontendConfig {
             min_reservoir_score: f32::NEG_INFINITY,
             tile_reservoir_pruning_enabled: true,
             gpu_histeq: true,
+            gpu_wait: GpuWait::Auto,
             histeq: HistEqMethod::None,
             camera: None,
             ransac: RansacConfig::default(),
@@ -299,6 +366,8 @@ pub struct GpuFrontend {
     has_prev: bool,
     // Frame between submit() and collect().
     pending: Option<PendingFrame>,
+    // `config.gpu_wait` resolved for this device.
+    wait: GpuWait,
 
     img_w: usize,
     img_h: usize,
@@ -311,6 +380,7 @@ impl GpuFrontend {
     /// at startup, not every frame.
     pub fn new(gpu: &GpuDevice, config: GpuFrontendConfig, img_w: usize, img_h: usize) -> Self {
         let camera_projection = config.camera.as_ref().map(CameraIntrinsics::projection);
+        let config_wait = config.gpu_wait.resolve(gpu);
         let pyr_pipeline = GpuPyramidPipeline::new(gpu);
         let fast = GpuFastDetector::new(
             gpu,
@@ -367,6 +437,7 @@ impl GpuFrontend {
             features: Vec::new(),
             track_meta: Vec::new(),
             pending: None,
+            wait: config_wait,
             prev_features: Vec::new(),
             next_id: 1,
             has_prev: false,
@@ -607,9 +678,12 @@ impl GpuFrontend {
     /// `stats.timing.total` counts only time spent inside `submit` and
     /// `collect`, not the caller's work in between.
     ///
-    /// On the Jetson Orin Nano the driver's GPU wait spins a CPU core; to use
-    /// the GPU time for other work, call `collect` late or check
-    /// [`poll_ready`] first.
+    /// If the GPU is still busy, `collect` waits according to
+    /// [`GpuFrontendConfig::gpu_wait`] (by default sleep-polling on Jetson,
+    /// where the driver's blocking wait spins a core). Work done between
+    /// `submit` and `collect` overlaps with the GPU; [`poll_ready`] checks
+    /// without waiting. (`SubmitStrategy::Separate` keeps the original blocking
+    /// waits inside its stages.)
     ///
     /// # Panics
     /// If no frame was submitted.
@@ -639,14 +713,7 @@ impl GpuFrontend {
         // ── Step 2: KLT results (+ LBP verification, CPU) ────────────────────
         let t0 = Instant::now();
         let (results, fused_winners) = if p.fused {
-            let wait = match &p.first_submit {
-                Some(idx) => wgpu::PollType::Wait {
-                    submission_index: Some(idx.clone()),
-                    timeout: None,
-                },
-                None => wgpu::PollType::wait_indefinitely(),
-            };
-            gpu.device.poll(wait).expect("GPU poll failed");
+            self.wait.wait(gpu, p.first_submit.as_ref());
             if p.gpu_lut {
                 self.frame_lut = Some(self.histeq_gpu.collect_lut());
             } else {
@@ -845,9 +912,7 @@ impl GpuFrontend {
         let winners = if let Some(w) = fused_winners {
             w
         } else if p.pipelined {
-            gpu.device
-                .poll(wgpu::PollType::wait_indefinitely())
-                .expect("GPU poll failed");
+            self.wait.wait(gpu, None);
             self.fast.collect_winners(0)
         } else if slots > 0 {
             let curr_pyr = p
@@ -955,9 +1020,7 @@ impl GpuFrontend {
         let Some(p) = self.pending.take() else { return };
         debug_assert!(p.discarded);
         if p.fused {
-            gpu.device
-                .poll(wgpu::PollType::wait_indefinitely())
-                .expect("GPU poll failed");
+            self.wait.wait(gpu, None);
             if p.tracking {
                 let _ = self.klt.collect_results(&p.feats_snap);
             }

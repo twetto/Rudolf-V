@@ -28,6 +28,7 @@
 //   RUDOLF_GPU_HISTEQ=1|0             Global histeq on the GPU (default: 1)
 //   RUDOLF_RANSAC_THRESH=1e-5         RANSAC threshold (bench_euroc_cpu uses the
 //                                     RansacConfig default, 5e-4)
+//   RUDOLF_GPU_WAIT=auto|block|sleep[:us]   How collect() waits (default: auto)
 //   RUDOLF_OVERLAP_MS=0               Simulated backend CPU work (ms) run between
 //                                     submit() and collect() each frame
 
@@ -36,7 +37,7 @@ use rudolf_v::essential::RansacConfig;
 use rudolf_v::frontend::LbpPolicy;
 use rudolf_v::gpu::device::GpuDevice;
 use rudolf_v::gpu::fast::NmsStrategy;
-use rudolf_v::gpu::frontend::{GpuFrontend, GpuFrontendConfig, SubmitStrategy};
+use rudolf_v::gpu::frontend::{GpuFrontend, GpuFrontendConfig, GpuWait, SubmitStrategy};
 use rudolf_v::gpu::klt::KltSampling;
 use rudolf_v::histeq::HistEqMethod;
 use rudolf_v::image::Image;
@@ -64,6 +65,7 @@ fn main() {
         eprintln!("  RUDOLF_TILE_PRUNE=1|0");
         eprintln!("  RUDOLF_GPU_HISTEQ=1|0");
         eprintln!("  RUDOLF_RANSAC_THRESH=1e-5");
+        eprintln!("  RUDOLF_GPU_WAIT=auto|block|sleep[:us]");
         eprintln!("  RUDOLF_OVERLAP_MS=0");
         std::process::exit(1);
     }
@@ -167,6 +169,16 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.0);
+    let gpu_wait = match env::var("RUDOLF_GPU_WAIT").as_deref() {
+        Ok("block") => GpuWait::Block,
+        Ok(v) if v.starts_with("sleep") => GpuWait::SleepPoll {
+            interval_us: v
+                .strip_prefix("sleep:")
+                .and_then(|us| us.parse().ok())
+                .unwrap_or(20),
+        },
+        _ => GpuWait::Auto,
+    };
 
     let sensor_yaml = cam0_dir.join("sensor.yaml");
     let camera = CameraIntrinsics::from_euroc_yaml(&sensor_yaml).ok();
@@ -190,6 +202,7 @@ fn main() {
         lbp_policy,
         tile_reservoir_pruning_enabled,
         gpu_histeq,
+        gpu_wait,
         histeq,
         camera,
         ransac: RansacConfig {

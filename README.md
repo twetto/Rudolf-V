@@ -311,6 +311,19 @@ What got it there (frontend output bit-identical throughout):
   LBP, RANSAC and pruning overlap with it on the GPU. It reads the pyramid
   across submits, which was only deterministic with a fixed GPU clock here.
 
+**GPU waits.** wgpu waits with `vkWaitSemaphores`, and NVIDIA's Tegra driver
+busy-waits inside it, keeping a core at 100% for the whole wait.
+`GpuFrontendConfig::gpu_wait` (`GpuWait::Auto`, the default) therefore
+sleep-polls on Tegra: a zero-timeout wait, then 20 µs sleeps. Elsewhere it
+uses the driver's blocking wait. This only matters when `collect()` runs
+before the GPU is done; with ≥ the GPU time of work between `submit()` and
+`collect()`, there is no wait at all. Measured with nothing in between:
+
+| | Block: frame / CPU | Auto: frame / CPU |
+|---|---|---|
+| Fused, no histeq | 1.09 / 1.09 ms | 1.14 / 0.55 ms |
+| Fused, Global | 1.30 / 1.30 ms | 1.29 / 0.58 ms |
+
 Tried without gain: a shared-memory tile for FAST (the texture cache already
 serves the overlapping reads), and arithmetic circle offsets (slower than the
 table).
