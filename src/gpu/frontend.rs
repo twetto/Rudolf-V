@@ -32,7 +32,7 @@
 //
 // SUBMISSION
 // ──────────
-// Fused (default, one wait per frame): upload + pyramid + KLT + FAST + NMS
+// Fused (one wait per frame): upload + pyramid + KLT + FAST + NMS
 // are recorded into a single encoder. FAST always runs, even when the
 // reservoir is full before KLT: KLT losses (and RANSAC rejections) would
 // otherwise need a second blocking round-trip just for detection.
@@ -44,6 +44,19 @@
 // intermittently read stale contents — output became nondeterministic.
 // Fused never does that: each pyramid is built and first consumed in one
 // command buffer. Keep that invariant if you restructure this.
+//
+// Pipelined splits the frame after KLT: FAST + NMS read the curr pyramid in a
+// second submit. KLT has already read it in the first command buffer (except
+// on frames with nothing to track), so FAST is a later consumer, not the
+// first. Submit-time Vulkan synchronization validation (VVL 1.3.250) reports
+// no hazards for either strategy, and on Jetson Orin Nano Pipelined stayed
+// bit-exact at unlocked clocks while a probe that builds a fresh pyramid and
+// reads it only in a later submit still read stale data (wgpu 30). That the
+// first-consumer rule is what matters is an observation, not a proven cause.
+//
+// Auto (default) uses Pipelined while collect() has to wait for the GPU and
+// Fused once the caller's work between submit() and collect() covers the
+// GPU time (the second submit then only costs CPU). See SubmitStrategy.
 //
 // RANSAC NOTE
 // ────────────
@@ -79,9 +92,10 @@ use camera_geometry::{CameraModel, CameraProjection, Pixel};
 
 /// Controls how KLT and FAST are submitted to the GPU each frame.
 ///
-/// `Fused` is the default and the fast, verified path. `Pipelined` is faster
-/// still but only verified with a fixed GPU clock (see its docs). `Separate`
-/// is the original pipeline, kept for comparison.
+/// `Auto` (default) picks `Fused` or `Pipelined` per frame, whichever is
+/// faster for how the caller uses `submit()` / `collect()`; all three give
+/// bit-identical results. `Separate` is the original pipeline, kept for
+/// comparison.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SubmitStrategy {
     /// Original flow: fresh pyramid per frame, KLT and FAST in separate
@@ -89,20 +103,29 @@ pub enum SubmitStrategy {
     Separate,
     /// Pyramid + KLT + FAST recorded into one encoder: one submit, one wait
     /// per frame, persistent pyramids and bind groups (no per-frame
-    /// allocation). Default.
-    #[default]
+    /// allocation). Fastest when the caller does enough work between
+    /// `submit()` and `collect()` for the GPU to finish first.
     Fused,
     /// Like `Fused`, but FAST + NMS go in a second submit so the CPU runs LBP,
     /// RANSAC and reservoir pruning while the GPU is still detecting (collect
     /// waits for the first submit, then for the second only before
-    /// replenishment). Same results as `Fused`.
+    /// replenishment). Same results as `Fused`. Fastest when `collect()` is
+    /// called right after `submit()` (or via `process()`); the second submit
+    /// costs ~0.1 ms of CPU on Jetson Orin Nano, wasted when the GPU would
+    /// have finished anyway.
     ///
-    /// Caveat: FAST reads the pyramid in a later submit than the one that
-    /// built it. On the Jetson Orin Nano (wgpu Vulkan) that pattern returned
-    /// stale texels while the GPU clock governor was switching frequencies;
-    /// it was deterministic with the clock fixed. Use only with a fixed GPU
-    /// clock (e.g. min_freq = max_freq, or jetson_clocks).
+    /// FAST reads the pyramid in a later submit than the one that built it.
+    /// Vulkan synchronization validation (submit-time checks) reports no
+    /// hazards, and on Jetson Orin Nano it stayed bit-exact at unlocked GPU
+    /// clocks (174 full EuRoC runs) while a probe that builds fresh pyramids
+    /// per call hit the driver's stale-read issue (see SUBMISSION).
     Pipelined,
+    /// `Pipelined` while `collect()` has to wait for the GPU, `Fused` once
+    /// the caller's work between `submit()` and `collect()` covers the GPU
+    /// time. Decided per frame from the previous frame (a zero-timeout check
+    /// at the start of `collect()`); switching never changes results. Default.
+    #[default]
+    Auto,
 }
 
 /// How `collect()` waits for GPU work that has not finished yet.
@@ -176,8 +199,7 @@ impl GpuWait {
 /// GPU frontend always uses IC KLT and GPU FAST.
 #[derive(Clone)]
 pub struct GpuFrontendConfig {
-    /// GPU submit strategy: one fused submit per frame, or the original
-    /// separate submits. See [`SubmitStrategy`]. Defaults to `Fused`.
+    /// GPU submit strategy. See [`SubmitStrategy`]. Defaults to `Auto`.
     pub submit_strategy: SubmitStrategy,
     /// NMS strategy: CPU readback (iGPU) or GPU NMS pass (discrete GPU).
     /// See [`NmsStrategy`] for guidance. Defaults to `Cpu`.
@@ -206,7 +228,7 @@ pub struct GpuFrontendConfig {
     pub klt_epsilon: f32,
     /// How KLT interpolates the pyramid: manual 4-tap bilinear (`Manual`,
     /// default) or hardware texture filtering (`Hardware` / `Auto`, ~3% faster
-    /// frontend, slightly more KLT outliers; only verified with `Fused`).
+    /// frontend, slightly more KLT outliers; nondeterministic with `Separate` on Tegra).
     /// See [`KltSampling`].
     pub klt_sampling: KltSampling,
     /// LBP descriptor verification (occlusion/drift detection), as in the
@@ -240,7 +262,7 @@ pub struct GpuFrontendConfig {
 impl Default for GpuFrontendConfig {
     fn default() -> Self {
         GpuFrontendConfig {
-            submit_strategy: SubmitStrategy::Fused,
+            submit_strategy: SubmitStrategy::Auto,
             nms_strategy: NmsStrategy::Cpu,
             fast_threshold: 20,
             fast_arc_length: 9,
@@ -282,6 +304,10 @@ struct PendingFrame {
     /// Pipelined strategy: KLT (+ histeq, pyramid) were submitted first.
     pipelined: bool,
     first_submit: Option<wgpu::SubmissionIndex>,
+    /// The frame's last submit (fused/pipelined).
+    last_submit: Option<wgpu::SubmissionIndex>,
+    /// `SubmitStrategy::Auto` chose this frame's strategy.
+    auto: bool,
     /// KLT was run (fused: recorded) for this frame.
     tracking: bool,
     /// Features and metadata as they were at submit(), index-aligned with the
@@ -368,6 +394,9 @@ pub struct GpuFrontend {
     pending: Option<PendingFrame>,
     // `config.gpu_wait` resolved for this device.
     wait: GpuWait,
+    // `SubmitStrategy::Auto`: submit the next frame as `Pipelined` (else
+    // `Fused`). Updated in collect().
+    auto_pipelined: bool,
 
     img_w: usize,
     img_h: usize,
@@ -438,6 +467,7 @@ impl GpuFrontend {
             track_meta: Vec::new(),
             pending: None,
             wait: config_wait,
+            auto_pipelined: true,
             prev_features: Vec::new(),
             next_id: 1,
             has_prev: false,
@@ -504,12 +534,16 @@ impl GpuFrontend {
         // CPU-equalized image, or — when Global equalization runs on the GPU —
         // the raw image, with the GPU's LUT applied at the sampled pixels.
         let t0 = Instant::now();
-        let fused = matches!(
-            self.config.submit_strategy,
-            SubmitStrategy::Fused | SubmitStrategy::Pipelined
-        );
-        let pipelined = self.config.submit_strategy == SubmitStrategy::Pipelined;
+        let auto = self.config.submit_strategy == SubmitStrategy::Auto;
+        let strategy = match self.config.submit_strategy {
+            SubmitStrategy::Auto if self.auto_pipelined => SubmitStrategy::Pipelined,
+            SubmitStrategy::Auto => SubmitStrategy::Fused,
+            s => s,
+        };
+        let fused = matches!(strategy, SubmitStrategy::Fused | SubmitStrategy::Pipelined);
+        let pipelined = strategy == SubmitStrategy::Pipelined;
         let mut first_submit = None;
+        let mut last_submit = None;
         let gpu_lut = fused && self.config.gpu_histeq && self.config.histeq == HistEqMethod::Global;
         if self.config.histeq != HistEqMethod::None && !gpu_lut {
             histeq::apply_histeq_into(image, self.config.histeq, &mut self.input_buf);
@@ -619,7 +653,7 @@ impl GpuFrontend {
                 self.fast
                     .record_into(gpu, &mut encoder, &self.pyramids[curr].levels[0]);
             }
-            gpu.queue.submit(std::iter::once(encoder.finish()));
+            last_submit = Some(gpu.queue.submit(std::iter::once(encoder.finish())));
             if !pipelined {
                 if tracking {
                     self.klt.arm_readback();
@@ -646,6 +680,8 @@ impl GpuFrontend {
             fused,
             pipelined,
             first_submit,
+            last_submit,
+            auto,
             tracking,
             feats_snap,
             meta_snap,
@@ -698,6 +734,20 @@ impl GpuFrontend {
             .expect("GpuFrontend::collect: no frame submitted");
         let t_collect = Instant::now();
         let mut timing = p.timing.clone();
+
+        if p.auto {
+            // Whole frame already done: the caller's work covered the GPU
+            // time, so a second submit would only cost CPU. Otherwise let
+            // the CPU stages below overlap FAST.
+            let done = gpu
+                .device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: p.last_submit.clone(),
+                    timeout: Some(std::time::Duration::ZERO),
+                })
+                .is_ok();
+            self.auto_pipelined = !done;
+        }
 
         let mut stats = FrameStats {
             tracked: 0,

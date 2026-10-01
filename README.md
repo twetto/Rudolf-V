@@ -145,13 +145,15 @@ Two enums on `GpuFrontendConfig` expose the underlying tradeoffs:
 
 | Setting | Options | Default |
 |---|---|---|
-| `SubmitStrategy` | `Separate`, `Fused` | `Separate` |
+| `SubmitStrategy` | `Separate`, `Fused`, `Pipelined`, `Auto` | `Auto` |
 | `NmsStrategy` | `Cpu`, `Gpu` | `Cpu` |
 
-`SubmitStrategy::Fused` records KLT and FAST into a single command encoder,
-reducing `poll(Wait)` round-trips. `SubmitStrategy::Separate` lets the driver
-schedule each stage independently; the CPU work between KLT and FAST (RANSAC,
-grid update) acts as a natural gap that keeps the GPU fed without explicit fusion.
+`SubmitStrategy::Fused` records the whole frame into a single command
+encoder: one submit, one wait. `SubmitStrategy::Pipelined` puts FAST in a
+second submit so the CPU stages (LBP, RANSAC, pruning) overlap with it.
+`SubmitStrategy::Auto` (default) picks between the two per frame (see
+Phase 3h). `SubmitStrategy::Separate` is the original flow: each stage
+submitted and waited for on its own. All four give identical results.
 
 `NmsStrategy::Cpu` reads back the full score buffer (~1.4 MB for 752×480) and
 runs cell-max NMS on the CPU. `NmsStrategy::Gpu` adds a compute pass and reads
@@ -190,7 +192,7 @@ relative to GPU capability.
 * [x] FAST corner detection kernel
 * [x] KLT tracking kernel (inverse compositional — constant Hessian is GPU-friendly)
 * [x] `NmsStrategy::{Cpu, Gpu}` — selectable NMS for iGPU and discrete GPU
-* [x] `SubmitStrategy::{Separate, Fused}` — selectable command encoder submit strategy
+* [x] `SubmitStrategy::{Separate, Fused, Pipelined, Auto}` — selectable submit strategy
 * [x] `GpuFrontend::process()` integration (API-compatible with CPU `Frontend`)
 * [ ] Harris corner response kernel
 
@@ -219,7 +221,7 @@ overhead.
 
 **Phase 3c — GPU per-frame overhead removal:**
 
-`SubmitStrategy::Fused` (now the default) no longer allocates anything per
+`SubmitStrategy::Fused` (the default until Phase 3h) no longer allocates anything per
 frame, and does one submit and one wait per frame:
 
 * Two persistent pyramids used alternately (`GpuPyramidPipeline::allocate` +
@@ -307,9 +309,9 @@ What got it there (frontend output bit-identical throughout):
   * The previous position is found through a hash lookup instead of a
     linear scan.
   * 0.23 → 0.18 ms.
-* **`SubmitStrategy::Pipelined`** (opt-in). FAST goes in a second submit, so
-  LBP, RANSAC and pruning overlap with it on the GPU. It reads the pyramid
-  across submits, which was only deterministic with a fixed GPU clock here.
+* **`SubmitStrategy::Pipelined`**. FAST goes in a second submit, so
+  LBP, RANSAC and pruning overlap with it on the GPU. Validated at unlocked
+  clocks in Phase 3h; used by `Auto` (default) when it pays off.
 
 **GPU waits.** wgpu waits with `vkWaitSemaphores`, and NVIDIA's Tegra driver
 busy-waits inside it, keeping a core at 100% for the whole wait.
@@ -328,10 +330,45 @@ Tried without gain: a shared-memory tile for FAST (the texture cache already
 serves the overlapping reads), and arithmetic circle offsets (slower than the
 table).
 
-Not yet validated with the GPU governor active: merging several dispatches
-into one pass. A single-pass pyramid was one of the configurations that read
-stale data with unlocked clocks during Phase 3c. Re-run the determinism
-checks without `jetson_clocks` before relying on this in deployment.
+The single compute pass and `Pipelined` were measured with locked clocks;
+Phase 3h validates them with the GPU governor active.
+
+**Phase 3h — unlocked clocks, `SubmitStrategy::Auto`:**
+
+Jetson Orin Nano, default GPU governor (no `jetson_clocks`), V1_01_easy:
+
+* **Determinism.** No per-frame differences from the reference output in
+  any run:
+  * 174 full `Pipelined` runs (both reference configurations), 100 of them
+    while a random GPU load made the clock governor switch ~5000 times.
+  * 91 `Fused` runs alongside.
+  * Positive control: a probe that builds a fresh pyramid and reads it only
+    in a later submit still reads stale data under the same conditions
+    (stale reads in 13 of 31 runs). The frontend never uses that pattern
+    (see SUBMISSION in `src/gpu/frontend.rs`).
+* **Synchronization validation.** Vulkan validation layers 1.3.250
+  (`VALIDATION_CHECK_ENABLE_SYNCHRONIZATION_VALIDATION_QUEUE_SUBMIT`, which
+  checks hazards across submits and is off by default) report no hazards for
+  `Fused`, `Pipelined`, or the probe. wgpu's barriers are correct; the stale
+  reads come from below the API. The layers shipped with Ubuntu 22.04
+  (1.3.204) do not detect cross-submit hazards at all.
+* **`SubmitStrategy::Auto` (new default).** `Pipelined` is fastest when
+  `collect()` follows `submit()` directly (unlocked: 2.0–2.4 vs 2.9–3.5
+  ms/frame). Its second submit costs ~0.1–0.15 ms of CPU, which is wasted
+  once the caller's work between `submit()` and `collect()` covers the GPU
+  time (3 ms of simulated backend work: 3.70 vs 3.88 ms for `Fused` vs
+  `Pipelined`). `Auto` checks at the start of `collect()` whether the
+  frame's last submit has already finished (a zero-timeout wait). If it
+  has, the next frame uses `Fused`, otherwise `Pipelined`. Frames submitted
+  as `Pipelined`, by simulated backend work:
+
+  | Backend work | 0 ms | 0.5 ms | 1 ms | 2 ms | 3 ms |
+  |---|---|---|---|---|---|
+  | `Pipelined` frames | 100% | 100% | 75% | 13% | 1% |
+
+  Output is bit-identical in every mode and overlap.
+* **KLT hardware sampling** (opt-in, Phase 3d) is repeat-deterministic with
+  `Fused`, `Pipelined` and `Auto`, with the same output in all three.
 
 **Phase 3f — histogram equalization:**
 

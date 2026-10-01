@@ -77,9 +77,11 @@ const WG_WARP: u32 = 64;
 /// (p99 0.004 px), but ~2× as many ill-conditioned tracks run away (≈0.1% of
 /// tracks; RANSAC rejected +0.6% overall). Hardware sampling was also far more
 /// sensitive to the Tegra stale-texture issue (see gpu/frontend.rs SUBMISSION)
-/// — it is only verified deterministic inside `SubmitStrategy::Fused`, where
-/// each pyramid is built and first read in one command buffer. Hence `Manual`
-/// is the default.
+/// when pyramids were first read in a later submit than the one that built
+/// them. With `Fused`, `Pipelined` and `Auto` (KLT reads the pyramid in the
+/// command buffer that builds it) it was repeat-deterministic and identical
+/// across the three. `Manual` stays the default for accuracy: the texture
+/// unit's 8-bit interpolation weights cause the runaway tracks above.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum KltSampling {
     /// Hardware when the device supports filterable R32Float and the
