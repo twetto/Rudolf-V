@@ -2091,6 +2091,67 @@ pub(crate) fn compute_lbp_at_lut(
     Some(compute_min_rotation(lbp))
 }
 
+/// `compute_lbp_at_lut` for CLAHE: the mapping varies across the image, so
+/// each sampled pixel goes through the bilinear blend of the four tile LUTs
+/// around *it* (`TileLuts::apply`), which is what the level-0 shaders do.
+///
+/// Same structure, bounds and fixed-point weights as `compute_lbp_at_lut`;
+/// only `map` differs, so the two stay in step.
+pub(crate) fn compute_lbp_at_tile_lut(
+    img: &Image<u8>,
+    tiles: &crate::gpu::clahe::TileLuts,
+    x: f32,
+    y: f32,
+) -> Option<u16> {
+    let w = img.width();
+    let h = img.height();
+    let stride = img.stride();
+    let data = img.as_slice();
+
+    if !x.is_finite() || !y.is_finite() {
+        return None;
+    }
+
+    let x0 = x as usize;
+    let y0 = y as usize;
+    if x0 < 3 || y0 < 3 || x0 + 4 >= w || y0 + 4 >= h {
+        return None;
+    }
+
+    let fx = x - x0 as f32;
+    let fy = y - y0 as f32;
+
+    let w00 = ((1.0 - fx) * (1.0 - fy) * 256.0) as u32;
+    let w10 = (fx * (1.0 - fy) * 256.0) as u32;
+    let w01 = ((1.0 - fx) * fy * 256.0) as u32;
+    let w11 = (fx * fy * 256.0) as u32;
+
+    let bilerp = |px: usize, py: usize| -> u32 {
+        let x1 = if px + 1 < w { px + 1 } else { px };
+        let y1 = if py + 1 < h { py + 1 } else { py };
+        unsafe {
+            let p00 = tiles.apply(px, py, *data.get_unchecked(py * stride + px)) as u32;
+            let p10 = tiles.apply(x1, py, *data.get_unchecked(py * stride + x1)) as u32;
+            let p01 = tiles.apply(px, y1, *data.get_unchecked(y1 * stride + px)) as u32;
+            let p11 = tiles.apply(x1, y1, *data.get_unchecked(y1 * stride + x1)) as u32;
+            w00 * p00 + w10 * p10 + w01 * p01 + w11 * p11
+        }
+    };
+
+    let center = bilerp(x0, y0);
+    let mut lbp: u16 = 0;
+
+    for (i, &(dx, dy)) in CIRCLE_OFFSETS.iter().enumerate() {
+        let px = (x0 as i32 + dx) as usize;
+        let py = (y0 as i32 + dy) as usize;
+        if bilerp(px, py) >= center {
+            lbp |= 1 << i;
+        }
+    }
+
+    Some(compute_min_rotation(lbp))
+}
+
 /// Compute the rotation-invariant LBP by finding the minimum value
 /// among all 16 cyclic shifts.
 #[inline]

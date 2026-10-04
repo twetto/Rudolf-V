@@ -1,3 +1,4 @@
+pub mod clahe;
 pub mod device;
 pub mod fast;
 pub mod frontend;

@@ -72,9 +72,10 @@ use crate::camera::CameraIntrinsics;
 use crate::essential::{self, BearingCorrespondence, RansacConfig};
 use crate::fast::Feature;
 use crate::frontend::{
-    compute_lbp_at_lut, prune_low_reservoir_score, prune_overfull_tiles, select_by_tile_deficit,
-    FrameStats, LbpPolicy, TimingStats, TrackMeta,
+    compute_lbp_at_lut, compute_lbp_at_tile_lut, prune_low_reservoir_score, prune_overfull_tiles,
+    select_by_tile_deficit, FrameStats, LbpPolicy, TimingStats, TrackMeta,
 };
+use crate::gpu::clahe::{GpuClahe, TileLuts};
 use crate::gpu::device::GpuDevice;
 use crate::gpu::fast::{GpuFastDetector, NmsStrategy};
 use crate::gpu::histeq::GpuGlobalHistEq;
@@ -322,6 +323,7 @@ struct PendingFrame {
     discarded: bool,
     /// Global histogram equalization ran on the GPU; its LUT is being read back.
     gpu_lut: bool,
+    gpu_clahe: bool,
 }
 
 /// GPU visual frontend.
@@ -383,9 +385,16 @@ pub struct GpuFrontend {
     // GPU global histogram equalization; its LUT buffer is bound to both
     // pyramids' convert pass. Holds the identity when not equalizing on GPU.
     histeq_gpu: GpuGlobalHistEq,
+    // CLAHE on the GPU. `Some` when config.histeq is Clahe and gpu_histeq is
+    // set: the pyramid's level 0 then reads through per-tile LUTs instead of
+    // one global LUT. See gpu::clahe.
+    clahe_gpu: Option<GpuClahe>,
     lut_is_identity: bool,
     // LUT of the frame being collected (GPU Global equalization), else None.
     frame_lut: Option<[u8; 256]>,
+    /// This frame's per-tile CLAHE LUTs, read back so LBP verification can
+    /// equalize the few pixels it needs exactly as the GPU did.
+    frame_tile_luts: Option<TileLuts>,
     // Track ID → bearing unprojected at the track's current position (RANSAC
     // b2); reused as next frame's b1.
     bearing_cache: std::collections::HashMap<u64, [f64; 3]>,
@@ -431,22 +440,49 @@ impl GpuFrontend {
         );
         let grid = OccupancyGrid::new(img_w, img_h, config.cell_size);
         let histeq_gpu = GpuGlobalHistEq::new(gpu, img_w, img_h);
-        let pyramids = [
-            pyr_pipeline.allocate_with_lut(
-                gpu,
-                img_w,
-                img_h,
-                config.pyramid_levels,
-                histeq_gpu.lut_buffer(),
-            ),
-            pyr_pipeline.allocate_with_lut(
-                gpu,
-                img_w,
-                img_h,
-                config.pyramid_levels,
-                histeq_gpu.lut_buffer(),
-            ),
-        ];
+        let clahe_gpu = match config.histeq {
+            HistEqMethod::Clahe {
+                tile_size,
+                clip_limit,
+            } if config.gpu_histeq => Some(GpuClahe::new(gpu, img_w, img_h, tile_size, clip_limit)),
+            _ => None,
+        };
+        let pyramids = match &clahe_gpu {
+            Some(c) => [
+                pyr_pipeline.allocate_with_tile_lut(
+                    gpu,
+                    img_w,
+                    img_h,
+                    config.pyramid_levels,
+                    c.luts_buffer(),
+                    c.params_buffer(),
+                ),
+                pyr_pipeline.allocate_with_tile_lut(
+                    gpu,
+                    img_w,
+                    img_h,
+                    config.pyramid_levels,
+                    c.luts_buffer(),
+                    c.params_buffer(),
+                ),
+            ],
+            None => [
+                pyr_pipeline.allocate_with_lut(
+                    gpu,
+                    img_w,
+                    img_h,
+                    config.pyramid_levels,
+                    histeq_gpu.lut_buffer(),
+                ),
+                pyr_pipeline.allocate_with_lut(
+                    gpu,
+                    img_w,
+                    img_h,
+                    config.pyramid_levels,
+                    histeq_gpu.lut_buffer(),
+                ),
+            ],
+        };
 
         GpuFrontend {
             config,
@@ -460,8 +496,10 @@ impl GpuFrontend {
             separate_prev: None,
             input_buf: Image::new(img_w, img_h),
             histeq_gpu,
+            clahe_gpu,
             lut_is_identity: true,
             frame_lut: None,
+            frame_tile_luts: None,
             bearing_cache: std::collections::HashMap::new(),
             features: Vec::new(),
             track_meta: Vec::new(),
@@ -545,7 +583,11 @@ impl GpuFrontend {
         let mut first_submit = None;
         let mut last_submit = None;
         let gpu_lut = fused && self.config.gpu_histeq && self.config.histeq == HistEqMethod::Global;
-        if self.config.histeq != HistEqMethod::None && !gpu_lut {
+        // CLAHE on the GPU: same deal, but through per-tile LUTs. Only the
+        // fused path builds level 0 from the raw texture, so Separate keeps
+        // the CPU route.
+        let gpu_clahe = fused && self.clahe_gpu.is_some();
+        if self.config.histeq != HistEqMethod::None && !gpu_lut && !gpu_clahe {
             histeq::apply_histeq_into(image, self.config.histeq, &mut self.input_buf);
         } else if self.input_buf.stride() == image.stride() {
             self.input_buf
@@ -613,6 +655,12 @@ impl GpuFrontend {
                         .record_dispatches(gpu, &mut pass, &self.pyramids[curr]);
                     self.lut_is_identity = false;
                 }
+                if gpu_clahe {
+                    self.clahe_gpu
+                        .as_mut()
+                        .expect("gpu_clahe implies clahe_gpu")
+                        .record_dispatches(gpu, &mut pass, &self.pyramids[curr]);
+                }
                 self.pyr_pipeline
                     .record_build_in_pass(gpu, &mut pass, &self.pyramids[curr]);
                 if tracking {
@@ -626,6 +674,12 @@ impl GpuFrontend {
             if gpu_lut {
                 self.histeq_gpu.record_readback(&mut encoder);
             }
+            if gpu_clahe {
+                self.clahe_gpu
+                    .as_ref()
+                    .expect("gpu_clahe implies clahe_gpu")
+                    .record_readback(&mut encoder);
+            }
             if tracking {
                 self.klt.record_readback(&mut encoder);
             }
@@ -638,6 +692,12 @@ impl GpuFrontend {
                 first_submit = Some(gpu.queue.submit(std::iter::once(encoder.finish())));
                 if tracking {
                     self.klt.arm_readback();
+                }
+                if gpu_clahe {
+                    self.clahe_gpu
+                        .as_mut()
+                        .expect("gpu_clahe implies clahe_gpu")
+                        .arm_readback();
                 }
                 if gpu_lut {
                     self.histeq_gpu.arm_readback();
@@ -657,6 +717,12 @@ impl GpuFrontend {
             if !pipelined {
                 if tracking {
                     self.klt.arm_readback();
+                }
+                if gpu_clahe {
+                    self.clahe_gpu
+                        .as_mut()
+                        .expect("gpu_clahe implies clahe_gpu")
+                        .arm_readback();
                 }
                 if gpu_lut {
                     self.histeq_gpu.arm_readback();
@@ -689,6 +755,7 @@ impl GpuFrontend {
             dropped: Vec::new(),
             discarded: false,
             gpu_lut,
+            gpu_clahe,
         });
     }
 
@@ -769,6 +836,16 @@ impl GpuFrontend {
             } else {
                 self.frame_lut = None;
             }
+            if p.gpu_clahe {
+                self.frame_tile_luts = Some(
+                    self.clahe_gpu
+                        .as_mut()
+                        .expect("gpu_clahe implies clahe_gpu")
+                        .collect_luts(),
+                );
+            } else {
+                self.frame_tile_luts = None;
+            }
             let results = if p.tracking {
                 self.klt.collect_results(&p.feats_snap)
             } else {
@@ -811,12 +888,18 @@ impl GpuFrontend {
                 let feat = &result.feature;
                 let mut lbp_distance = 0u16;
                 if self.config.lbp_verification_enabled {
-                    let Some(new_desc) = compute_lbp_at_lut(
-                        &self.input_buf,
-                        self.frame_lut.as_ref(),
-                        feat.x,
-                        feat.y,
-                    ) else {
+                    let desc = match &self.frame_tile_luts {
+                        Some(tiles) => {
+                            compute_lbp_at_tile_lut(&self.input_buf, tiles, feat.x, feat.y)
+                        }
+                        None => compute_lbp_at_lut(
+                            &self.input_buf,
+                            self.frame_lut.as_ref(),
+                            feat.x,
+                            feat.y,
+                        ),
+                    };
+                    let Some(new_desc) = desc else {
                         stats.rejected += 1;
                         continue;
                     };
@@ -1020,12 +1103,12 @@ impl GpuFrontend {
                     score: f.score,
                     level: f.level,
                     id: self.next_id,
-                    descriptor: compute_lbp_at_lut(
-                        &self.input_buf,
-                        self.frame_lut.as_ref(),
-                        f.x,
-                        f.y,
-                    )
+                    descriptor: match &self.frame_tile_luts {
+                        Some(tiles) => compute_lbp_at_tile_lut(&self.input_buf, tiles, f.x, f.y),
+                        None => {
+                            compute_lbp_at_lut(&self.input_buf, self.frame_lut.as_ref(), f.x, f.y)
+                        }
+                    }
                     .unwrap_or(0),
                 };
                 self.next_id += 1;
@@ -1077,6 +1160,13 @@ impl GpuFrontend {
             let _ = self.fast.collect_winners(0);
             if p.gpu_lut {
                 let _ = self.histeq_gpu.collect_lut();
+            }
+            if p.gpu_clahe {
+                let _ = self
+                    .clahe_gpu
+                    .as_mut()
+                    .expect("gpu_clahe implies clahe_gpu")
+                    .collect_luts();
             }
         }
     }
@@ -1568,4 +1658,218 @@ mod tests {
     gpu_test!(test_drop_tracks_in_flight, inner_drop_tracks_in_flight);
     gpu_test!(test_reset_while_pending, inner_reset_while_pending);
     gpu_test!(test_lbp_policies, inner_lbp_policies);
+}
+
+#[cfg(test)]
+mod gpu_clahe_tests {
+    use super::*;
+
+    pub(super) fn moving_scene_pub(w: usize, h: usize, dx: i32, dy: i32) -> Image<u8> {
+        moving_scene(w, h, dx, dy)
+    }
+
+    fn moving_scene(w: usize, h: usize, dx: i32, dy: i32) -> Image<u8> {
+        let mut img = Image::new(w, h);
+        let stride = img.stride();
+        let px = img.as_mut_slice();
+        let mut seed: u32 = 0xc0ff_ee11;
+        for y in 0..h {
+            for x in 0..w {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let n = ((seed >> 26) & 0x1f) as f32;
+                let sx = (x as i32 - dx) as f32;
+                let sy = (y as i32 - dy) as f32;
+                let v = 50.0
+                    + 90.0 * ((sx * 0.08).sin() * (sy * 0.07).cos()).abs()
+                    + 40.0 * ((sx * 0.31).sin() * (sy * 0.29).sin())
+                    + n;
+                px[y * stride + x] = v.clamp(0.0, 255.0) as u8;
+            }
+        }
+        img
+    }
+
+    /// Every submit strategy that builds level 0 on the GPU must agree with
+    /// the CPU. Auto resolves to Pipelined or Fused per frame, and Pipelined
+    /// arms its readbacks in a different place, so both are covered.
+    #[test]
+    fn gpu_clahe_frontend_matches_cpu_all_strategies() {
+        for strategy in [
+            SubmitStrategy::Fused,
+            SubmitStrategy::Pipelined,
+            SubmitStrategy::Auto,
+        ] {
+            check_strategy(strategy);
+        }
+    }
+
+    fn check_strategy(strategy: SubmitStrategy) {
+        let Ok(gpu) = GpuDevice::new() else {
+            eprintln!("no GPU adapter; skipping gpu_clahe_frontend_matches_cpu");
+            return;
+        };
+        let (w, h) = (320usize, 240usize);
+        let base = GpuFrontendConfig {
+            histeq: HistEqMethod::Clahe {
+                tile_size: 64,
+                clip_limit: 3.0,
+            },
+            max_features: 60,
+            submit_strategy: strategy,
+            ..Default::default()
+        };
+
+        let mut on = GpuFrontend::new(
+            &gpu,
+            GpuFrontendConfig {
+                gpu_histeq: true,
+                ..base.clone()
+            },
+            w,
+            h,
+        );
+        let mut off = GpuFrontend::new(
+            &gpu,
+            GpuFrontendConfig {
+                gpu_histeq: false,
+                ..base
+            },
+            w,
+            h,
+        );
+        assert!(on.clahe_gpu.is_some(), "GPU CLAHE should be active");
+        assert!(off.clahe_gpu.is_none(), "control must stay on the CPU");
+
+        let mut total_tracked = 0usize;
+        for i in 0..6i32 {
+            let img = moving_scene(w, h, i * 2, i);
+            on.submit(&gpu, &img);
+            let (fa, sa) = on.collect(&gpu);
+            let fa: Vec<Feature> = fa.to_vec();
+            let (sa_tracked, sa_rejected, sa_new) = (sa.tracked, sa.rejected, sa.new_detections);
+            off.submit(&gpu, &img);
+            let (fb, sb) = off.collect(&gpu);
+
+            assert_eq!(fa.len(), fb.len(), "{strategy:?} frame {i}: feature count");
+            for (k, (a, b)) in fa.iter().zip(fb.iter()).enumerate() {
+                assert_eq!(a.id, b.id, "frame {i} feature {k}: id");
+                assert_eq!(a.x, b.x, "frame {i} feature {k}: x");
+                assert_eq!(a.y, b.y, "frame {i} feature {k}: y");
+                assert_eq!(
+                    a.descriptor, b.descriptor,
+                    "frame {i} feature {k}: descriptor"
+                );
+            }
+            assert_eq!(sa_tracked, sb.tracked, "frame {i}: tracked");
+            assert_eq!(sa_rejected, sb.rejected, "frame {i}: rejected");
+            assert_eq!(sa_new, sb.new_detections, "frame {i}: new");
+            total_tracked += sa_tracked;
+        }
+        assert!(
+            total_tracked > 0,
+            "{strategy:?}: the scene must track something or the test proves nothing"
+        );
+    }
+}
+
+#[cfg(test)]
+mod gpu_clahe_bench {
+    use super::gpu_clahe_tests::moving_scene_pub;
+    use super::*;
+    use std::time::Instant;
+
+    /// `cargo test --release --features parallel --lib bench_gpu_clahe -- --nocapture --ignored`
+    /// Set RV_FRAMES=<frames.u8> for real 1280x800 frames.
+    #[test]
+    #[ignore]
+    fn bench_gpu_clahe() {
+        let Ok(gpu) = GpuDevice::new() else { return };
+        let (w, h) = (1280usize, 800usize);
+        let frames: Vec<Image<u8>> = match std::env::var("RV_FRAMES") {
+            Ok(path) => {
+                let bytes = std::fs::read(&path).expect("RV_FRAMES unreadable");
+                (0..40)
+                    .map(|i| {
+                        let off = i * w * h;
+                        let mut img = Image::new(w, h);
+                        let stride = img.stride();
+                        let px = img.as_mut_slice();
+                        for y in 0..h {
+                            px[y * stride..y * stride + w]
+                                .copy_from_slice(&bytes[off + y * w..off + y * w + w]);
+                        }
+                        img
+                    })
+                    .collect()
+            }
+            Err(_) => (0..40)
+                .map(|i| moving_scene_pub(w, h, i as i32 * 2, i as i32))
+                .collect(),
+        };
+        let base = GpuFrontendConfig {
+            histeq: HistEqMethod::Clahe {
+                tile_size: 256,
+                clip_limit: 4.0,
+            },
+            max_features: 300,
+            submit_strategy: SubmitStrategy::Fused,
+            ..Default::default()
+        };
+
+        // Both frontends see every frame; which one is timed first alternates,
+        // so the clock drift of a powersave governor cancels instead of
+        // landing on whichever ran second (it moved a repeat by 1.7x).
+        let mut cpu_fe = GpuFrontend::new(
+            &gpu,
+            GpuFrontendConfig {
+                gpu_histeq: false,
+                ..base.clone()
+            },
+            w,
+            h,
+        );
+        let mut gpu_fe = GpuFrontend::new(
+            &gpu,
+            GpuFrontendConfig {
+                gpu_histeq: true,
+                ..base
+            },
+            w,
+            h,
+        );
+        for img in frames.iter().take(5) {
+            cpu_fe.submit(&gpu, img);
+            let _ = cpu_fe.collect(&gpu);
+            gpu_fe.submit(&gpu, img);
+            let _ = gpu_fe.collect(&gpu);
+        }
+
+        let mut t_cpu = Vec::new();
+        let mut t_gpu = Vec::new();
+        let (mut n_cpu, mut n_gpu) = (0usize, 0usize);
+        let mut run = |fe: &mut GpuFrontend, img: &Image<u8>, n: &mut usize| -> f64 {
+            let t0 = Instant::now();
+            fe.submit(&gpu, img);
+            let (_, st) = fe.collect(&gpu);
+            *n += st.tracked;
+            t0.elapsed().as_secs_f64() * 1e3
+        };
+        for (i, img) in frames.iter().enumerate() {
+            if i % 2 == 0 {
+                t_cpu.push(run(&mut cpu_fe, img, &mut n_cpu));
+                t_gpu.push(run(&mut gpu_fe, img, &mut n_gpu));
+            } else {
+                t_gpu.push(run(&mut gpu_fe, img, &mut n_gpu));
+                t_cpu.push(run(&mut cpu_fe, img, &mut n_cpu));
+            }
+        }
+        for (label, mut v, n) in [("CPU", t_cpu, n_cpu), ("GPU", t_gpu, n_gpu)] {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!(
+                "  CLAHE on {label}: frontend {:.2} ms/frame (p90 {:.2}), tracked {n}",
+                v[v.len() / 2],
+                v[v.len() * 9 / 10]
+            );
+        }
+    }
 }

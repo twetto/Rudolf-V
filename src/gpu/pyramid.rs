@@ -135,6 +135,8 @@ struct PersistentResources {
     raw: wgpu::Texture,
     raw_view: wgpu::TextureView,
     convert_bg: wgpu::BindGroup,
+    /// Level 0 goes through per-tile CLAHE LUTs rather than one global LUT.
+    clahe: bool,
     /// Fused level 0 + 1 bind group (≥ 2 levels); replaces the convert pass
     /// and the first blur pass.
     l0l1_bg: Option<wgpu::BindGroup>,
@@ -311,6 +313,12 @@ pub struct GpuPyramidPipeline {
     /// Fused level 0 + level 1 (pyramid_l0l1.wgsl), for pyramids of ≥ 2 levels.
     l0l1_pipeline: wgpu::ComputePipeline,
     l0l1_bgl: wgpu::BindGroupLayout,
+    // CLAHE variants: same kernels, but level-0 values come from four tile
+    // LUTs blended per pixel instead of one global LUT. See clahe_lut.wgsl.
+    convert_clahe_pipeline: wgpu::ComputePipeline,
+    convert_clahe_bgl: wgpu::BindGroupLayout,
+    l0l1_clahe_pipeline: wgpu::ComputePipeline,
+    l0l1_clahe_bgl: wgpu::BindGroupLayout,
     /// Identity 256-entry LUT (u32 per entry) for pyramids allocated without
     /// histogram equalization.
     identity_lut: wgpu::Buffer,
@@ -541,6 +549,125 @@ impl GpuPyramidPipeline {
                     cache: None,
                 });
 
+        // ── CLAHE variants ────────────────────────────────────────────────
+        // Binding 2/3 is a tile-LUT array instead of a 256-entry LUT, plus a
+        // uniform describing the tile grid.
+        let tile_lut_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let params_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let raw_tex_entry = wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Texture {
+                multisampled: false,
+                view_dimension: wgpu::TextureViewDimension::D2,
+                sample_type: wgpu::TextureSampleType::Uint,
+            },
+            count: None,
+        };
+        let store_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::StorageTexture {
+                access: wgpu::StorageTextureAccess::WriteOnly,
+                format: wgpu::TextureFormat::R32Float,
+                view_dimension: wgpu::TextureViewDimension::D2,
+            },
+            count: None,
+        };
+
+        let convert_clahe_bgl =
+            gpu.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("GpuPyramid convert CLAHE BGL"),
+                    entries: &[
+                        raw_tex_entry.clone(),
+                        store_entry(1),
+                        tile_lut_entry(2),
+                        params_entry(3),
+                    ],
+                });
+        let convert_clahe_shader = gpu.create_compute_shader(wgpu::ShaderModuleDescriptor {
+            label: Some("pyramid_convert_clahe.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../shaders/pyramid_convert_clahe.wgsl")
+                    .replace("{{WG_X}}", &gpu.workgroup_size.x.to_string())
+                    .replace("{{WG_Y}}", &gpu.workgroup_size.y.to_string())
+                    .into(),
+            ),
+        });
+        let convert_clahe_pipeline =
+            gpu.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("convert_u8_clahe"),
+                    layout: Some(&gpu.device.create_pipeline_layout(
+                        &wgpu::PipelineLayoutDescriptor {
+                            label: Some("GpuPyramid convert CLAHE layout"),
+                            bind_group_layouts: &[Some(&convert_clahe_bgl)],
+                            immediate_size: 0,
+                        },
+                    )),
+                    module: &convert_clahe_shader,
+                    entry_point: Some("convert_u8_clahe"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                });
+
+        let l0l1_clahe_bgl =
+            gpu.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("GpuPyramid l0l1 CLAHE BGL"),
+                    entries: &[
+                        raw_tex_entry.clone(),
+                        store_entry(1),
+                        store_entry(2),
+                        tile_lut_entry(3),
+                        params_entry(4),
+                    ],
+                });
+        let l0l1_clahe_shader = gpu.create_compute_shader(wgpu::ShaderModuleDescriptor {
+            label: Some("pyramid_l0l1_clahe.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../shaders/pyramid_l0l1_clahe.wgsl")
+                    .replace("{{WG_X}}", &gpu.workgroup_size.x.to_string())
+                    .replace("{{WG_Y}}", &gpu.workgroup_size.y.to_string())
+                    .into(),
+            ),
+        });
+        let l0l1_clahe_pipeline =
+            gpu.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("l0_l1_clahe"),
+                    layout: Some(&gpu.device.create_pipeline_layout(
+                        &wgpu::PipelineLayoutDescriptor {
+                            label: Some("GpuPyramid l0l1 CLAHE layout"),
+                            bind_group_layouts: &[Some(&l0l1_clahe_bgl)],
+                            immediate_size: 0,
+                        },
+                    )),
+                    module: &l0l1_clahe_shader,
+                    entry_point: Some("l0_l1_clahe"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                });
+
         GpuPyramidPipeline {
             pipeline,
             bgl,
@@ -548,6 +675,10 @@ impl GpuPyramidPipeline {
             convert_bgl,
             l0l1_pipeline,
             l0l1_bgl,
+            convert_clahe_pipeline,
+            convert_clahe_bgl,
+            l0l1_clahe_pipeline,
+            l0l1_clahe_bgl,
             identity_lut,
         }
     }
@@ -582,6 +713,35 @@ impl GpuPyramidPipeline {
         num_levels: usize,
         lut: &wgpu::Buffer,
     ) -> GpuPyramid {
+        self.allocate_inner(gpu, width, height, num_levels, lut, None)
+    }
+
+    /// Like [`allocate_with_lut`](GpuPyramidPipeline::allocate_with_lut), but
+    /// level 0 goes through per-tile CLAHE LUTs: `luts` holds
+    /// `tile_cols * tile_rows * 256` u32 entries and `params` describes the
+    /// tile grid, both rebuilt each frame by
+    /// [`GpuClahe`](crate::gpu::clahe::GpuClahe).
+    pub fn allocate_with_tile_lut(
+        &self,
+        gpu: &GpuDevice,
+        width: usize,
+        height: usize,
+        num_levels: usize,
+        luts: &wgpu::Buffer,
+        params: &wgpu::Buffer,
+    ) -> GpuPyramid {
+        self.allocate_inner(gpu, width, height, num_levels, luts, Some(params))
+    }
+
+    fn allocate_inner(
+        &self,
+        gpu: &GpuDevice,
+        width: usize,
+        height: usize,
+        num_levels: usize,
+        lut: &wgpu::Buffer,
+        clahe_params: Option<&wgpu::Buffer>,
+    ) -> GpuPyramid {
         assert!(num_levels >= 1, "pyramid must have at least 1 level");
         let kernel = [1.0 / 16.0, 4.0 / 16.0, 6.0 / 16.0, 4.0 / 16.0, 1.0 / 16.0];
 
@@ -611,23 +771,34 @@ impl GpuPyramidPipeline {
             levels.push(GpuPyramidLevel::new(&gpu.device, dst_w, dst_h, &label));
         }
 
+        let mut convert_entries = vec![
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&raw_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&levels[0].write_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: lut.as_entire_binding(),
+            },
+        ];
+        if let Some(params) = clahe_params {
+            convert_entries.push(wgpu::BindGroupEntry {
+                binding: 3,
+                resource: params.as_entire_binding(),
+            });
+        }
         let convert_bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("pyramid convert bind group"),
-            layout: &self.convert_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&raw_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&levels[0].write_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: lut.as_entire_binding(),
-                },
-            ],
+            layout: if clahe_params.is_some() {
+                &self.convert_clahe_bgl
+            } else {
+                &self.convert_bgl
+            },
+            entries: &convert_entries,
         });
 
         let mut params_bufs = Vec::with_capacity(num_levels.saturating_sub(1));
@@ -664,33 +835,45 @@ impl GpuPyramidPipeline {
         }
 
         let l0l1_bg = (num_levels >= 2).then(|| {
+            let mut entries = vec![
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&raw_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&levels[0].write_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&levels[1].write_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: lut.as_entire_binding(),
+                },
+            ];
+            if let Some(params) = clahe_params {
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: params.as_entire_binding(),
+                });
+            }
             gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("pyramid l0l1 bind group"),
-                layout: &self.l0l1_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&raw_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&levels[0].write_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(&levels[1].write_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: lut.as_entire_binding(),
-                    },
-                ],
+                layout: if clahe_params.is_some() {
+                    &self.l0l1_clahe_bgl
+                } else {
+                    &self.l0l1_bgl
+                },
+                entries: &entries,
             })
         });
 
         GpuPyramid {
             levels,
             persistent: Some(PersistentResources {
+                clahe: clahe_params.is_some(),
                 raw,
                 raw_view,
                 convert_bg,
@@ -795,13 +978,21 @@ impl GpuPyramidPipeline {
         let (w, h) = (pyr.levels[0].width, pyr.levels[0].height);
         // Levels 0 and 1 together when there is a level 1, else convert only.
         let first_blur = if let Some(bg) = &res.l0l1_bg {
-            pass.set_pipeline(&self.l0l1_pipeline);
+            pass.set_pipeline(if res.clahe {
+                &self.l0l1_clahe_pipeline
+            } else {
+                &self.l0l1_pipeline
+            });
             pass.set_bind_group(0, bg, &[]);
             let (dx, dy) = gpu.dispatch_size(w.div_ceil(2), h.div_ceil(2));
             pass.dispatch_workgroups(dx, dy, 1);
             1
         } else {
-            pass.set_pipeline(&self.convert_pipeline);
+            pass.set_pipeline(if res.clahe {
+                &self.convert_clahe_pipeline
+            } else {
+                &self.convert_pipeline
+            });
             pass.set_bind_group(0, &res.convert_bg, &[]);
             let (dx, dy) = gpu.dispatch_size(w, h);
             pass.dispatch_workgroups(dx, dy, 1);

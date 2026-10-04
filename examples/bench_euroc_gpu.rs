@@ -25,7 +25,7 @@
 //   RUDOLF_KLT_SAMPLING=manual|hardware|auto   KLT interpolation (default: manual)
 //   RUDOLF_LBP=soft|hard|off          LBP verification policy (default: soft)
 //   RUDOLF_TILE_PRUNE=1|0             Over-full tile reservoir pruning (default: 1)
-//   RUDOLF_GPU_HISTEQ=1|0             Global histeq on the GPU (default: 1)
+//   RUDOLF_GPU_HISTEQ=1|0             Global histeq / CLAHE on the GPU (default: 1)
 //   RUDOLF_RANSAC_THRESH=1e-5         RANSAC threshold (bench_euroc_cpu uses the
 //                                     RansacConfig default, 5e-4)
 //   RUDOLF_GPU_WAIT=auto|block|sleep[:us]   How collect() waits (default: auto)
