@@ -590,7 +590,6 @@ pub struct Frontend {
     /// Scratch buffers for pyramid construction (convolution intermediates).
     pyr_scratch: PyramidScratch,
     /// Scratch buffer for histogram equalization output (avoids per-frame alloc).
-    histeq_buf: Image<u8>,
     /// Whether we have a valid previous frame.
     has_prev: bool,
     /// Currently tracked features with persistent IDs.
@@ -715,7 +714,6 @@ impl Frontend {
                 pad_border,
             },
             pyr_scratch,
-            histeq_buf: Image::new(img_w, img_h),
             has_prev: false,
             features: Vec::new(),
             track_meta: Vec::new(),
@@ -758,6 +756,14 @@ impl Frontend {
         // Step 0: Histogram equalization LUT (brightness normalization).
         // The actual remap is fused into pyramid level 0 construction.
         let t0 = Instant::now();
+        // Both branches now build only a MAP here; the remap itself is fused
+        // into pyramid level 0 below, which already reads and writes every
+        // pixel. Before this, CLAHE materialised a whole equalized image first
+        // -- measured at 320x200 that separate pass was 0.651 ms of CLAHE's
+        // 0.973 ms, duplicating work the pyramid does anyway. `timing.histeq`
+        // is therefore map construction for both methods, and comparable
+        // between them for the first time.
+        let mut clahe_map = None;
         let histeq_lut = match self.config.histeq {
             HistEqMethod::Global => Some(histeq::equalize_histogram_lut(image)),
             HistEqMethod::None => None,
@@ -765,7 +771,7 @@ impl Frontend {
                 tile_size,
                 clip_limit,
             } => {
-                histeq::equalize_clahe_into(image, tile_size, clip_limit, &mut self.histeq_buf);
+                clahe_map = Some(histeq::ClaheMap::build(image, tile_size, clip_limit));
                 None
             }
         };
@@ -775,18 +781,16 @@ impl Frontend {
         // Swap: what was curr becomes prev, then rebuild curr.
         let t0 = Instant::now();
         std::mem::swap(&mut self.prev_pyramid, &mut self.curr_pyramid);
-        let (pyr_src, pyr_lut) = if histeq_lut.is_some() {
-            (image, histeq_lut.as_ref())
-        } else if self.config.histeq != HistEqMethod::None {
-            (&self.histeq_buf, None)
-        } else {
-            (image, None)
+        let pre = match (&histeq_lut, &clahe_map) {
+            (Some(lut), _) => crate::pyramid::PyrPreproc::Lut(lut),
+            (None, Some(map)) if !map.is_empty() => crate::pyramid::PyrPreproc::Clahe(map),
+            _ => crate::pyramid::PyrPreproc::None,
         };
-        self.curr_pyramid.build_reuse_lut(
-            pyr_src,
+        self.curr_pyramid.build_reuse_preproc(
+            image,
             self.config.pyramid_levels,
             &mut self.pyr_scratch,
-            pyr_lut,
+            pre,
         );
         timing.pyramid = t0.elapsed().as_secs_f64();
 
@@ -1253,7 +1257,15 @@ impl Frontend {
                     None
                 }
             }
-            _ => Some(&self.histeq_buf),
+            // CLAHE is fused into level 0 now, exactly like Global; nothing
+            // writes an intermediate buffer any more, so there is nothing else to read.
+            _ => {
+                if self.curr_pyramid.has_u8_levels() {
+                    Some(self.curr_pyramid.u8_level(0))
+                } else {
+                    None
+                }
+            }
         }
     }
 
