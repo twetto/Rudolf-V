@@ -20,6 +20,8 @@
 // it was ~2.3 ms, the largest CPU-side cost once KLT and FAST had moved, and
 // 4.9 ms of a 10.5 ms single-core frontend on an x86 laptop.
 
+use std::sync::Arc;
+
 use wgpu::util::DeviceExt;
 
 use crate::gpu::device::GpuDevice;
@@ -40,6 +42,41 @@ pub(crate) struct ClaheParams {
     pub _pad1: u32,
 }
 
+/// Where a pixel sits between tile centres along one axis: the two tiles it
+/// blends and its weight toward the second.
+#[derive(Clone, Copy, Debug)]
+struct AxisBlend {
+    t0: u32,
+    t1: u32,
+    a: f32,
+}
+
+/// The blend for every coordinate along one axis. It depends only on the image
+/// size and tile size, so `GpuClahe` builds it once and every frame's
+/// `TileLuts` shares it: `apply` then does no division, floor or clamp, which
+/// made up most of the CPU LBP cost under CLAHE. Same expressions as the
+/// level-0 shaders, so the results stay bit-identical.
+fn axis_blend(n_px: usize, n_tiles: usize, tile_size: usize) -> Arc<[AxisBlend]> {
+    let ts = tile_size as f32;
+    (0..n_px)
+        .map(|p| {
+            let f = p as f32 / ts - 0.5;
+            let t0 = f.floor().max(0.0) as usize;
+            let t1 = (t0 + 1).min(n_tiles - 1);
+            let a = if t0 == t1 {
+                0.0
+            } else {
+                ((p as f32 - (t0 as f32 + 0.5) * ts) / ts).clamp(0.0, 1.0)
+            };
+            AxisBlend {
+                t0: t0 as u32,
+                t1: t1 as u32,
+                a,
+            }
+        })
+        .collect()
+}
+
 /// The frame's per-tile LUTs, read back for CPU-side consumers.
 #[derive(Clone, Debug)]
 pub struct TileLuts {
@@ -48,6 +85,8 @@ pub struct TileLuts {
     pub tile_size: usize,
     pub tile_cols: usize,
     pub tile_rows: usize,
+    cols: Arc<[AxisBlend]>,
+    rows: Arc<[AxisBlend]>,
 }
 
 impl TileLuts {
@@ -56,26 +95,15 @@ impl TileLuts {
     /// `histeq::equalize_clahe_into` and the level-0 shaders.
     #[inline]
     pub fn apply(&self, x: usize, y: usize, v: u8) -> u8 {
-        let ts = self.tile_size as f32;
-        let blend = |p: usize, n: usize| -> (usize, usize, f32) {
-            let f = p as f32 / ts - 0.5;
-            let t0 = f.floor().max(0.0) as usize;
-            let t1 = (t0 + 1).min(n - 1);
-            let a = if t0 == t1 {
-                0.0
-            } else {
-                ((p as f32 - (t0 as f32 + 0.5) * ts) / ts).clamp(0.0, 1.0)
-            };
-            (t0, t1, a)
-        };
-        let (tx0, tx1, ax) = blend(x, self.tile_cols);
-        let (ty0, ty1, ay) = blend(y, self.tile_rows);
+        let bx = self.cols[x];
+        let by = self.rows[y];
         let at = |t: usize| self.luts[t * BINS + v as usize] as f32;
-        let row0 = ty0 * self.tile_cols;
-        let row1 = ty1 * self.tile_cols;
-        let top = at(row0 + tx0) + ax * (at(row0 + tx1) - at(row0 + tx0));
-        let bot = at(row1 + tx0) + ax * (at(row1 + tx1) - at(row1 + tx0));
-        (top * (1.0 - ay) + bot * ay).round().clamp(0.0, 255.0) as u8
+        let row0 = by.t0 as usize * self.tile_cols;
+        let row1 = by.t1 as usize * self.tile_cols;
+        let (tx0, tx1) = (bx.t0 as usize, bx.t1 as usize);
+        let top = at(row0 + tx0) + bx.a * (at(row0 + tx1) - at(row0 + tx0));
+        let bot = at(row1 + tx0) + bx.a * (at(row1 + tx1) - at(row1 + tx0));
+        (top * (1.0 - by.a) + bot * by.a).round().clamp(0.0, 255.0) as u8
     }
 }
 
@@ -91,6 +119,8 @@ pub struct GpuClahe {
     tile_size: usize,
     tile_cols: usize,
     tile_rows: usize,
+    cols: Arc<[AxisBlend]>,
+    rows: Arc<[AxisBlend]>,
 }
 
 impl GpuClahe {
@@ -183,7 +213,8 @@ impl GpuClahe {
                 contents: bytemuck::bytes_of(&params),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
-        let bytes = (n_luts * BINS * 4) as u64;
+        // One byte per entry, packed four per u32 by clahe_lut.wgsl.
+        let bytes = (n_luts * BINS) as u64;
         let luts_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("GpuClahe tile LUTs"),
             size: bytes,
@@ -208,6 +239,8 @@ impl GpuClahe {
             tile_size,
             tile_cols,
             tile_rows,
+            cols: axis_blend(width, tile_cols, tile_size),
+            rows: axis_blend(height, tile_rows, tile_size),
         }
     }
 
@@ -310,8 +343,15 @@ impl GpuClahe {
             .slice(..)
             .get_mapped_range()
             .expect("buffer mapping failed");
-        let words: &[u32] = bytemuck::cast_slice(&mapped);
-        let luts: Vec<u8> = words.iter().map(|&w| w as u8).collect();
+        // Entry 4k+j sits in byte j of word k, so on a little-endian host the
+        // mapped bytes are the u8 LUTs in order.
+        #[cfg(target_endian = "little")]
+        let luts: Vec<u8> = mapped.to_vec();
+        #[cfg(target_endian = "big")]
+        let luts: Vec<u8> = bytemuck::cast_slice::<u8, u32>(&mapped)
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
         drop(mapped);
         self.rb_buf.unmap();
         TileLuts {
@@ -319,6 +359,8 @@ impl GpuClahe {
             tile_size: self.tile_size,
             tile_cols: self.tile_cols,
             tile_rows: self.tile_rows,
+            cols: Arc::clone(&self.cols),
+            rows: Arc::clone(&self.rows),
         }
     }
 }
@@ -500,6 +542,158 @@ mod gpu_share {
         println!(
             "  => CLAHE dispatch costs {:.3} ms of GPU time",
             with - without
+        );
+    }
+
+    /// Where the GPU CLAHE time goes, stage by stage, at EuRoC size.
+    /// `RUDOLF_PROFILE_IMG=<png> cargo test --release --lib clahe_stage_profile -- --nocapture --ignored`
+    #[test]
+    #[ignore]
+    fn clahe_stage_profile() {
+        let Ok(gpu) = GpuDevice::new() else { return };
+        println!("  adapter: {}", gpu.adapter_info.name);
+        let img = match std::env::var("RUDOLF_PROFILE_IMG") {
+            Ok(p) => {
+                let g = image::open(&p).expect("load RUDOLF_PROFILE_IMG").to_luma8();
+                let (w, h) = (g.width() as usize, g.height() as usize);
+                let mut img = Image::new(w, h);
+                let stride = img.stride();
+                let px = img.as_mut_slice();
+                for y in 0..h {
+                    px[y * stride..y * stride + w].copy_from_slice(&g.as_raw()[y * w..(y + 1) * w]);
+                }
+                img
+            }
+            Err(_) => super::tests::scene_pub(752, 480),
+        };
+        let (w, h) = (img.width(), img.height());
+        let (tile, clip, levels) = (32usize, 2.0f32, 3usize);
+        let pipeline = GpuPyramidPipeline::new(&gpu);
+        let mut clahe = GpuClahe::new(&gpu, w, h, tile, clip);
+        let plain = pipeline.allocate(&gpu, w, h, levels);
+        let tiled = pipeline.allocate_with_tile_lut(
+            &gpu,
+            w,
+            h,
+            levels,
+            clahe.luts_buffer(),
+            clahe.params_buffer(),
+        );
+        pipeline.upload(&gpu, &img, &plain);
+        pipeline.upload(&gpu, &img, &tiled);
+
+        // 0: plain pyramid, 1: CLAHE pyramid (blend only), 2: + LUT build,
+        // 3: + LUT readback copy and map.
+        let mut once = |variant: usize| -> f64 {
+            let t0 = Instant::now();
+            let mut enc = gpu.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+                if variant >= 2 {
+                    clahe.record_dispatches(&gpu, &mut pass, &tiled);
+                }
+                let pyr = if variant == 0 { &plain } else { &tiled };
+                pipeline.record_build_in_pass(&gpu, &mut pass, pyr);
+            }
+            if variant == 3 {
+                clahe.record_readback(&mut enc);
+            }
+            gpu.queue.submit(std::iter::once(enc.finish()));
+            if variant == 3 {
+                clahe.arm_readback();
+            }
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .unwrap();
+            if variant == 3 {
+                let _ = clahe.collect_luts();
+            }
+            t0.elapsed().as_secs_f64() * 1e3
+        };
+        for _ in 0..50 {
+            for v in 0..4 {
+                once(v);
+            }
+        }
+        let mut t: [Vec<f64>; 4] = Default::default();
+        for i in 0..400 {
+            for k in 0..4 {
+                let v = (i + k) % 4; // rotate the order so clock drift cancels
+                t[v].push(once(v));
+            }
+        }
+        let med: Vec<f64> = t
+            .iter_mut()
+            .map(|v| {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[v.len() / 2]
+            })
+            .collect();
+        println!("  {w}x{h}, tile {tile}, clip {clip}, {levels} levels (median submit + wait)");
+        println!("  plain pyramid            : {:.3} ms", med[0]);
+        println!(
+            "  CLAHE pyramid (blend)    : {:.3} ms  (+{:.3})",
+            med[1],
+            med[1] - med[0]
+        );
+        println!(
+            "  + LUT build              : {:.3} ms  (+{:.3})",
+            med[2],
+            med[2] - med[1]
+        );
+        println!(
+            "  + LUT readback           : {:.3} ms  (+{:.3})",
+            med[3],
+            med[3] - med[2]
+        );
+
+        // CPU side: collect_luts alone, and LBP at 200 features through the tile LUTs.
+        let mut collect = Vec::new();
+        let mut tiles = None;
+        for _ in 0..200 {
+            let mut enc = gpu.device.create_command_encoder(&Default::default());
+            clahe.record_readback(&mut enc);
+            gpu.queue.submit(std::iter::once(enc.finish()));
+            clahe.arm_readback();
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .unwrap();
+            let t0 = Instant::now();
+            tiles = Some(clahe.collect_luts());
+            collect.push(t0.elapsed().as_secs_f64() * 1e3);
+        }
+        collect.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let tiles = tiles.unwrap();
+        let mut seed = 12345u32;
+        let feats: Vec<(f32, f32)> = (0..200)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let x = 8.0 + (seed >> 8) as f32 / (1u32 << 24) as f32 * (w as f32 - 16.0);
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let y = 8.0 + (seed >> 8) as f32 / (1u32 << 24) as f32 * (h as f32 - 16.0);
+                (x, y)
+            })
+            .collect();
+        let mut lbp = Vec::new();
+        let mut sink = 0u32;
+        for _ in 0..500 {
+            let t0 = Instant::now();
+            for &(x, y) in &feats {
+                sink = sink.wrapping_add(
+                    crate::frontend::compute_lbp_at_tile_lut(&img, &tiles, x, y).unwrap_or(0)
+                        as u32,
+                );
+            }
+            lbp.push(t0.elapsed().as_secs_f64() * 1e3);
+        }
+        lbp.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!(
+            "  CPU collect_luts         : {:.3} ms",
+            collect[collect.len() / 2]
+        );
+        println!(
+            "  CPU LBP x200 (tile LUTs) : {:.3} ms  (sink {sink})",
+            lbp[lbp.len() / 2]
         );
     }
 }

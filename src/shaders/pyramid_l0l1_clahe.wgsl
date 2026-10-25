@@ -44,6 +44,12 @@ struct ClaheParams {
 
 const W5 = array<f32, 5>(0.0625, 0.25, 0.375, 0.25, 0.0625);
 
+// Entry `v` of tile `t`'s LUT; clahe_lut.wgsl packs four entries per word.
+fn lut(t: u32, v: u32) -> f32 {
+    let w = luts[t * (BINS / 4u) + (v >> 2u)];
+    return f32((w >> ((v & 3u) * 8u)) & 0xffu);
+}
+
 fn value(x: i32, y: i32) -> f32 {
     let v  = textureLoad(src_tex, vec2<i32>(x, y), 0).r;
     let ts = f32(params.tile_size);
@@ -66,10 +72,10 @@ fn value(x: i32, y: i32) -> f32 {
 
     let row0 = ty0 * params.tile_cols;
     let row1 = ty1 * params.tile_cols;
-    let v00 = f32(luts[(row0 + tx0) * BINS + v]);
-    let v10 = f32(luts[(row0 + tx1) * BINS + v]);
-    let v01 = f32(luts[(row1 + tx0) * BINS + v]);
-    let v11 = f32(luts[(row1 + tx1) * BINS + v]);
+    let v00 = lut(row0 + tx0, v);
+    let v10 = lut(row0 + tx1, v);
+    let v01 = lut(row1 + tx0, v);
+    let v11 = lut(row1 + tx1, v);
 
     let top = v00 + ax * (v10 - v00);
     let bot = v01 + ax * (v11 - v01);

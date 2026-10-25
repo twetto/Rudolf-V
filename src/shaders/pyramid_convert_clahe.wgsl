@@ -32,6 +32,12 @@ struct ClaheParams {
 @group(0) @binding(2) var<storage, read> luts: array<u32>;
 @group(0) @binding(3) var<uniform> params: ClaheParams;
 
+// Entry `v` of tile `t`'s LUT; clahe_lut.wgsl packs four entries per word.
+fn lut(t: u32, v: u32) -> f32 {
+    let w = luts[t * (BINS / 4u) + (v >> 2u)];
+    return f32((w >> ((v & 3u) * 8u)) & 0xffu);
+}
+
 @compute @workgroup_size({{WG_X}}, {{WG_Y}})
 fn convert_u8_clahe(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dims = textureDimensions(src_tex);
@@ -59,10 +65,10 @@ fn convert_u8_clahe(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let row0 = ty0 * params.tile_cols;
     let row1 = ty1 * params.tile_cols;
-    let v00 = f32(luts[(row0 + tx0) * BINS + v]);
-    let v10 = f32(luts[(row0 + tx1) * BINS + v]);
-    let v01 = f32(luts[(row1 + tx0) * BINS + v]);
-    let v11 = f32(luts[(row1 + tx1) * BINS + v]);
+    let v00 = lut(row0 + tx0, v);
+    let v10 = lut(row0 + tx1, v);
+    let v01 = lut(row1 + tx0, v);
+    let v11 = lut(row1 + tx1, v);
 
     let top = v00 + ax * (v10 - v00);
     let bot = v01 + ax * (v11 - v01);

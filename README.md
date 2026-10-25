@@ -392,8 +392,13 @@ Jetson Orin Nano, locked clocks, EuRoC V1_01_easy, Global histeq:
 | GPU frontend, histeq on CPU | 2.08–2.10 ms | 3.2 ms |
 | GPU frontend, histeq on GPU (default) | 1.85–1.90 ms | 1.9 ms |
 
-CLAHE still runs on the CPU (0.9–2.3 ms/frame with rayon). It is not
-ported yet.
+CLAHE runs on the GPU too (`becf218`): `clahe_lut.wgsl` builds one LUT per
+tile, and the level-0 pyramid pass blends the four around each pixel. The
+LUTs are read back, packed four entries per u32, for LBP verification on the
+CPU, which looks up each pixel's tile blend in per-axis tables built once per
+image size instead of recomputing it. On RX Vega 56/64 (RADV), V1_01_easy, tile
+32, clip 2, those two changes take the GPU frontend from 1.20 to 0.91 ms/frame
+(Global histeq: 0.66 ms in the same session).
 
 **Phase 3d — KLT hardware bilinear sampling (opt-in):**
 
