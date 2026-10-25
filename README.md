@@ -167,9 +167,12 @@ back only per-cell winners (~17 KB), saving PCIe bandwidth on discrete hardware.
 | AMD Radeon 780M (iGPU) | 1.00ms | 1.82ms | Fused+Gpu | CPU |
 | Raspberry Pi 4 | ~50ms | ~141ms | — | CPU (2.6×) |
 | Jetson Orin Nano (JetPack 6.2, V1_01_easy) | 3.55ms | 2.56ms | Fused+Gpu | **GPU (1.4×)** |
+| Ryzen 7 3700X + RX Vega 56/64 (RADV, Mesa 26.2) | 1.40ms | 0.54ms | Auto+Gpu | **GPU (2.6×)** |
 
 The Jetson row is after the Phase 3c overhead removal below (before it: GPU
-~5.1ms). Other rows predate Phase 3c and have not been re-measured.
+~5.1ms). The Vega row is at `becf218` (after Phase 3h), full MH_01 sequence
+(3682 frames), CPU with `--features parallel`, mean of three runs; single-threaded
+CPU is 1.70ms. Other rows predate Phase 3c and have not been re-measured.
 
 **Why GPU is slower at this resolution:** At 752×480, individual GPU kernels
 complete in <0.1ms — well below wgpu's fixed per-dispatch overhead (~50–100μs
@@ -391,6 +394,16 @@ Jetson Orin Nano, locked clocks, EuRoC V1_01_easy, Global histeq:
 | CPU frontend | 3.33–3.41 ms | 7.7 ms |
 | GPU frontend, histeq on CPU | 2.08–2.10 ms | 3.2 ms |
 | GPU frontend, histeq on GPU (default) | 1.85–1.90 ms | 1.9 ms |
+
+For comparison, Ryzen 7 3700X + RX Vega 56/64 (RADV, Mesa 26.2, unlocked
+clocks), same sequence, all 2912 frames, three runs each:
+
+| | Frame time (mean) |
+|---|---|
+| CPU frontend, `--features parallel` | 1.71–1.72 ms |
+| GPU frontend, histeq on GPU (default) | 0.59–0.60 ms |
+| GPU frontend, no histeq | 0.56–0.57 ms |
+| GPU frontend, CLAHE on GPU | 1.18–1.22 ms |
 
 CLAHE still runs on the CPU (0.9–2.3 ms/frame with rayon). It is not
 ported yet.
