@@ -16,6 +16,11 @@
 // ROUNDING: WGSL `round` is half-to-even, Rust's `f32::round` is half-away-
 // from-zero. Values here are non-negative, so `floor(x + 0.5)` matches the CPU;
 // plain `round` left ~0.2 % of pixels off by one.
+//
+// PACKING: each LUT entry fits in a byte, so the output packs four per u32
+// (entry 4k+j in byte j of word k, i.e. plain byte order on a little-endian
+// host). That is a quarter of the bytes to read back each frame, and the
+// readback is the u8 LUT array as is.
 
 const BINS: u32 = 256u;
 
@@ -125,5 +130,15 @@ fn clahe_luts(@builtin(workgroup_id) wg: vec3<u32>,
         let val = (f32(cdf_i) - f32(cdf_min)) / denom * 255.0;
         out_v = u32(clamp(floor(val + 0.5), 0.0, 255.0));
     }
-    luts[tile * BINS + i] = out_v;
+
+    // Pack four entries per word (every thread has read its cdf_i above).
+    scan[i] = out_v;
+    workgroupBarrier();
+    if (i < BINS / 4u) {
+        let k = i * 4u;
+        luts[tile * (BINS / 4u) + i] = scan[k]
+            | (scan[k + 1u] << 8u)
+            | (scan[k + 2u] << 16u)
+            | (scan[k + 3u] << 24u);
+    }
 }

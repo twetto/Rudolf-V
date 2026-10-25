@@ -403,10 +403,15 @@ clocks), same sequence, all 2912 frames, three runs each:
 | CPU frontend, `--features parallel` | 1.71–1.72 ms |
 | GPU frontend, histeq on GPU (default) | 0.59–0.60 ms |
 | GPU frontend, no histeq | 0.56–0.57 ms |
-| GPU frontend, CLAHE on GPU | 1.18–1.22 ms |
+| GPU frontend, CLAHE on GPU (`becf218`; 0.90–0.91 ms after the change below) | 1.18–1.22 ms |
 
-CLAHE still runs on the CPU (0.9–2.3 ms/frame with rayon). It is not
-ported yet.
+CLAHE runs on the GPU too (`becf218`): `clahe_lut.wgsl` builds one LUT per
+tile, and the level-0 pyramid pass blends the four around each pixel. The
+LUTs are read back, packed four entries per u32, for LBP verification on the
+CPU, which looks up each pixel's tile blend in per-axis tables built once per
+image size instead of recomputing it. On RX Vega 56/64 (RADV), V1_01_easy, tile
+32, clip 2, those two changes take the GPU frontend from 1.20 to 0.91 ms/frame
+(Global histeq: 0.66 ms in the same session).
 
 **Phase 3d — KLT hardware bilinear sampling (opt-in):**
 
