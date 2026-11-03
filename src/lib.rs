@@ -5,6 +5,7 @@
 // Frontend for High-Speed VIO" (IROS 2020)
 
 pub mod camera;
+pub mod checkerboard;
 pub mod convert;
 pub mod convolution;
 pub mod essential;
