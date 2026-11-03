@@ -312,6 +312,23 @@ fn half_a_board_is_no_board() {
 }
 
 #[test]
+fn a_bigger_board_is_no_board() {
+    // a 9x6 board holds 7x6 and 9x5 lattices; they are not those boards
+    let (img, _) = render(400, 300, rect(80.5, 60.25, 240.0, 168.0), 0.0, 12);
+    for (cols, rows) in [(7, 6), (9, 5), (8, 5)] {
+        let d = CheckerboardDetector::new(CheckerboardConfig {
+            cols,
+            rows,
+            ..Default::default()
+        });
+        assert!(
+            d.detect(&img).is_none(),
+            "{cols}x{rows} found in a 9x6 board"
+        );
+    }
+}
+
+#[test]
 fn clutter_is_no_board() {
     let (w, h) = (320, 240);
     let mut img = Image::from_vec(w, h, vec![BACKGROUND as u8; w * h]);

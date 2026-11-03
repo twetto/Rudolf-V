@@ -30,8 +30,9 @@
 //      perspective and lens distortion (raw, unrectified images work); the
 //      nearest candidate within a fraction of the local spacing is taken. A
 //      full cols×rows lattice (either orientation) whose cells alternate
-//      dark/light and whose rows and columns bend smoothly is the board; a
-//      partial board is no board.
+//      dark/light and whose rows and columns bend smoothly is the board, if
+//      it ends there: a partial board is no board, and neither is a bigger
+//      one (its next row or column would match too).
 //   4. Sub-pixel refinement of each corner as it joins the lattice: the
 //      gradient-orthogonality solve of OpenCV's cornerSubPix (at a saddle,
 //      every gradient in the window is orthogonal to the vector from the
@@ -438,9 +439,10 @@ impl CheckerboardDetector {
     }
 
     /// Grow the lattice by whole rows and columns until nothing more fits;
-    /// Some only for a complete cols×rows (or rows×cols) board. Predictions use
-    /// refined positions: the candidates' raw peaks are only good to ~0.5 px,
-    /// which extrapolation would amplify.
+    /// Some only for a complete cols×rows (or rows×cols) board that ends there.
+    /// A bigger board would grow on, so it is no board either, as half a board
+    /// is not. Predictions use refined positions: the candidates' raw peaks are
+    /// only good to ~0.5 px, which extrapolation would amplify.
     fn grow(&self, s: &mut Search, mut g: Vec<Vec<usize>>, half: usize) -> Option<Vec<Vec<usize>>> {
         let (cols, rows) = (self.config.cols, self.config.rows);
         let (long, short) = (cols.max(rows), cols.min(rows));
@@ -454,33 +456,9 @@ impl CheckerboardDetector {
                 if (along_x && !fits(ny, nx + 1)) || (!along_x && !fits(ny + 1, nx)) {
                     continue;
                 }
-                let lines = if along_x { ny } else { nx };
-                let mut used: Vec<usize> = g.iter().flatten().copied().collect();
-                let mut new_line = Vec::with_capacity(lines);
-                for k in 0..lines {
-                    // The line's points from the end being extended, inwards.
-                    let pts: Vec<[f32; 2]> = (0..3isize)
-                        .filter_map(|t| {
-                            let (j, i) = match side {
-                                0 => (k as isize, nx as isize - 1 - t),
-                                1 => (k as isize, t),
-                                2 => (ny as isize - 1 - t, k as isize),
-                                _ => (t, k as isize),
-                            };
-                            (j >= 0 && i >= 0 && (j as usize) < ny && (i as usize) < nx)
-                                .then(|| s.refined[g[j as usize][i as usize]].unwrap())
-                        })
-                        .collect();
-                    let Some(m) = self.next_on_line(s, &pts, &used) else {
-                        break;
-                    };
-                    s.pos(m, half);
-                    used.push(m);
-                    new_line.push(m);
-                }
-                if new_line.len() < lines {
+                let Some(new_line) = self.next_line(s, &g, side, half) else {
                     continue;
-                }
+                };
                 match side {
                     0 => g
                         .iter_mut()
@@ -500,7 +478,50 @@ impl CheckerboardDetector {
             }
         }
         let (ny, nx) = (g.len(), g[0].len());
-        ((ny, nx) == (rows, cols) || (ny, nx) == (cols, rows)).then_some(g)
+        if (ny, nx) != (rows, cols) && (ny, nx) != (cols, rows) {
+            return None;
+        }
+        // The board must end here: a bigger one has its next row or column too.
+        if (0..4).any(|side| self.next_line(s, &g, side, half).is_some()) {
+            return None;
+        }
+        Some(g)
+    }
+
+    /// A new row or column beyond `side` of the lattice (0: right, 1: left,
+    /// 2: down, 3: up): each line's continuation, or None unless every line
+    /// has one.
+    fn next_line(
+        &self,
+        s: &mut Search,
+        g: &[Vec<usize>],
+        side: usize,
+        half: usize,
+    ) -> Option<Vec<usize>> {
+        let (ny, nx) = (g.len(), g[0].len());
+        let lines = if side < 2 { ny } else { nx };
+        let mut used: Vec<usize> = g.iter().flatten().copied().collect();
+        let mut new_line = Vec::with_capacity(lines);
+        for k in 0..lines {
+            // The line's points from the end being extended, inwards.
+            let pts: Vec<[f32; 2]> = (0..3isize)
+                .filter_map(|t| {
+                    let (j, i) = match side {
+                        0 => (k as isize, nx as isize - 1 - t),
+                        1 => (k as isize, t),
+                        2 => (ny as isize - 1 - t, k as isize),
+                        _ => (t, k as isize),
+                    };
+                    (j >= 0 && i >= 0 && (j as usize) < ny && (i as usize) < nx)
+                        .then(|| s.refined[g[j as usize][i as usize]].unwrap())
+                })
+                .collect();
+            let m = self.next_on_line(s, &pts, &used)?;
+            s.pos(m, half);
+            used.push(m);
+            new_line.push(m);
+        }
+        Some(new_line)
     }
 
     /// The candidate continuing a line whose last points are `p` (nearest the
