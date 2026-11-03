@@ -4,7 +4,7 @@
 // outer square corners), anti-aliased by 4×4 supersampling, with optional
 // barrel distortion, so every test knows the true corner positions.
 
-use rudolf_v::checkerboard::{CheckerboardConfig, CheckerboardDetector, chess_response};
+use rudolf_v::checkerboard::{chess_response, CheckerboardConfig, CheckerboardDetector};
 use rudolf_v::image::Image;
 
 const COLS: usize = 9;
@@ -237,6 +237,21 @@ fn rotated_and_in_perspective() {
         "error {}",
         max_error(&found, &truth)
     );
+}
+
+#[test]
+fn turned_near_upright_never_mirrored() {
+    // Rows near vertical: ordering them by y alone could number the board as
+    // its mirror image. max_error accepts the true order or its 180° flip only.
+    for deg in [80.0, 88.0, 90.0, 92.0, 100.0, -90.0] {
+        let (img, truth) = render(400, 400, turned(200.3, 200.7, 240.0, 168.0, deg), 0.0, 11);
+        let found = detector().detect(&img).expect("board");
+        assert!(
+            max_error(&found, &truth) < 0.3,
+            "{deg}°: error {}",
+            max_error(&found, &truth)
+        );
+    }
 }
 
 #[test]

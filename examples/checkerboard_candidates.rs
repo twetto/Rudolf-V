@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use rudolf_v::checkerboard::{CheckerboardConfig, chess_response, find_candidates};
+use rudolf_v::checkerboard::{chess_response, find_candidates, CheckerboardConfig};
 use rudolf_v::image::Image;
 
 fn main() {

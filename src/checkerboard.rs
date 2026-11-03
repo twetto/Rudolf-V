@@ -43,8 +43,10 @@
 //      squares many times the ring's size weaken it; halving the image halves
 //      both.
 //   6. Order: row-major, rows along the `cols` axis pointing +x, rows ordered
-//      +y. A 180° turn of the board gives the same order flipped; the board's
-//      centre and distance are the same either way.
+//      so the numbering keeps the image's handedness (+y for rows along +x).
+//      Never a mirror image, which would put the board's front behind it; a
+//      180° turn of the board, which the pattern cannot tell, gives the same
+//      order flipped.
 //
 // The output is in the input image's pixels: on a raw image, raw pixels. Undo
 // lens distortion on these points (camera-geometry), not on the image.
@@ -500,7 +502,8 @@ impl CheckerboardDetector {
         agree as f32 >= 0.9 * cells.len() as f32
     }
 
-    /// Row-major: rows along the `cols` axis pointing +x, rows ordered +y.
+    /// Row-major: rows along the `cols` axis pointing +x, rows ordered to
+    /// keep the image's handedness (never a mirror image).
     fn ordered(&self, mut g: Vec<Vec<[f32; 2]>>) -> Vec<[f32; 2]> {
         if g[0].len() != self.config.cols {
             g = (0..g[0].len())
@@ -511,7 +514,14 @@ impl CheckerboardDetector {
         if g[0][last][0] < g[0][0][0] {
             g.iter_mut().for_each(|row| row.reverse());
         }
-        if g[g.len() - 1][0][1] < g[0][0][1] {
+        // Rows ordered by the side the columns run to, not by y alone: a board
+        // turned near 90° has its rows' first corners at about the same y.
+        let along = [g[0][last][0] - g[0][0][0], g[0][last][1] - g[0][0][1]];
+        let down = [
+            g[g.len() - 1][0][0] - g[0][0][0],
+            g[g.len() - 1][0][1] - g[0][0][1],
+        ];
+        if along[0] * down[1] - along[1] * down[0] < 0.0 {
             g.reverse();
         }
         g.into_iter().flatten().collect()
