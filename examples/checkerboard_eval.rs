@@ -3,7 +3,8 @@
 //   cargo run --release --example checkerboard_eval -- <png dir> [cols rows] > results.jsonl
 //
 // One JSON line per image (file stem, found, corners, milliseconds), a summary on stderr.
-// For comparing against another detector's results on the same frames.
+// For comparing against another detector's results on the same frames. All images are
+// decoded before the first detection, so a profiler sees the detector, not PNG decoding.
 
 use std::path::Path;
 use std::time::Instant;
@@ -39,11 +40,12 @@ fn main() {
         .collect();
     files.sort();
 
+    let images: Vec<Image<u8>> = files.iter().map(|p| load_grayscale(p)).collect();
+
     let (mut found, mut times) = (0, Vec::new());
-    for path in &files {
-        let image = load_grayscale(path);
+    for (path, image) in files.iter().zip(&images) {
         let t0 = Instant::now();
-        let corners = detector.detect(&image);
+        let corners = detector.detect(image);
         let ms = t0.elapsed().as_secs_f64() * 1e3;
         times.push(ms);
         let stem = path.file_stem().unwrap().to_string_lossy();
@@ -62,12 +64,13 @@ fn main() {
     times.sort_by(|a, b| a.total_cmp(b));
     let pct = |p: f64| times[((times.len() - 1) as f64 * p) as usize];
     eprintln!(
-        "{} images, board found in {} ({:.0} %); ms per image: median {:.1}, p90 {:.1}, max {:.1}",
+        "{} images, board found in {} ({:.0} %); ms per image: median {:.1}, p90 {:.1}, max {:.1}; total {:.0} ms",
         files.len(),
         found,
         100.0 * found as f64 / files.len().max(1) as f64,
         pct(0.5),
         pct(0.9),
-        pct(1.0)
+        pct(1.0),
+        times.iter().sum::<f64>()
     );
 }

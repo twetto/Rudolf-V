@@ -85,6 +85,35 @@ const RING: [(isize, isize); 16] = [
 /// Border without a response: the ring's radius.
 const RADIUS: usize = 5;
 
+/// The 5×5 window around a pixel, nearest first: a pixel on a peak's slope
+/// usually meets a higher neighbour among the first few.
+const WINDOW: [(isize, isize); 24] = [
+    (1, 0),
+    (-1, 0),
+    (0, 1),
+    (0, -1),
+    (1, 1),
+    (1, -1),
+    (-1, 1),
+    (-1, -1),
+    (2, 0),
+    (-2, 0),
+    (0, 2),
+    (0, -2),
+    (2, 1),
+    (2, -1),
+    (-2, 1),
+    (-2, -1),
+    (1, 2),
+    (1, -2),
+    (-1, 2),
+    (-1, -2),
+    (2, 2),
+    (2, -2),
+    (-2, 2),
+    (-2, -2),
+];
+
 /// Nearest neighbours considered when forming a seed quad.
 const SEED_NEIGHBOURS: usize = 8;
 
@@ -151,28 +180,8 @@ pub fn chess_response(image: &Image<u8>) -> Image<f32> {
     if w <= 2 * RADIUS || h <= 2 * RADIUS {
         return out;
     }
-    let stride = image.stride();
-    let data = image.as_slice();
-    let ring: [isize; 16] = core::array::from_fn(|k| RING[k].1 * stride as isize + RING[k].0);
-
-    let fill_row = |y: usize, out_row: &mut [f32]| {
-        for x in RADIUS..w - RADIUS {
-            let c = (y * stride + x) as isize;
-            let s: [i32; 16] = core::array::from_fn(|k| data[(c + ring[k]) as usize] as i32);
-            let sum: i32 = (0..4)
-                .map(|n| ((s[n] + s[n + 8]) - (s[n + 4] + s[n + 12])).abs())
-                .sum();
-            let diff: i32 = (0..8).map(|n| (s[n] - s[n + 8]).abs()).sum();
-            let ring_mean = s.iter().sum::<i32>() as f32 / 16.0;
-            let local = (data[c as usize] as i32
-                + data[(c - 1) as usize] as i32
-                + data[(c + 1) as usize] as i32
-                + data[(c - stride as isize) as usize] as i32
-                + data[(c + stride as isize) as usize] as i32) as f32
-                / 5.0;
-            out_row[x] = (sum - diff) as f32 - 16.0 * (ring_mean - local).abs();
-        }
-    };
+    let fill_row =
+        |y: usize, out_row: &mut [f32]| response_row(image, y, &mut out_row[RADIUS..w - RADIUS]);
 
     #[cfg(feature = "parallel")]
     out.as_mut_slice()
@@ -187,6 +196,54 @@ pub fn chess_response(image: &Image<u8>) -> Image<f32> {
     out
 }
 
+/// The response of row `y` for x in RADIUS..width − RADIUS, into `out`.
+fn response_row(image: &Image<u8>, y: usize, out: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        // SAFETY: the CPU has AVX2.
+        return unsafe { response_row_avx2(image, y, out) };
+    }
+    response_row_body(image, y, out)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn response_row_avx2(image: &Image<u8>, y: usize, out: &mut [f32]) {
+    response_row_body(image, y, out)
+}
+
+/// 5R in i16, which needs no division and holds every value (−30600..10200):
+///   5R = 5·(sum − diff) − |5·(ring sum) − 16·(sum of the centre and its 4 neighbours)|
+/// Each ring sample and each centre pixel is one row slice, and the slices are
+/// walked in step, so the compiler vectorizes across pixels (16 per instruction
+/// with AVX2, 8 with NEON).
+#[inline(always)]
+fn response_row_body(image: &Image<u8>, y: usize, out: &mut [f32]) {
+    let (data, stride, n) = (image.as_slice(), image.stride() as isize, out.len());
+    // The n pixels from (RADIUS + dx, y + dy) on.
+    let at = |dx: isize, dy: isize| {
+        let start = ((y as isize + dy) * stride + RADIUS as isize + dx) as usize;
+        &data[start..start + n]
+    };
+    let ring: [&[u8]; 16] = core::array::from_fn(|k| at(RING[k].0, RING[k].1));
+    let centre = [at(0, 0), at(-1, 0), at(1, 0), at(0, -1), at(0, 1)];
+    for x in 0..n {
+        // In four groups of samples a quarter turn apart (k, k+4, k+8, k+12),
+        // each feeding all three sums, so few values are live at once.
+        let (mut sum, mut diff, mut ring_sum) = (0i16, 0i16, 0i16);
+        for k in 0..4 {
+            let (a, b) = (ring[k][x] as i16, ring[k + 4][x] as i16);
+            let (c, d) = (ring[k + 8][x] as i16, ring[k + 12][x] as i16);
+            sum += ((a + c) - (b + d)).abs();
+            diff += (a - c).abs() + (b - d).abs();
+            ring_sum += a + b + c + d;
+        }
+        let centre_sum: i16 = centre.iter().map(|row| row[x] as i16).sum();
+        let r5 = 5 * (sum - diff) - (5 * ring_sum - 16 * centre_sum).abs();
+        out[x] = r5 as f32 * 0.2;
+    }
+}
+
 /// Local maxima of the response (5×5) down to `grow_response`, strongest
 /// first, sub-pixel.
 pub fn find_candidates(response: &Image<f32>, config: &CheckerboardConfig) -> Vec<Candidate> {
@@ -198,39 +255,36 @@ pub fn find_candidates(response: &Image<f32>, config: &CheckerboardConfig) -> Ve
     let threshold = config.grow_response;
     let mut out = Vec::new();
     for y in m..h - m {
-        let row = response.row(y);
-        for x in m..w - m {
-            let v = row[x];
-            if v < threshold {
+        let rows: [&[f32]; 5] = core::array::from_fn(|k| response.row(y + k - 2));
+        // Most pixels are below the threshold: test 16 at once (an OR without
+        // short-circuit, which vectorizes) and look closer where one passes.
+        for (i, chunk) in rows[2][m..w - m].chunks(16).enumerate() {
+            if !chunk.iter().fold(false, |any, &v| any | (v >= threshold)) {
                 continue;
             }
-            // Strict maximum over earlier pixels, at least equal to later ones,
-            // so a plateau yields exactly one candidate.
-            let mut is_max = true;
-            'win: for dy in -2isize..=2 {
-                let r = response.row((y as isize + dy) as usize);
-                for dx in -2isize..=2 {
-                    if dx == 0 && dy == 0 {
-                        continue;
-                    }
-                    let u = r[(x as isize + dx) as usize];
-                    let earlier = dy < 0 || (dy == 0 && dx < 0);
-                    if u > v || (earlier && u == v) {
-                        is_max = false;
-                        break 'win;
-                    }
+            for (j, &v) in chunk.iter().enumerate() {
+                if v < threshold {
+                    continue;
                 }
+                let x = m + 16 * i + j;
+                // Strict maximum over earlier pixels, at least equal to later
+                // ones, so a plateau yields exactly one candidate.
+                let is_max = WINDOW.iter().all(|&(dx, dy)| {
+                    let u = rows[(2 + dy) as usize][(x as isize + dx) as usize];
+                    let earlier = dy < 0 || (dy == 0 && dx < 0);
+                    !(u > v || (earlier && u == v))
+                });
+                if !is_max {
+                    continue;
+                }
+                let (l, r) = (rows[2][x - 1], rows[2][x + 1]);
+                let (u, d) = (rows[1][x], rows[3][x]);
+                out.push(Candidate {
+                    x: x as f32 + parabola_peak(l, v, r),
+                    y: y as f32 + parabola_peak(u, v, d),
+                    response: v,
+                });
             }
-            if !is_max {
-                continue;
-            }
-            let (l, r) = (row[x - 1], row[x + 1]);
-            let (u, d) = (response.row(y - 1)[x], response.row(y + 1)[x]);
-            out.push(Candidate {
-                x: x as f32 + parabola_peak(l, v, r),
-                y: y as f32 + parabola_peak(u, v, d),
-                response: v,
-            });
         }
     }
     out.sort_by(|a, b| b.response.total_cmp(&a.response));
@@ -376,12 +430,9 @@ impl CheckerboardDetector {
         let half = ((0.3 * n1.min(n2)).round() as usize).clamp(2, 6);
         let (p0, pa, pb) = (s.pos(seed, half), s.pos(a, half), s.pos(b, half));
         let p3 = [pa[0] + pb[0] - p0[0], pa[1] + pb[1] - p0[1]];
-        let d = s.index.nearest(
-            s.c,
-            p3,
-            self.config.match_tolerance * n1.min(n2),
-            &[seed, a, b],
-        )?;
+        let d = s
+            .index
+            .nearest(p3, self.config.match_tolerance * n1.min(n2), &[seed, a, b])?;
         s.pos(d, half);
         Some((vec![vec![seed, a], vec![b, d]], half))
     }
@@ -458,7 +509,7 @@ impl CheckerboardDetector {
         let d1 = [p[0][0] - p[1][0], p[0][1] - p[1][1]];
         let radius = self.config.match_tolerance * norm(d1);
         let linear = [p[0][0] + d1[0], p[0][1] + d1[1]];
-        if let Some(m) = s.index.nearest(s.c, linear, radius, used) {
+        if let Some(m) = s.index.nearest(linear, radius, used) {
             return Some(m);
         }
         if p.len() < 3 {
@@ -466,7 +517,7 @@ impl CheckerboardDetector {
         }
         let d2 = [p[1][0] - p[2][0], p[1][1] - p[2][1]];
         let quadratic = [linear[0] + d1[0] - d2[0], linear[1] + d1[1] - d2[1]];
-        s.index.nearest(s.c, quadratic, radius, used)
+        s.index.nearest(quadratic, radius, used)
     }
 
     /// The cells between the corners alternate dark/light, with enough contrast.
@@ -644,6 +695,13 @@ pub fn refine_corner(image: &Image<u8>, p: [f32; 2], half: usize) -> [f32; 2] {
     let (w, h) = (image.width() as isize, image.height() as isize);
     let half = half as isize;
     let sigma2 = (0.5 * half as f64 + 0.5).powi(2);
+    let n = 2 * half + 1;
+    let weight: Vec<f64> = (0..n * n)
+        .map(|i| {
+            let (dx, dy) = (i % n - half, i / n - half);
+            (-((dx * dx + dy * dy) as f64) / (2.0 * sigma2)).exp()
+        })
+        .collect();
     let mut q = [p[0] as f64, p[1] as f64];
     for _ in 0..10 {
         let (cx, cy) = (q[0].round() as isize, q[1].round() as isize);
@@ -657,7 +715,7 @@ pub fn refine_corner(image: &Image<u8>, p: [f32; 2], half: usize) -> [f32; 2] {
                 let (x, y) = ((cx + dx) as usize, (cy + dy) as usize);
                 let gx = 0.5 * (image.get(x + 1, y) as f64 - image.get(x - 1, y) as f64);
                 let gy = 0.5 * (image.get(x, y + 1) as f64 - image.get(x, y - 1) as f64);
-                let wgt = (-((dx * dx + dy * dy) as f64) / (2.0 * sigma2)).exp();
+                let wgt = weight[((dy + half) * n + dx + half) as usize];
                 let (gxx, gyy, gxy) = (gx * gx * wgt, gy * gy * wgt, gx * gy * wgt);
                 a += gxx;
                 b += gyy;
@@ -684,11 +742,17 @@ pub fn refine_corner(image: &Image<u8>, p: [f32; 2], half: usize) -> [f32; 2] {
 }
 
 /// Candidates bucketed on a grid, for nearest-candidate queries near a point.
+/// One array sorted by bucket, holding the positions themselves: the buckets
+/// of one grid row are then one contiguous slice, read without following
+/// candidate numbers elsewhere in memory.
 struct SpatialIndex {
     cell: f32,
     nx: usize,
     ny: usize,
-    buckets: Vec<Vec<usize>>,
+    /// Bucket b holds entries[start[b]..start[b + 1]].
+    start: Vec<usize>,
+    /// (x, y, candidate), in candidate order within each bucket.
+    entries: Vec<(f32, f32, usize)>,
 }
 
 impl SpatialIndex {
@@ -696,43 +760,55 @@ impl SpatialIndex {
         let cell = 16.0;
         let nx = (width as f32 / cell).ceil() as usize + 1;
         let ny = (height as f32 / cell).ceil() as usize + 1;
-        let mut buckets = vec![Vec::new(); nx * ny];
+        let bucket = |q: &Candidate| {
+            ((q.y / cell) as usize).min(ny - 1) * nx + ((q.x / cell) as usize).min(nx - 1)
+        };
+        // Counting sort: bucket sizes, their running sum, then each entry into place.
+        let mut start = vec![0; nx * ny + 1];
+        for q in c {
+            start[bucket(q) + 1] += 1;
+        }
+        for b in 0..nx * ny {
+            start[b + 1] += start[b];
+        }
+        let mut next = start.clone();
+        let mut entries = vec![(0.0, 0.0, 0); c.len()];
         for (k, q) in c.iter().enumerate() {
-            let (bx, by) = ((q.x / cell) as usize, (q.y / cell) as usize);
-            buckets[by.min(ny - 1) * nx + bx.min(nx - 1)].push(k);
+            let b = bucket(q);
+            entries[next[b]] = (q.x, q.y, k);
+            next[b] += 1;
         }
         Self {
             cell,
             nx,
             ny,
-            buckets,
+            start,
+            entries,
         }
     }
 
     /// The candidate nearest to `p` within `radius`, not in `exclude`.
-    fn nearest(
-        &self,
-        c: &[Candidate],
-        p: [f32; 2],
-        radius: f32,
-        exclude: &[usize],
-    ) -> Option<usize> {
+    fn nearest(&self, p: [f32; 2], radius: f32, exclude: &[usize]) -> Option<usize> {
         let r = (radius / self.cell).ceil() as isize;
         let (bx, by) = (
             (p[0] / self.cell).floor() as isize,
             (p[1] / self.cell).floor() as isize,
         );
+        let (x0, x1) = ((bx - r).max(0), (bx + r).min(self.nx as isize - 1));
+        if x1 < x0 {
+            return None;
+        }
         let mut best: Option<(f32, usize)> = None;
         for y in (by - r).max(0)..=(by + r).min(self.ny as isize - 1) {
-            for x in (bx - r).max(0)..=(bx + r).min(self.nx as isize - 1) {
-                for &k in &self.buckets[y as usize * self.nx + x as usize] {
-                    let d = (c[k].x - p[0]).powi(2) + (c[k].y - p[1]).powi(2);
-                    if d <= radius * radius
-                        && best.is_none_or(|(bd, _)| d < bd)
-                        && !exclude.contains(&k)
-                    {
-                        best = Some((d, k));
-                    }
+            let row = y as usize * self.nx;
+            let span = self.start[row + x0 as usize]..self.start[row + x1 as usize + 1];
+            for &(x, y, k) in &self.entries[span] {
+                let d = (x - p[0]).powi(2) + (y - p[1]).powi(2);
+                if d <= radius * radius
+                    && best.is_none_or(|(bd, _)| d < bd)
+                    && !exclude.contains(&k)
+                {
+                    best = Some((d, k));
                 }
             }
         }
