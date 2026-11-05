@@ -1,8 +1,9 @@
 // examples/checkerboard_eval.rs — Run the checkerboard detector on a folder of PNGs.
 //
-//   cargo run --release --example checkerboard_eval -- <png dir> [cols rows] > results.jsonl
+//   cargo run --release --example checkerboard_eval -- <png dir> [cols rows] [--gpu] > results.jsonl
 //
 // One JSON line per image (file stem, found, corners, milliseconds), a summary on stderr.
+// --gpu: the ChESS responses on the GPU (GpuCheckerboardDetector), the same corners.
 // For comparing against another detector's results on the same frames. All images are
 // decoded before the first detection, so a profiler sees the detector, not PNG decoding.
 
@@ -10,6 +11,8 @@ use std::path::Path;
 use std::time::Instant;
 
 use rudolf_v::checkerboard::{CheckerboardConfig, CheckerboardDetector};
+use rudolf_v::gpu::checkerboard::GpuCheckerboardDetector;
+use rudolf_v::gpu::device::GpuDevice;
 use rudolf_v::image::Image;
 
 fn load_grayscale(path: &Path) -> Image<u8> {
@@ -21,17 +24,25 @@ fn load_grayscale(path: &Path) -> Image<u8> {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().collect();
+    let gpu = args.iter().position(|a| a == "--gpu").map(|i| {
+        args.remove(i);
+        GpuDevice::new().expect("--gpu: no Vulkan GPU")
+    });
     let dir = args
         .get(1)
-        .expect("usage: checkerboard_eval <png dir> [cols rows]");
+        .expect("usage: checkerboard_eval <png dir> [cols rows] [--gpu]");
     let cols = args.get(2).map_or(9, |s| s.parse().expect("cols"));
     let rows = args.get(3).map_or(6, |s| s.parse().expect("rows"));
-    let detector = CheckerboardDetector::new(CheckerboardConfig {
+    let config = CheckerboardConfig {
         cols,
         rows,
         ..Default::default()
-    });
+    };
+    let mut gpu_detector = gpu
+        .as_ref()
+        .map(|g| GpuCheckerboardDetector::new(g, config.clone()));
+    let detector = CheckerboardDetector::new(config);
 
     let mut files: Vec<_> = std::fs::read_dir(dir)
         .expect("png dir")
@@ -45,7 +56,10 @@ fn main() {
     let (mut found, mut times) = (0, Vec::new());
     for (path, image) in files.iter().zip(&images) {
         let t0 = Instant::now();
-        let corners = detector.detect(image);
+        let corners = match (&gpu, &mut gpu_detector) {
+            (Some(g), Some(d)) => d.detect(g, image),
+            _ => detector.detect(image),
+        };
         let ms = t0.elapsed().as_secs_f64() * 1e3;
         times.push(ms);
         let stem = path.file_stem().unwrap().to_string_lossy();
