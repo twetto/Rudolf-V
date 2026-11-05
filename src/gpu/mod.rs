@@ -1,3 +1,4 @@
+pub mod checkerboard;
 pub mod clahe;
 pub mod device;
 pub mod fast;
