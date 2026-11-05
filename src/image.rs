@@ -82,6 +82,18 @@ impl Pixel for u16 {
     }
 }
 
+impl Pixel for i16 {
+    #[inline]
+    fn to_f32(self) -> f32 {
+        self as f32
+    }
+
+    #[inline]
+    fn from_f32(v: f32) -> Self {
+        v.clamp(-32768.0, 32767.0).round() as i16
+    }
+}
+
 impl Pixel for f32 {
     #[inline]
     fn to_f32(self) -> f32 {
