@@ -12,8 +12,9 @@
 // The response kernel works from a shared-memory tile per workgroup (each texel
 // read about twice, not 21 times). As the frontend's persistent pyramids (Phase
 // 3c), the frame goes into an R8Uint texture by `queue.write_texture`, and the
-// texture, buffers and bind groups are created once per image size, so a frame
-// allocates nothing. Both scales are computed every time, though the half-size
+// texture, buffers and bind groups are kept for the largest image so far; a
+// smaller one (a window around a board) runs in them with its own sizes, so a
+// frame allocates nothing. Both scales are computed every time, though the half-size
 // candidates are only searched when the full-size ones hold no board: one round
 // trip, not two.
 //
@@ -70,26 +71,30 @@ pub struct GpuCheckerboardDetector {
     candidate_pipeline: wgpu::ComputePipeline,
     candidate_bgl: wgpu::BindGroupLayout,
     workgroup: (u32, u32),
-    /// The GPU resources for the last image size.
+    /// The GPU resources, for the largest image so far.
     frame: Option<Frame>,
     readback_rx: Option<Receiver<Result<(), wgpu::BufferAsyncError>>>,
     /// Also read the responses back (for checking them).
     read_responses: bool,
 }
 
-/// The GPU side for one image size: the frame's texture and both scales.
+/// The GPU side for images up to cap_w × cap_h: the frame's texture and both
+/// scales.
 struct Frame {
-    width: u32,
-    height: u32,
+    cap_w: u32,
+    cap_h: u32,
     texture: wgpu::Texture,
     scales: Vec<Scale>,
 }
 
-/// One scale: its response and candidates passes and their buffers.
+/// One scale: its response and candidates passes and their buffers, sized
+/// for the frame's capacity.
 struct Scale {
     half: bool,
+    /// This frame's size at this scale; inactive when empty.
     width: u32,
     height: u32,
+    active: bool,
     response_bg: wgpu::BindGroup,
     response_groups: (u32, u32),
     candidate_bg: wgpu::BindGroup,
@@ -100,12 +105,39 @@ struct Scale {
     response_readback: wgpu::Buffer,
     found: wgpu::Buffer,
     found_readback: wgpu::Buffer,
-    _params: [wgpu::Buffer; 2],
+    response_params: wgpu::Buffer,
+    candidate_params: wgpu::Buffer,
 }
 
 impl Scale {
     fn response_bytes(&self) -> u64 {
         (self.pairs * self.height) as u64 * 4
+    }
+
+    /// This scale at width × height (within its capacity): the shaders' sizes
+    /// (`write_buffer`, before the next submission) and the dispatch.
+    fn resize(&mut self, gpu: &GpuDevice, width: u32, height: u32, threshold: i32, wg: (u32, u32)) {
+        self.width = width;
+        self.height = height;
+        self.pairs = width.div_ceil(2);
+        let response = ResponseParams {
+            width,
+            height,
+            half: self.half as u32,
+            _pad: 0,
+        };
+        let candidates = CandidateParams {
+            width,
+            height,
+            threshold,
+            capacity: CAPACITY,
+        };
+        gpu.queue
+            .write_buffer(&self.response_params, 0, bytemuck::bytes_of(&response));
+        gpu.queue
+            .write_buffer(&self.candidate_params, 0, bytemuck::bytes_of(&candidates));
+        self.response_groups = (self.pairs.div_ceil(wg.0), height.div_ceil(wg.1));
+        self.candidate_groups = (width.div_ceil(wg.0), height.div_ceil(wg.1));
     }
 }
 
@@ -248,6 +280,29 @@ impl GpuCheckerboardDetector {
         self.collect(image)
     }
 
+    /// As `detect`, within the region (x, y, w, h) of `image`; corners in the
+    /// whole image's pixels.
+    pub fn detect_region(
+        &mut self,
+        gpu: &GpuDevice,
+        image: &Image<u8>,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+    ) -> Option<Vec<[f32; 2]>> {
+        let w = w.min(image.width().saturating_sub(x));
+        let h = h.min(image.height().saturating_sub(y));
+        let crop = image.sub_image(x, y, w, h).to_owned_image();
+        let corners = self.detect(gpu, &crop)?;
+        Some(
+            corners
+                .into_iter()
+                .map(|[u, v]| [u + x as f32, v + y as f32])
+                .collect(),
+        )
+    }
+
     /// The candidates in `image` and in its half-size image, from the GPU.
     pub fn candidates(
         &mut self,
@@ -265,7 +320,7 @@ impl GpuCheckerboardDetector {
         self.read_responses = false;
         let frame = self.frame.as_ref().expect("run() allocates the frame");
         let mut out = [Image::new(0, 0), Image::new(0, 0)];
-        for s in &frame.scales {
+        for s in frame.scales.iter().filter(|s| s.active) {
             out[s.half as usize] = read_response(s);
         }
         self.read_candidates(image); // unmaps the candidates
@@ -298,12 +353,18 @@ impl GpuCheckerboardDetector {
         image: &Image<u8>,
     ) {
         let (w, h) = (image.width() as u32, image.height() as u32);
-        if !self
-            .frame
-            .as_ref()
-            .is_some_and(|f| f.width == w && f.height == h)
-        {
-            self.frame = Some(self.allocate(gpu, w, h));
+        let (cap_w, cap_h) = self.frame.as_ref().map_or((0, 0), |f| (f.cap_w, f.cap_h));
+        if self.frame.is_none() || w > cap_w || h > cap_h {
+            self.frame = Some(self.allocate(gpu, w.max(cap_w), h.max(cap_h)));
+        }
+        let (threshold, wg) = (grow_r5(&self.detector.config) as i32, self.workgroup);
+        let frame = self.frame.as_mut().unwrap();
+        for s in &mut frame.scales {
+            let (sw, sh) = if s.half { (w / 2, h / 2) } else { (w, h) };
+            s.active = sw > 0 && sh > 0;
+            if s.active && (sw, sh) != (s.width, s.height) {
+                s.resize(gpu, sw, sh, threshold, wg);
+            }
         }
         let frame = self.frame.as_ref().unwrap();
         if w == 0 || h == 0 {
@@ -328,7 +389,8 @@ impl GpuCheckerboardDetector {
                 depth_or_array_layers: 1,
             },
         );
-        for s in &frame.scales {
+        let active = || frame.scales.iter().filter(|s| s.active);
+        for s in active() {
             encoder.clear_buffer(&s.found, 0, Some(HEADER));
         }
         {
@@ -336,7 +398,7 @@ impl GpuCheckerboardDetector {
                 label: Some("checkerboard"),
                 timestamp_writes: None,
             });
-            for s in &frame.scales {
+            for s in active() {
                 pass.set_pipeline(&self.response_pipeline);
                 pass.set_bind_group(0, &s.response_bg, &[]);
                 pass.dispatch_workgroups(s.response_groups.0, s.response_groups.1, 1);
@@ -345,7 +407,7 @@ impl GpuCheckerboardDetector {
                 pass.dispatch_workgroups(s.candidate_groups.0, s.candidate_groups.1, 1);
             }
         }
-        for s in &frame.scales {
+        for s in active() {
             encoder.copy_buffer_to_buffer(&s.found, 0, &s.found_readback, 0, s.found.size());
             if self.read_responses {
                 let bytes = s.response_bytes();
@@ -358,7 +420,12 @@ impl GpuCheckerboardDetector {
     /// encoder, before `device.poll(Wait)`.
     pub fn arm_readback(&mut self) {
         let (tx, rx) = std::sync::mpsc::channel();
-        for s in self.frame.iter().flat_map(|f| &f.scales) {
+        for s in self
+            .frame
+            .iter()
+            .flat_map(|f| &f.scales)
+            .filter(|s| s.active)
+        {
             let mut buffers = vec![(&s.found_readback, s.found.size())];
             if self.read_responses {
                 buffers.push((&s.response_readback, s.response_bytes()));
@@ -391,12 +458,8 @@ impl GpuCheckerboardDetector {
         }
         let config = &self.detector.config;
         let mut out = [Vec::new(), Vec::new()];
-        for s in &self
-            .frame
-            .as_ref()
-            .expect("call record_into() first")
-            .scales
-        {
+        let frame = self.frame.as_ref().expect("call record_into() first");
+        for s in frame.scales.iter().filter(|s| s.active) {
             let mapped = s
                 .found_readback
                 .slice(..s.found.size())
@@ -440,7 +503,8 @@ impl GpuCheckerboardDetector {
         (full, half)
     }
 
-    /// The texture and both scales' buffers and bind groups for a w×h image.
+    /// The texture and both scales' buffers and bind groups for images up to
+    /// w × h; their sizes are set by `record_into`.
     fn allocate(&self, gpu: &GpuDevice, w: u32, h: u32) -> Frame {
         let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("GpuCheckerboard frame"),
@@ -459,12 +523,11 @@ impl GpuCheckerboardDetector {
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let scales = [(w, h, false), (w / 2, h / 2, true)]
             .into_iter()
-            .filter(|&(sw, sh, _)| sw * sh > 0)
-            .map(|(sw, sh, half)| self.allocate_scale(gpu, &view, sw, sh, half))
+            .map(|(sw, sh, half)| self.allocate_scale(gpu, &view, sw.max(1), sh.max(1), half))
             .collect();
         Frame {
-            width: w,
-            height: h,
+            cap_w: w,
+            cap_h: h,
             texture,
             scales,
         }
@@ -491,7 +554,7 @@ impl GpuCheckerboardDetector {
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("GpuCheckerboard params"),
                     contents,
-                    usage: wgpu::BufferUsages::UNIFORM,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 })
         };
         let bind_group = |layout, entries: &[wgpu::BindGroupEntry]| {
@@ -575,21 +638,23 @@ impl GpuCheckerboardDetector {
                 },
             ],
         );
-        let (wx, wy) = self.workgroup;
+        // Sized by the first `record_into` (resize).
         Scale {
             half,
-            width,
-            height,
+            width: 0,
+            height: 0,
+            active: false,
             response_bg,
-            response_groups: (pairs.div_ceil(wx), height.div_ceil(wy)),
+            response_groups: (0, 0),
             candidate_bg,
-            candidate_groups: (width.div_ceil(wx), height.div_ceil(wy)),
-            pairs,
+            candidate_groups: (0, 0),
+            pairs: 0,
             response,
             response_readback,
             found,
             found_readback,
-            _params: [response_params, candidate_params],
+            response_params,
+            candidate_params,
         }
     }
 }
@@ -711,6 +776,54 @@ mod tests {
         println!("GPU_TEST_OK");
     }
 
+    /// One detector through changing sizes (as a window around a board): a
+    /// smaller image runs in the larger one's texture and buffers, whose stale
+    /// pixels past its edge must not reach its responses or candidates.
+    #[test]
+    #[ignore = "GPU integration"]
+    fn inner_sizes_change() {
+        let gpu = GpuDevice::new().expect("need Vulkan GPU");
+        let config = CheckerboardConfig::default();
+        let mut det = GpuCheckerboardDetector::new(&gpu, config.clone());
+        for (k, (w, h)) in [
+            (640, 480),
+            (321, 157),
+            (640, 480),
+            (97, 301),
+            (1, 1),
+            (700, 100),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let img = blocky(w, h, 3, 20 + k as u32);
+            let (full, small) = det.responses(&gpu, &img);
+            assert_eq!(
+                full.as_slice(),
+                chess_response_r5(&img).as_slice(),
+                "{w}x{h}"
+            );
+            let half = half_size(&img);
+            assert_eq!(
+                small.as_slice(),
+                chess_response_r5(&half).as_slice(),
+                "{w}x{h} half"
+            );
+            let (c_full, c_half) = det.candidates(&gpu, &img);
+            assert_eq!(
+                bits(&c_full),
+                bits(&candidates_of(&img, &config)),
+                "{w}x{h}"
+            );
+            assert_eq!(
+                bits(&c_half),
+                bits(&candidates_of(&half, &config)),
+                "{w}x{h} half"
+            );
+        }
+        println!("GPU_TEST_OK");
+    }
+
     #[test]
     #[ignore = "GPU integration"]
     fn inner_detects_as_cpu() {
@@ -763,6 +876,14 @@ mod tests {
         assert!(
             run_gpu_test("gpu::checkerboard::tests::inner_candidates_match_cpu")
                 .contains("GPU_TEST_OK")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a real Vulkan GPU"]
+    fn test_sizes_change() {
+        assert!(
+            run_gpu_test("gpu::checkerboard::tests::inner_sizes_change").contains("GPU_TEST_OK")
         );
     }
 
