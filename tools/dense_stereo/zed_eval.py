@@ -33,7 +33,7 @@ import numpy as np
 import yaml
 
 RANGES = [0.3, 0.5, 1.0, 2.0, 3.5, 5.0, np.inf]  # SDK range bins, metres
-EDGES = np.linspace(-2, 2, 4001)  # signed log-range error histogram, 0.001 bins
+EDGES = np.linspace(-2, 2, 20001)  # signed log-range error histogram, 0.0002 bins
 BAND = 0.45  # mr-neuro-nav reflex: risk_y_max_frac
 N_BINS, FOV = 9, np.radians(67.0)  # mr-neuro-nav configs/quadruped.yaml
 SAFETY = (0.5, 1.0)
@@ -177,7 +177,7 @@ class Score:
 def report(name, s):
     st = s.stats()
     print(f"\n{name}: {100 * s.px / s.all_px:.1f}% of pixels have depth, {100 * st['cov']:.1f}% of the SDK's")
-    print(f"  |log-range error| median {100 * st['abs_med']:.2f}%, signed {100 * st['sgn']:+.2f}%, "
+    print(f"  |log-range error| median {100 * st['abs_med']:.3f}%, signed {100 * st['sgn']:+.2f}%, "
           f">10% {100 * st['b10']:.1f}%, >25% {100 * st['b25']:.1f}% "
           f"(nearer {100 * st['near25']:.1f}%, farther {100 * st['far25']:.1f}%)")
     print(f"  {'SDK range':>12s} {'SDK px':>9s} {'coverage':>9s} {'median':>8s} {'signed':>8s} {'>10%':>7s} {'>25%':>7s}")

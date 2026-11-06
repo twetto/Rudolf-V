@@ -9,6 +9,9 @@
 //   --frames a:b:s   frames a..b, every s-th            (default: all)
 //   --level L        finest pyramid level                (default: 0.5)
 //   --vr N           variational fixed-point iterations  (default: 5)
+//   --sor N          SOR iterations per fixed-point one  (default: 5)
+//   --gd N           Gauss-Newton iterations per patch and level (default: 16)
+//   --sweeps N       red-black propagation sweeps        (default: 2)
 //   --edge S         edge-aware smoothness, grey/px      (default: 0, off)
 //   --speckle N      drop depth regions under N pixels   (default: 100)
 //   --fallback N     coarser levels the fallback may fill from, 0 = off (default: 2)
@@ -110,6 +113,9 @@ fn main() {
     let frames = take("--frames");
     let level: usize = take("--level").map_or(1, |v| v.parse().expect("--level"));
     let vr: usize = take("--vr").map_or(5, |v| v.parse().expect("--vr"));
+    let sor: Option<usize> = take("--sor").map(|v| v.parse().expect("--sor"));
+    let gd: Option<usize> = take("--gd").map(|v| v.parse().expect("--gd"));
+    let sweeps: Option<usize> = take("--sweeps").map(|v| v.parse().expect("--sweeps"));
     let edge: f32 = take("--edge").map_or(0.0, |v| v.parse().expect("--edge"));
     let speckle: Option<usize> = take("--speckle").map(|v| v.parse().expect("--speckle"));
     let fallback: Option<usize> = take("--fallback").map(|v| v.parse().expect("--fallback"));
@@ -161,6 +167,9 @@ fn main() {
     let config = DenseStereoConfig {
         speckle_size: speckle.unwrap_or(config.speckle_size),
         coarse_fallback: fallback.unwrap_or(config.coarse_fallback),
+        sor_iterations: sor.unwrap_or(config.sor_iterations),
+        grad_descent_iterations: gd.unwrap_or(config.grad_descent_iterations),
+        propagation_sweeps: sweeps.unwrap_or(config.propagation_sweeps),
         min_texture: min_texture.unwrap_or(config.min_texture),
         ..config
     };

@@ -878,34 +878,23 @@ struct Buffers {
     // Finest-level statistics from the valid patches.
     valid: Vec<bool>,
     var: Vec<f32>,
-    // Variational refinement: per pixel, the warp's linearisation and the
-    // data-term derivatives (along the epipolar direction) with their
-    // constant normalisations.
-    warped: Vec<f32>,
-    ex: Vec<f32>,
-    ey: Vec<f32>,
+    // Variational refinement. The solved pixels in SOR order (index, and
+    // index in the padded solver arrays); the linearised warp's mean and
+    // difference images; per solved pixel, its data term's constants, 1/A
+    // and the right-hand side's constant part.
+    act: Vec<u32>,
+    act_pad: Vec<u32>,
     avg: Vec<f32>,
     iz: Vec<f32>,
-    ix: Vec<f32>,
-    iy: Vec<f32>,
-    ixx: Vec<f32>,
-    ixy: Vec<f32>,
-    iyy: Vec<f32>,
-    ixz: Vec<f32>,
-    iyz: Vec<f32>,
-    inv_nd: Vec<f32>,
-    inv_nx: Vec<f32>,
-    inv_ny: Vec<f32>,
-    edge: Vec<f32>,
-    // The solver, (w+2)×(h+2) with a zero border: D, its increment, the
-    // weights of each pixel's right and lower edges, and per pixel 1/A and
-    // the right-hand side's constant part.
+    terms: Vec<DataTerm>,
+    inv_a: Vec<f32>,
+    c: Vec<f32>,
+    // The solver, (w+2)×(h+2) with a zero border: D, its increment, and the
+    // weights of each pixel's right and lower edges.
     dpad: Vec<f32>,
     dd: Vec<f32>,
     wr: Vec<f32>,
     wd: Vec<f32>,
-    inv_a: Vec<f32>,
-    c: Vec<f32>,
     // Occlusion test: nearest D per right-image pixel, and each left pixel's
     // right-image pixel.
     zbuf: Vec<f32>,
@@ -916,6 +905,24 @@ struct Buffers {
     coarse: Vec<LevelDepth>,
     disagree: Vec<u32>,
     source: Vec<u8>,
+}
+
+/// One solved pixel's data term, fixed over the fixed-point iterations:
+/// temporal difference I1(warp) − I0 and its gradient, the gradient of the
+/// mean image along the epipolar direction and its derivatives, the
+/// normalisations, and the edge factor of the smoothness weight.
+#[derive(Clone, Copy, Default)]
+struct DataTerm {
+    iz: f32,
+    id: f32,
+    ixd: f32,
+    iyd: f32,
+    ixz: f32,
+    iyz: f32,
+    inv_nd: f32,
+    inv_nx: f32,
+    inv_ny: f32,
+    edge: f32,
 }
 
 /// A coarser level's depth after validation, for the coarse fallback.
@@ -1218,7 +1225,8 @@ impl DenseStereo {
             !validate || rise(p.d - DISTINCT_STEP).min(rise(p.d + DISTINCT_STEP)) >= min_rise
         }));
         // Pixels using a patch: its footprint, extended to the image's far
-        // edge for the last row and column of patches.
+        // edge for the last row and column of patches, and by one pixel all
+        // round for the local cost at depth edges.
         samplers.clear();
         samplers.extend(patches.iter().enumerate().map(|(k, p)| {
             let (js, is) = (k % ws, k / ws);
@@ -1238,7 +1246,8 @@ impl DenseStereo {
                     is * st + psz - 1
                 },
             );
-            ShiftSampler::new(v.i1, p.shift, xs, ys)
+            let grow = |r: (usize, usize), n: usize| (r.0.saturating_sub(1), (r.1 + 1).min(n - 1));
+            ShiftSampler::new(v.i1, p.shift, grow(xs, w), grow(ys, h))
         }));
 
         d.resize(w * h, 0.0);
@@ -1258,14 +1267,14 @@ impl DenseStereo {
             };
             (first.min(last), last)
         };
-        // Photometric cost of a patch's shift on the 3×3 pixels around (x, y).
-        let local_cost = |x: usize, y: usize, shift: [f32; 2]| -> f32 {
+        // Photometric cost of patch k's shift on the 3×3 pixels around (x, y).
+        let local_cost = |x: usize, y: usize, k: usize| -> f32 {
             let mut c = 0.0;
             for dy in -1isize..=1 {
                 let yy = (y as isize + dy).clamp(0, h as isize - 1) as usize;
                 for dx in -1isize..=1 {
                     let xx = (x as isize + dx).clamp(0, w as isize - 1) as usize;
-                    let i1 = v.i1.sample(xx as f32 + shift[0], yy as f32 + shift[1]);
+                    let i1 = samplers[k].sample(v.i1, xx, yy);
                     c += (i1 - v.i0[yy * w + xx]).abs();
                 }
             }
@@ -1323,7 +1332,7 @@ impl DenseStereo {
                 let centre = if hi - lo > DISAGREE {
                     let mut costs = [(0.0f32, 0.0f32); MAX_COVER];
                     for (c, &(k, _)) in costs.iter_mut().zip(cand) {
-                        *c = (local_cost(x, y, patches[k].shift), patches[k].d);
+                        *c = (local_cost(x, y, k), patches[k].d);
                     }
                     let costs = &costs[..nc];
                     let (win_cost, win_d) = costs
@@ -1388,193 +1397,177 @@ impl DenseStereo {
         let n = w * h;
         let masked = level == cfg.finest_level;
         let b = &mut self.buf;
-        let active = |valid: &[bool], i: usize| !masked || valid[i];
+        let solved = |valid: &[bool], i: usize| !masked || valid[i];
 
-        // Linearise the warp at the current D: warped right image and the
-        // epipolar direction per pixel.
-        b.warped.resize(n, 0.0);
-        b.ex.resize(n, 0.0);
-        b.ey.resize(n, 0.0);
-        for y in 0..h {
-            for x in 0..w {
-                let i = y * w + x;
-                let loc = if active(&b.valid, i) {
-                    self.epi.locate(g, g.rays[i], x as f32, y as f32, b.d[i])
-                } else {
-                    None
-                };
-                match loc {
-                    Some(loc) => {
-                        b.warped[i] = self.i1.sample(loc[0], loc[1]);
-                        b.ex[i] = loc[2];
-                        b.ey[i] = loc[3];
-                    }
-                    None => {
-                        b.warped[i] = b.i0[i];
-                        b.ex[i] = 0.0;
-                        b.ey[i] = 0.0;
+        // The solved pixels in SOR order: red ((x + y) even), then black, each
+        // row-major. The others keep their D (increment 0) and constrain
+        // nothing.
+        let pw = w + 2;
+        b.act.clear();
+        b.act_pad.clear();
+        let mut n_red = 0;
+        for colour in 0..2 {
+            for y in 0..h {
+                for x in ((y + colour) % 2..w).step_by(2) {
+                    let i = y * w + x;
+                    if solved(&b.valid, i) {
+                        b.act.push(i as u32);
+                        b.act_pad.push(((y + 1) * pw + x + 1) as u32);
                     }
                 }
             }
-        }
-        b.avg.resize(n, 0.0);
-        b.iz.resize(n, 0.0);
-        for i in 0..n {
-            b.avg[i] = 0.5 * (b.i0[i] + b.warped[i]);
-            b.iz[i] = b.warped[i] - b.i0[i];
-        }
-        diff_x(&b.avg, w, h, &mut b.ix);
-        diff_y(&b.avg, w, h, &mut b.iy);
-        diff_x(&b.ix, w, h, &mut b.ixx);
-        diff_y(&b.ix, w, h, &mut b.ixy);
-        diff_y(&b.iy, w, h, &mut b.iyy);
-        diff_x(&b.iz, w, h, &mut b.ixz);
-        diff_y(&b.iz, w, h, &mut b.iyz);
-        // Derivatives along the epipolar direction, kept in ix/ixx/iyy:
-        // id = ∇I·e, ixd = ∂x∇I·e, iyd = ∂y∇I·e; and the normalisations,
-        // which stay fixed over the fixed-point iterations.
-        b.inv_nd.resize(n, 0.0);
-        b.inv_nx.resize(n, 0.0);
-        b.inv_ny.resize(n, 0.0);
-        for i in 0..n {
-            let (dx, dy) = (b.ex[i], b.ey[i]);
-            let id = b.ix[i] * dx + b.iy[i] * dy;
-            let ixd = b.ixx[i] * dx + b.ixy[i] * dy;
-            let iyd = b.ixy[i] * dx + b.iyy[i] * dy;
-            b.ix[i] = id;
-            b.ixx[i] = ixd;
-            b.iyy[i] = iyd;
-            b.inv_nd[i] = 1.0 / (id * id + ZETA2);
-            b.inv_nx[i] = 1.0 / (ixd * ixd + ZETA2);
-            b.inv_ny[i] = 1.0 / (iyd * iyd + ZETA2);
-        }
-        b.edge.clear();
-        if cfg.edge_sigma > 0.0 {
-            let inv = 1.0 / (cfg.edge_sigma * cfg.edge_sigma);
-            b.edge.extend(
-                (0..n).map(|i| 1.0 / (1.0 + (b.gx[i] * b.gx[i] + b.gy[i] * b.gy[i]) * inv)),
-            );
+            if colour == 0 {
+                n_red = b.act.len();
+            }
         }
 
-        let pw = w + 2;
+        // Linearise the warp at the current D: mean and difference of the
+        // left and warped right images (an unsolved pixel, or one whose ray
+        // misses the right image, sees its own grey).
+        b.avg.clear();
+        b.avg.extend_from_slice(&b.i0);
+        b.iz.clear();
+        b.iz.resize(n, 0.0);
+        b.terms.clear();
+        for &i in &b.act {
+            let i = i as usize;
+            let (x, y) = (i % w, i / w);
+            let mut t = DataTerm::default();
+            if let Some(loc) = self.epi.locate(g, g.rays[i], x as f32, y as f32, b.d[i]) {
+                let warped = self.i1.sample(loc[0], loc[1]);
+                b.avg[i] = 0.5 * (b.i0[i] + warped);
+                b.iz[i] = warped - b.i0[i];
+                // The epipolar direction, until the derivatives below.
+                (t.id, t.ixd) = (loc[2], loc[3]);
+            }
+            b.terms.push(t);
+        }
+        // Derivatives at the solved pixels: central differences clamped at
+        // the border (diff_x, diff_y), the second ones composed of the first.
+        let (avg, iz) = (&b.avg, &b.iz);
+        let xm = |x: usize| x.saturating_sub(1);
+        let xp = |x: usize| (x + 1).min(w - 1);
+        let ym = |y: usize| y.saturating_sub(1);
+        let yp = |y: usize| (y + 1).min(h - 1);
+        let dx = |f: &[f32], x: usize, y: usize| 0.5 * (f[y * w + xp(x)] - f[y * w + xm(x)]);
+        let dy = |f: &[f32], x: usize, y: usize| 0.5 * (f[yp(y) * w + x] - f[ym(y) * w + x]);
+        let inv_edge = if cfg.edge_sigma > 0.0 {
+            1.0 / (cfg.edge_sigma * cfg.edge_sigma)
+        } else {
+            0.0
+        };
+        for (t, &i) in b.terms.iter_mut().zip(&b.act) {
+            let i = i as usize;
+            let (x, y) = (i % w, i / w);
+            let (ex, ey) = (t.id, t.ixd);
+            let (ix, iy) = (dx(avg, x, y), dy(avg, x, y));
+            let ixx = 0.5 * (dx(avg, xp(x), y) - dx(avg, xm(x), y));
+            let ixy = 0.5 * (dx(avg, x, yp(y)) - dx(avg, x, ym(y)));
+            let iyy = 0.5 * (dy(avg, x, yp(y)) - dy(avg, x, ym(y)));
+            // Along the epipolar direction: id = ∇I·e, ixd = ∂x∇I·e,
+            // iyd = ∂y∇I·e.
+            t.id = ix * ex + iy * ey;
+            t.ixd = ixx * ex + ixy * ey;
+            t.iyd = ixy * ex + iyy * ey;
+            t.iz = iz[i];
+            t.ixz = dx(iz, x, y);
+            t.iyz = dy(iz, x, y);
+            t.inv_nd = 1.0 / (t.id * t.id + ZETA2);
+            t.inv_nx = 1.0 / (t.ixd * t.ixd + ZETA2);
+            t.inv_ny = 1.0 / (t.iyd * t.iyd + ZETA2);
+            t.edge = 1.0 / (1.0 + (b.gx[i] * b.gx[i] + b.gy[i] * b.gy[i]) * inv_edge);
+        }
+
         let pn = pw * (h + 2);
-        for buf in [
-            &mut b.dpad,
-            &mut b.dd,
-            &mut b.wr,
-            &mut b.wd,
-            &mut b.inv_a,
-            &mut b.c,
-        ] {
+        for buf in [&mut b.dpad, &mut b.dd, &mut b.wr, &mut b.wd] {
             buf.clear();
             buf.resize(pn, 0.0);
         }
         for y in 0..h {
             b.dpad[(y + 1) * pw + 1..][..w].copy_from_slice(&b.d[y * w..][..w]);
         }
+        let m = b.act.len();
+        b.inv_a.clear();
+        b.inv_a.resize(m, 0.0);
+        b.c.clear();
+        b.c.resize(m, 0.0);
         let (delta2, gamma2, alpha2) = (cfg.delta * 0.5, cfg.gamma * 0.5, cfg.alpha * 0.5);
         let omega = cfg.sor_omega;
         for _ in 0..cfg.variational_iterations {
             // Smoothness weights from the forward differences of D + dD; each
             // pixel's weight belongs to its right and lower edges, and only
             // edges between two solved pixels have one.
-            for y in 0..h {
-                for x in 0..w {
-                    let i = y * w + x;
-                    let p = (y + 1) * pw + x + 1;
-                    if !active(&b.valid, i) {
-                        b.wr[p] = 0.0;
-                        b.wd[p] = 0.0;
-                        continue;
-                    }
-                    let right = x + 1 < w && active(&b.valid, i + 1);
-                    let down = y + 1 < h && active(&b.valid, i + w);
-                    let u = b.dpad[p] + b.dd[p];
-                    let ux = if right {
-                        b.dpad[p + 1] + b.dd[p + 1] - u
-                    } else {
-                        0.0
-                    };
-                    let uy = if down {
-                        b.dpad[p + pw] + b.dd[p + pw] - u
-                    } else {
-                        0.0
-                    };
-                    let mut ws = alpha2 / (ux * ux + uy * uy + EPS2).sqrt();
-                    if !b.edge.is_empty() {
-                        ws *= b.edge[i];
-                    }
-                    b.wr[p] = if right { ws } else { 0.0 };
-                    b.wd[p] = if down { ws } else { 0.0 };
-                }
+            for (k, &i) in b.act.iter().enumerate() {
+                let (i, p) = (i as usize, b.act_pad[k] as usize);
+                let x = i % w;
+                let right = x + 1 < w && solved(&b.valid, i + 1);
+                let down = i + w < n && solved(&b.valid, i + w);
+                let u = b.dpad[p] + b.dd[p];
+                let ux = if right {
+                    b.dpad[p + 1] + b.dd[p + 1] - u
+                } else {
+                    0.0
+                };
+                let uy = if down {
+                    b.dpad[p + pw] + b.dd[p + pw] - u
+                } else {
+                    0.0
+                };
+                let ws = alpha2 / (ux * ux + uy * uy + EPS2).sqrt() * b.terms[k].edge;
+                b.wr[p] = if right { ws } else { 0.0 };
+                b.wd[p] = if down { ws } else { 0.0 };
             }
             // Data terms linearised around D + dD, and the parts of each
             // pixel's equation that stay fixed during SOR:
             //   A·dD = c + Σ w·dD_neighbour.
-            for y in 0..h {
-                for x in 0..w {
-                    let i = y * w + x;
-                    let p = (y + 1) * pw + x + 1;
-                    if !active(&b.valid, i) {
-                        b.inv_a[p] = 0.0;
-                        b.c[p] = 0.0;
-                        continue;
-                    }
-                    let dd = b.dd[p];
-                    let (id, inv_nd) = (b.ix[i], b.inv_nd[i]);
-                    let z = b.iz[i] + id * dd;
-                    let wc = delta2 * inv_nd / (z * z * inv_nd + EPS2).sqrt();
-                    let mut a = wc * id * id + ZETA2;
-                    let mut rhs = -wc * b.iz[i] * id;
+            for (k, t) in b.terms.iter().enumerate() {
+                let p = b.act_pad[k] as usize;
+                let dd = b.dd[p];
+                let z = t.iz + t.id * dd;
+                let wc = delta2 * t.inv_nd / (z * z * t.inv_nd + EPS2).sqrt();
+                let mut a = wc * t.id * t.id + ZETA2;
+                let mut rhs = -wc * t.iz * t.id;
 
-                    let (ixd, iyd) = (b.ixx[i], b.iyy[i]);
-                    let (inv_nx, inv_ny) = (b.inv_nx[i], b.inv_ny[i]);
-                    let zx = b.ixz[i] + ixd * dd;
-                    let zy = b.iyz[i] + iyd * dd;
-                    let wg = gamma2 / (zx * zx * inv_nx + zy * zy * inv_ny + EPS2).sqrt();
-                    a += wg * (ixd * ixd * inv_nx + iyd * iyd * inv_ny);
-                    rhs -= wg * (ixd * b.ixz[i] * inv_nx + iyd * b.iyz[i] * inv_ny);
+                let zx = t.ixz + t.ixd * dd;
+                let zy = t.iyz + t.iyd * dd;
+                let wg = gamma2 / (zx * zx * t.inv_nx + zy * zy * t.inv_ny + EPS2).sqrt();
+                a += wg * (t.ixd * t.ixd * t.inv_nx + t.iyd * t.iyd * t.inv_ny);
+                rhs -= wg * (t.ixd * t.ixz * t.inv_nx + t.iyd * t.iyz * t.inv_ny);
 
-                    let (wr, wl, wd, wu) = (b.wr[p], b.wr[p - 1], b.wd[p], b.wd[p - pw]);
-                    let d0 = b.dpad[p];
-                    a += wr + wl + wd + wu;
-                    rhs += wr * (b.dpad[p + 1] - d0)
-                        + wl * (b.dpad[p - 1] - d0)
-                        + wd * (b.dpad[p + pw] - d0)
-                        + wu * (b.dpad[p - pw] - d0);
-                    b.inv_a[p] = 1.0 / a;
-                    b.c[p] = rhs;
-                }
+                let (wr, wl, wd, wu) = (b.wr[p], b.wr[p - 1], b.wd[p], b.wd[p - pw]);
+                let d0 = b.dpad[p];
+                a += wr + wl + wd + wu;
+                rhs += wr * (b.dpad[p + 1] - d0)
+                    + wl * (b.dpad[p - 1] - d0)
+                    + wd * (b.dpad[p + pw] - d0)
+                    + wu * (b.dpad[p - pw] - d0);
+                b.inv_a[k] = 1.0 / a;
+                b.c[k] = rhs;
             }
-            // Red-black SOR. Unsolved pixels have 1/A = 0 and c = 0, so their
-            // increment stays 0; the border's weights are 0.
+            // Red-black SOR over the solved pixels; unsolved neighbours'
+            // increments stay 0 and the border's weights are 0.
             for _ in 0..cfg.sor_iterations {
-                for colour in 0..2 {
-                    for y in 0..h {
-                        let row = (y + 1) * pw + 1;
-                        for x in ((y + colour) % 2..w).step_by(2) {
-                            let p = row + x;
-                            let s = b.c[p]
-                                + b.wr[p] * b.dd[p + 1]
-                                + b.wr[p - 1] * b.dd[p - 1]
-                                + b.wd[p] * b.dd[p + pw]
-                                + b.wd[p - pw] * b.dd[p - pw];
-                            b.dd[p] += omega * (s * b.inv_a[p] - b.dd[p]);
-                        }
+                for range in [0..n_red, n_red..m] {
+                    for k in range {
+                        let p = b.act_pad[k] as usize;
+                        let s = b.c[k]
+                            + b.wr[p] * b.dd[p + 1]
+                            + b.wr[p - 1] * b.dd[p - 1]
+                            + b.wd[p] * b.dd[p + pw]
+                            + b.wd[p - pw] * b.dd[p - pw];
+                        b.dd[p] += omega * (s * b.inv_a[k] - b.dd[p]);
                     }
                 }
             }
         }
         // The refinement's own change counts towards the variance.
         let var = b.var.len() == n;
-        for y in 0..h {
-            for x in 0..w {
-                let i = y * w + x;
-                let change = b.dd[(y + 1) * pw + x + 1];
-                b.d[i] += change;
-                if var {
-                    b.var[i] += change * change;
-                }
+        for (k, &i) in b.act.iter().enumerate() {
+            let i = i as usize;
+            let change = b.dd[b.act_pad[k] as usize];
+            b.d[i] += change;
+            if var {
+                b.var[i] += change * change;
             }
         }
     }
