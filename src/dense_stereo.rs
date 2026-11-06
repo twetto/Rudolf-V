@@ -1373,7 +1373,27 @@ impl Densify<'_> {
     fn local_cost(&self, x: usize, y: usize, k: usize) -> f32 {
         let v = self.v;
         let (w, h) = (v.g.w, v.g.h);
+        let s = &self.samplers[k];
         let mut c = 0.0;
+        if s.fast && x >= 1 && y >= 1 && x + 1 < w && y + 1 < h {
+            // Inside the image: ShiftSampler::sample without its clamps,
+            // three samples of a row from four right-image pixels per row.
+            let img = v.i1;
+            for yy in y - 1..=y + 1 {
+                let base = (((yy + img.border) * img.stride + x - 1 + img.border) as isize + s.off)
+                    as usize;
+                let (r0, r1) = (&img.data[base..][..4], &img.data[base + img.stride..][..4]);
+                let i0 = &v.i0[yy * w + x - 1..][..3];
+                for dx in 0..3 {
+                    let i1 = s.w[0] * r0[dx]
+                        + s.w[1] * r0[dx + 1]
+                        + s.w[2] * r1[dx]
+                        + s.w[3] * r1[dx + 1];
+                    c += (i1 - i0[dx]).abs();
+                }
+            }
+            return c;
+        }
         for dy in -1isize..=1 {
             let yy = (y as isize + dy).clamp(0, h as isize - 1) as usize;
             for dx in -1isize..=1 {
@@ -1486,6 +1506,12 @@ struct Buffers {
     iz: Vec<f32>,
     ex: Vec<f32>,
     ey: Vec<f32>,
+    // Their central differences: ∂x and ∂y of the mean image and of the
+    // difference image.
+    avg_x: Vec<f32>,
+    avg_y: Vec<f32>,
+    iz_x: Vec<f32>,
+    iz_y: Vec<f32>,
     rb: RedBlack,
     // Occlusion test: nearest D per right-image pixel, and each left pixel's
     // right-image pixel.
@@ -2270,14 +2296,17 @@ impl DenseStereo {
         // The solver's terms: derivatives at the solved pixels, central
         // differences clamped at the border (diff_x, diff_y), the second ones
         // composed of the first. Zero at the others.
-        let (avg, iz, ex, ey) = (&b.avg, &b.iz, &b.ex, &b.ey);
+        diff_x(&b.avg, w, h, &mut b.avg_x);
+        diff_y(&b.avg, w, h, &mut b.avg_y);
+        diff_x(&b.iz, w, h, &mut b.iz_x);
+        diff_y(&b.iz, w, h, &mut b.iz_y);
+        let (iz, ex, ey) = (&b.iz, &b.ex, &b.ey);
+        let (avg_x, avg_y, iz_x, iz_y) = (&b.avg_x, &b.avg_y, &b.iz_x, &b.iz_y);
         let (gx, gy) = (&b.gx, &b.gy);
         let xm = |x: usize| x.saturating_sub(1);
         let xp = |x: usize| (x + 1).min(w - 1);
         let ym = |y: usize| y.saturating_sub(1);
         let yp = |y: usize| (y + 1).min(h - 1);
-        let dx = |f: &[f32], x: usize, y: usize| 0.5 * (f[y * w + xp(x)] - f[y * w + xm(x)]);
-        let dy = |f: &[f32], x: usize, y: usize| 0.5 * (f[yp(y) * w + x] - f[ym(y) * w + x]);
         let inv_edge = if cfg.edge_sigma > 0.0 {
             1.0 / (cfg.edge_sigma * cfg.edge_sigma)
         } else {
@@ -2288,10 +2317,10 @@ impl DenseStereo {
             if !solved(i) {
                 return [0.0; 13];
             }
-            let (ix, iy) = (dx(avg, x, y), dy(avg, x, y));
-            let ixx = 0.5 * (dx(avg, xp(x), y) - dx(avg, xm(x), y));
-            let ixy = 0.5 * (dx(avg, x, yp(y)) - dx(avg, x, ym(y)));
-            let iyy = 0.5 * (dy(avg, x, yp(y)) - dy(avg, x, ym(y)));
+            let (ix, iy) = (avg_x[i], avg_y[i]);
+            let ixx = 0.5 * (avg_x[y * w + xp(x)] - avg_x[y * w + xm(x)]);
+            let ixy = 0.5 * (avg_x[yp(y) * w + x] - avg_x[ym(y) * w + x]);
+            let iyy = 0.5 * (avg_y[yp(y) * w + x] - avg_y[ym(y) * w + x]);
             // Along the epipolar direction: id = ∇I·e, ixd = ∂x∇I·e,
             // iyd = ∂y∇I·e.
             let id = ix * ex[i] + iy * ey[i];
@@ -2303,8 +2332,8 @@ impl DenseStereo {
                 ixd,
                 iyd,
                 iz[i],
-                dx(iz, x, y),
-                dy(iz, x, y),
+                iz_x[i],
+                iz_y[i],
                 1.0 / (id * id + ZETA2),
                 1.0 / (ixd * ixd + ZETA2),
                 1.0 / (iyd * iyd + ZETA2),
@@ -2340,20 +2369,22 @@ impl DenseStereo {
                 rd, id, ixd, iyd, rz, ixz, iyz, inv_nd, inv_nx, inv_ny, edge, rs, right, down,
             ],
         );
-        items(grid).enumerate().for_each(|(j, [rd, mut out @ ..])| {
+        items(grid).enumerate().for_each(|(j, [rd, out @ ..])| {
             let (c, r) = (j / (h + 2), j % (h + 2));
             if r == 0 || r > h {
                 return;
             }
             let y = r - 1;
-            for q in 0..hw {
-                let x = 2 * q + (y + c) % 2;
-                if x >= w {
-                    break;
-                }
-                rd[q + 1] = d[y * w + x];
+            // This row's pixels, past the border column: q < n in each.
+            let x0 = (y + c) % 2;
+            let n = (w - x0).div_ceil(2);
+            let rd = &mut rd[1..1 + n];
+            let mut out = out.map(|o| &mut o[1..1 + n]);
+            for q in 0..n {
+                let x = 2 * q + x0;
+                rd[q] = d[y * w + x];
                 for (o, t) in out.iter_mut().zip(terms(x, y)) {
-                    o[q + 1] = t;
+                    o[q] = t;
                 }
             }
         });
