@@ -5,10 +5,18 @@
     cargo run --release --example dense_stereo_eval -- walk/rect --out ours > ours/frames.jsonl
     cargo run --release --example dense_stereo_eval -- walk/raw --out raw > raw/frames.jsonl  # optional
     python3 -I zed_eval.py walk ours [--raw raw] [--png DIR] [--png-every 20]
+                                     [--dis fast medium fast:0] [--threads 1] [--on-ours]
 
 The SDK's depth (rectified left camera) is sampled on the depth maps' grid (level 1: every other
 pixel). DIS runs as the robot pipeline's fallback does (mr-neuro-nav: preset FAST, spatial
-propagation, half-resolution images, left -> right), its horizontal flow taken as disparity.
+propagation, half-resolution images, left -> right), its horizontal flow taken as disparity and
+sampled on the same grid.
+--dis scores other presets too, PRESET:SCALE also setting the finest scale DIS computes (FAST: 2,
+i.e. a quarter of its half-resolution input; ours computes every pixel of that grid, scale 0).
+DIS is timed on its calc() alone, the downsampling to half resolution apart (ours includes its
+pyramid). Every frame starts without a flow: DIS takes any flow of the right size it is passed
+as its initial estimate. --on-ours also scores each DIS configuration
+on only the pixels where ours has depth: the same pixels, so errors compare like for like.
 Our raw-image depth is warped onto the rectified grid through the SDK's rectification rotation,
 found from SIFT matches between raw and rectified left images.
 
@@ -227,7 +235,13 @@ def main():
     ap.add_argument("--raw", help="dense_stereo_eval --out on src/raw")
     ap.add_argument("--png", help="write comparison images here")
     ap.add_argument("--png-every", type=int, default=20)
+    ap.add_argument("--dis", nargs="+", default=["fast"], metavar="PRESET[:SCALE]",
+                    help="DIS configurations to score: ultrafast, fast or medium, optionally :finest scale")
+    ap.add_argument("--threads", type=int, help="OpenCV threads (default: OpenCV's choice)")
+    ap.add_argument("--on-ours", action="store_true", help="also score DIS where ours has depth")
     args = ap.parse_args()
+    if args.threads:
+        cv2.setNumThreads(args.threads)
 
     K, _, T = camchain(os.path.join(args.src, "rect/camchain.yaml"))
     baseline = -T[0, 3]
@@ -237,14 +251,29 @@ def main():
     s = 2 ** frames[0]["level"]
     ys, xs = np.mgrid[0:H, 0:W]
     n_grid = 1 / rays(K, xs * s, ys * s)[..., 2]  # range / Z on our grid
-    n_dis = 1 / rays(K, xs * s + 0.5 * (s - 1), ys * s + 0.5 * (s - 1))[..., 2]  # INTER_AREA pixel centres
+    # DIS sees half-resolution images as the pipeline does (full resolution for a level-0 grid),
+    # and is sampled every `step` pixels on our grid; its pixel centres, after INTER_AREA:
+    sd = min(s, 2)
+    step = s // sd
+    n_dis = 1 / rays(K, xs * s + 0.5 * (sd - 1), ys * s + 0.5 * (sd - 1))[..., 2]
     z_of = lambda logr: np.exp(logr) / n_grid[: logr.shape[0]]
     col_bin = np.arctan2(np.arange(W) * s - K[0, 2], K[0, 0])
     col_bin = np.searchsorted(np.linspace(-FOV / 2, FOV / 2, N_BINS + 1), col_bin, side="right") - 1
     col_bin[(col_bin < 0) | (col_bin >= N_BINS)] = -1
 
-    dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_FAST)
-    dis.setUseSpatialPropagation(True)
+    presets = {"ultrafast": cv2.DISOPTICAL_FLOW_PRESET_ULTRAFAST, "fast": cv2.DISOPTICAL_FLOW_PRESET_FAST,
+               "medium": cv2.DISOPTICAL_FLOW_PRESET_MEDIUM}
+    dis = {}  # name -> DIS instance
+    for spec in args.dis:
+        preset, _, scale = spec.partition(":")
+        d = cv2.DISOpticalFlow_create(presets[preset])
+        d.setUseSpatialPropagation(True)
+        name = f"DIS {preset}"
+        if scale:
+            d.setFinestScale(int(scale))
+            name += f", finest scale {scale}"
+        dis[name] = d
+    first_dis = next(iter(dis))
 
     if args.raw:
         K_raw, d_raw, _ = camchain(os.path.join(args.src, "raw/camchain.yaml"))
@@ -255,7 +284,9 @@ def main():
         RX, RY = np.round(uv[..., 0]).astype(int), np.round(uv[..., 1]).astype(int)
         inside = (RX >= 0) & (RY >= 0) & (RX < W) & (RY < H)
 
-    scores = {"ours": Score(), "DIS": Score()}
+    scores = {"ours": Score(), **{name: Score() for name in dis}}
+    if args.on_ours:
+        scores.update({f"{name}, where ours has depth": Score() for name in dis})
     if os.path.exists(os.path.join(args.ours, stems[0] + ".src")):
         scores["ours, finest level only"] = Score()
         scores["ours, coarse fallback only"] = Score()
@@ -263,23 +294,31 @@ def main():
         scores["ours, raw images"] = Score()
     if args.png:
         os.makedirs(args.png, exist_ok=True)
-    dis_ms = []
+    dis_ms = {name: [] for name in dis}
+    resize_ms = []
     for k, stem in enumerate(stems):
         z = cv2.imread(os.path.join(args.src, "rect/depth", stem + ".png"), -1)[::s, ::s][:H, :W] / 1000.0
         sdk = np.where(z > 0, np.log(np.maximum(z, 1e-3) * n_grid), np.nan).astype(np.float32)
         ours = np.fromfile(os.path.join(args.ours, stem + ".logr"), "<f4").reshape(H, W)
         left = cv2.imread(os.path.join(args.src, "rect/left", stem + ".png"), 0)
         right = cv2.imread(os.path.join(args.src, "rect/right", stem + ".png"), 0)
+        est = {"ours": ours}
         t0 = time.perf_counter()
-        a = cv2.resize(left, (left.shape[1] // s, left.shape[0] // s), interpolation=cv2.INTER_AREA)
-        b = cv2.resize(right, (right.shape[1] // s, right.shape[0] // s), interpolation=cv2.INTER_AREA)
-        flow = dis.calc(a, b, None)[:H, :W]
-        dis_ms.append((time.perf_counter() - t0) * 1e3)
-        disp = -flow[..., 0] * s  # full-resolution pixels
-        with np.errstate(all="ignore"):
-            d_logr = np.where(disp > 0, np.log(K[0, 0] * baseline / disp * n_dis), np.nan).astype(np.float32)
-        d_logr[(d_logr < np.log(0.25)) | (d_logr > np.log(30))] = np.nan
-        est = {"ours": ours, "DIS": d_logr}
+        a = cv2.resize(left, (left.shape[1] // sd, left.shape[0] // sd), interpolation=cv2.INTER_AREA)
+        b = cv2.resize(right, (right.shape[1] // sd, right.shape[0] // sd), interpolation=cv2.INTER_AREA)
+        resize_ms.append((time.perf_counter() - t0) * 1e3)
+        for name, d in dis.items():
+            t0 = time.perf_counter()
+            flow = d.calc(a, b, None)
+            dis_ms[name].append((time.perf_counter() - t0) * 1e3)
+            disp = -flow[::step, ::step][:H, :W, 0] * sd  # full-resolution pixels
+            with np.errstate(all="ignore"):
+                est[name] = np.where(disp > 0, np.log(K[0, 0] * baseline / disp * n_dis), np.nan).astype(np.float32)
+            est[name][(est[name] < np.log(0.25)) | (est[name] > np.log(30))] = np.nan
+        d_logr = est[first_dis]
+        if args.on_ours:
+            for name in dis:
+                est[f"{name}, where ours has depth"] = np.where(np.isfinite(ours), est[name], np.nan)
         src_path = os.path.join(args.ours, stem + ".src")
         if os.path.exists(src_path):  # source level per pixel: split measured / coarse fallback
             src = np.fromfile(src_path, np.uint8).reshape(H, W)
@@ -299,7 +338,7 @@ def main():
             rows = [np.hstack([label(grey(left), "rectified left", True), label(grey(right), "rectified right")]),
                     np.hstack([label(colour(sdk), f"SDK NEURAL_LIGHT ({pct(sdk)})", True),
                                label(colour(ours), f"ours ({pct(ours)})", True)]),
-                    np.hstack([label(colour(d_logr), f"OpenCV DIS fast ({pct(d_logr)})", True),
+                    np.hstack([label(colour(d_logr), f"OpenCV {first_dis} ({pct(d_logr)})", True),
                                label(err_colour(ours - sdk), "ours vs SDK", True)])]
             if args.raw:
                 rows.append(np.hstack([label(colour(raw), f"ours on raw images ({pct(raw)})"),
@@ -310,7 +349,10 @@ def main():
                         (0, 0, 0), 1, cv2.LINE_AA)
             cv2.imwrite(os.path.join(args.png, stem + ".png"), np.vstack(rows + [legend]))
 
-    print(f"{len(stems)} frames, {W}x{H} grid; DIS fast {np.median(dis_ms):.1f} ms median on this machine")
+    ours_ms = [f["ms"] for f in frames if "ms" in f]
+    print(f"{len(stems)} frames, {W}x{H} grid; ms per pair, median: ours {np.median(ours_ms):.1f} (where it ran); "
+          + ", ".join(f"{name} {np.median(t):.2f}" for name, t in dis_ms.items())
+          + f" plus {np.median(resize_ms):.2f} to downsample (this machine, {cv2.getNumThreads()} OpenCV threads)")
     for name, sc in scores.items():
         report(name, sc)
 

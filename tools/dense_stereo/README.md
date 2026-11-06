@@ -6,7 +6,7 @@ full usage.
 | Script | Runs on | Does |
 |---|---|---|
 | `zed_record.py` | the Orin with the ZED | `record`: lossless SVO2 of a walk; `extract`: raw and rectified pairs plus the SDK's NEURAL_LIGHT depth, as folders `dense_stereo_eval` reads |
-| `zed_eval.py` | anywhere | a `zed_record.py extract` folder against the SDK's depth, next to OpenCV DIS as the robot pipeline runs it: errors by range, the obstacle band (nearest per column, risk bins, blind bins), and measured vs coarse-fallback pixels |
+| `zed_eval.py` | anywhere | a `zed_record.py extract` folder against the SDK's depth, next to OpenCV DIS as the robot pipeline runs it (or other DIS presets and scales, `--dis`; timed on `calc()` alone, `--threads`): errors by range, the obstacle band (nearest per column, risk bins, blind bins), measured vs coarse-fallback pixels, and DIS on the pixels ours has depth (`--on-ours`) |
 | `extract_ros2_bag.py` | anywhere | stereo pairs from the iDog ROS 2 bags (rectified grey) |
 | `euroc_gt_eval.py` | anywhere | EuRoC V1/V2 against the Leica scan, next to OpenCV DIS (relative comparisons only, see its caveat) |
 
