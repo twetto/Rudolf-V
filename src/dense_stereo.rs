@@ -604,6 +604,181 @@ struct PatchSums {
     y: f32,
 }
 
+/// One patch against the right image at a bilinear position: the right
+/// image's samples from `base` (row stride `stride`, bilinear `weights`),
+/// the left image, its gradients from `off` (row stride `w`).
+struct PatchRows<'a> {
+    i1: &'a [f32],
+    base: usize,
+    stride: usize,
+    weights: [f32; 4],
+    i0: &'a [f32],
+    gx: &'a [f32],
+    gy: &'a [f32],
+    off: usize,
+    w: usize,
+    psz: usize,
+}
+
+impl PatchRows<'_> {
+    /// Σ r, Σ r², Σ r·gx and Σ r·gy over the patch, r = I1 − I0, and with
+    /// COST each r in `res` (row-major, psz² of them). AVX2+FMA (x86_64, runtime check)
+    /// or NEON (aarch64) for patch sides that fit their vectors; the sums'
+    /// order differs from the scalar loop's by rounding only.
+    #[inline(always)]
+    fn residuals<const COST: bool>(&self, res: &mut [f32]) -> [f32; 4] {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if self.psz % 8 == 0
+                && is_x86_feature_detected!("avx2")
+                && is_x86_feature_detected!("fma")
+            {
+                // SAFETY: the CPU has AVX2 and FMA; the rows are sliced to
+                // their lengths before any load.
+                return unsafe { self.residuals_avx2::<COST>(res) };
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            if self.psz % 4 == 0 {
+                // SAFETY: NEON is part of aarch64; rows are sliced first.
+                return unsafe { self.residuals_neon::<COST>(res) };
+            }
+        }
+        self.residuals_scalar::<COST>(res)
+    }
+
+    /// One row's slices: right image rows r0 and r1 (psz + 1 samples), and
+    /// the left image and its gradients (psz).
+    #[inline(always)]
+    fn row(&self, row: usize) -> [&[f32]; 5] {
+        let (psz, o) = (self.psz, self.off + row * self.w);
+        [
+            &self.i1[self.base + row * self.stride..][..psz + 1],
+            &self.i1[self.base + (row + 1) * self.stride..][..psz + 1],
+            &self.i0[o..o + psz],
+            &self.gx[o..o + psz],
+            &self.gy[o..o + psz],
+        ]
+    }
+
+    fn residuals_scalar<const COST: bool>(&self, res: &mut [f32]) -> [f32; 4] {
+        let [w00, w10, w01, w11] = self.weights;
+        let psz = self.psz;
+        let (mut sr, mut srr, mut srx, mut sry) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        for row in 0..psz {
+            let [r0, r1, t, gxr, gyr] = self.row(row);
+            let res_row: &mut [f32] = if COST {
+                &mut res[row * psz..(row + 1) * psz]
+            } else {
+                &mut []
+            };
+            for c in 0..psz {
+                let v = w00 * r0[c] + w10 * r0[c + 1] + w01 * r1[c] + w11 * r1[c + 1];
+                let r = v - t[c];
+                if COST {
+                    res_row[c] = r;
+                }
+                sr += r;
+                srr += r * r;
+                srx += r * gxr[c];
+                sry += r * gyr[c];
+            }
+        }
+        [sr, srr, srx, sry]
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn residuals_avx2<const COST: bool>(&self, res: &mut [f32]) -> [f32; 4] {
+        use std::arch::x86_64::*;
+        let psz = self.psz;
+        let [w00, w10, w01, w11] = self.weights.map(|v| _mm256_set1_ps(v));
+        let (mut ar, mut arr, mut arx, mut ary) = (
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+        );
+        for row in 0..psz {
+            let [r0, r1, t, gxr, gyr] = self.row(row);
+            let out = if COST {
+                res[row * psz..(row + 1) * psz].as_mut_ptr()
+            } else {
+                std::ptr::null_mut()
+            };
+            for c in (0..psz).step_by(8) {
+                // r0, r1 hold psz + 1 samples, the others psz: c + 8 <= psz.
+                let v = _mm256_mul_ps(w00, _mm256_loadu_ps(r0.as_ptr().add(c)));
+                let v = _mm256_fmadd_ps(w10, _mm256_loadu_ps(r0.as_ptr().add(c + 1)), v);
+                let v = _mm256_fmadd_ps(w01, _mm256_loadu_ps(r1.as_ptr().add(c)), v);
+                let v = _mm256_fmadd_ps(w11, _mm256_loadu_ps(r1.as_ptr().add(c + 1)), v);
+                let r = _mm256_sub_ps(v, _mm256_loadu_ps(t.as_ptr().add(c)));
+                if COST {
+                    _mm256_storeu_ps(out.add(c), r);
+                }
+                ar = _mm256_add_ps(ar, r);
+                arr = _mm256_fmadd_ps(r, r, arr);
+                arx = _mm256_fmadd_ps(r, _mm256_loadu_ps(gxr.as_ptr().add(c)), arx);
+                ary = _mm256_fmadd_ps(r, _mm256_loadu_ps(gyr.as_ptr().add(c)), ary);
+            }
+        }
+        [hsum256(ar), hsum256(arr), hsum256(arx), hsum256(ary)]
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn residuals_neon<const COST: bool>(&self, res: &mut [f32]) -> [f32; 4] {
+        use std::arch::aarch64::*;
+        let psz = self.psz;
+        let [w00, w10, w01, w11] = self.weights.map(|v| vdupq_n_f32(v));
+        let (mut ar, mut arr, mut arx, mut ary) = (
+            vdupq_n_f32(0.0),
+            vdupq_n_f32(0.0),
+            vdupq_n_f32(0.0),
+            vdupq_n_f32(0.0),
+        );
+        for row in 0..psz {
+            let [r0, r1, t, gxr, gyr] = self.row(row);
+            let out = if COST {
+                res[row * psz..(row + 1) * psz].as_mut_ptr()
+            } else {
+                std::ptr::null_mut()
+            };
+            for c in (0..psz).step_by(4) {
+                let v = vmulq_f32(w00, vld1q_f32(r0.as_ptr().add(c)));
+                let v = vfmaq_f32(v, w10, vld1q_f32(r0.as_ptr().add(c + 1)));
+                let v = vfmaq_f32(v, w01, vld1q_f32(r1.as_ptr().add(c)));
+                let v = vfmaq_f32(v, w11, vld1q_f32(r1.as_ptr().add(c + 1)));
+                let r = vsubq_f32(v, vld1q_f32(t.as_ptr().add(c)));
+                if COST {
+                    vst1q_f32(out.add(c), r);
+                }
+                ar = vaddq_f32(ar, r);
+                arr = vfmaq_f32(arr, r, r);
+                arx = vfmaq_f32(arx, r, vld1q_f32(gxr.as_ptr().add(c)));
+                ary = vfmaq_f32(ary, r, vld1q_f32(gyr.as_ptr().add(c)));
+            }
+        }
+        [
+            vaddvq_f32(ar),
+            vaddvq_f32(arr),
+            vaddvq_f32(arx),
+            vaddvq_f32(ary),
+        ]
+    }
+}
+
+/// Horizontal sum of 8 f32 lanes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn hsum256(v: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+    let s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    let s = _mm_add_ps(s, _mm_movehdup_ps(s));
+    let s = _mm_add_ss(s, _mm_movehl_ps(s, s));
+    _mm_cvtss_f32(s)
+}
+
 /// One patch's estimate.
 #[derive(Clone, Copy)]
 struct PatchState {
@@ -709,28 +884,22 @@ impl LevelView<'_> {
         let stride = self.i1.stride;
         let base = y0 * stride + x0;
 
+        // Residuals are kept only to compare candidates (COST).
         let mut res = [0.0f32; MAX_PATCH * MAX_PATCH];
-        let (mut sr, mut srr, mut srx, mut sry) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
-        for row in 0..psz {
-            let r0 = &self.i1.data[base + row * stride..][..psz + 1];
-            let r1 = &self.i1.data[base + (row + 1) * stride..][..psz + 1];
-            let off = (i + row) * w + j;
-            let t = &self.i0[off..off + psz];
-            let gxr = &self.gx[off..off + psz];
-            let gyr = &self.gy[off..off + psz];
-            let res_row = &mut res[row * psz..(row + 1) * psz];
-            for c in 0..psz {
-                let v = w00 * r0[c] + w10 * r0[c + 1] + w01 * r1[c] + w11 * r1[c + 1];
-                let r = v - t[c];
-                if COST {
-                    res_row[c] = r;
-                }
-                sr += r;
-                srr += r * r;
-                srx += r * gxr[c];
-                sry += r * gyr[c];
-            }
-        }
+        let res: &mut [f32] = if COST { &mut res } else { &mut [] };
+        let rows = PatchRows {
+            i1: &self.i1.data,
+            base,
+            stride,
+            weights: [w00, w10, w01, w11],
+            i0: self.i0,
+            gx: self.gx,
+            gy: self.gy,
+            off: i * w + j,
+            w,
+            psz,
+        };
+        let [sr, srr, srx, sry] = rows.residuals::<COST>(res);
         let mean = if self.cfg.mean_normalization {
             sr / n
         } else {
@@ -782,16 +951,20 @@ impl LevelView<'_> {
 
     /// Inverse-compositional Gauss-Newton from D `start` (evaluated as
     /// `e`), accepting only steps that lower the SSD. Moving more than a
-    /// patch side from the start discards the result, as DIS does.
-    fn refine(&self, k: usize, start: f32, mut e: Eval, iterations: usize) -> PatchState {
+    /// patch side from the start discards the result, as DIS does. Also
+    /// whether it converged (stopped before the iteration limit).
+    fn refine(&self, k: usize, start: f32, mut e: Eval, iterations: usize) -> (PatchState, bool) {
         let first = self.state(start, &e);
         let mut d = start;
+        let mut converged = false;
         for _ in 0..iterations {
             if !(e.hess > 1e-6) {
+                converged = true;
                 break;
             }
             let next = (d - e.grad / e.hess).clamp(self.dmin, self.dmax);
             if (next - d).abs() < GN_MIN_STEP {
+                converged = true;
                 break;
             }
             match self.eval::<false>(k, next) {
@@ -799,13 +972,16 @@ impl LevelView<'_> {
                     d = next;
                     e = n;
                 }
-                _ => break,
+                _ => {
+                    converged = true;
+                    break;
+                }
             }
         }
         if (d - start).abs() > self.cfg.patch_size as f32 {
-            return first;
+            return (first, false);
         }
-        self.state(d, &e)
+        (self.state(d, &e), converged)
     }
 
     /// The best of the candidate D values by truncated SSD, with its
@@ -866,6 +1042,10 @@ struct Buffers {
     gy: Vec<f32>,
     sums: Vec<PatchSums>,
     patches: Vec<PatchState>,
+    // Propagation: per patch, whether its D moved in its latest evaluation
+    // and whether that evaluation converged.
+    moved: Vec<bool>,
+    settled: Vec<bool>,
     /// Dense D of the current level.
     d: Vec<f32>,
     /// The coarser level's D, upsampled.
@@ -878,23 +1058,12 @@ struct Buffers {
     // Finest-level statistics from the valid patches.
     valid: Vec<bool>,
     var: Vec<f32>,
-    // Variational refinement. The solved pixels in SOR order (index, and
-    // index in the padded solver arrays); the linearised warp's mean and
-    // difference images; per solved pixel, its data term's constants, 1/A
-    // and the right-hand side's constant part.
+    // Variational refinement: the solved pixels, the linearised warp's mean
+    // and difference images, and the solver.
     act: Vec<u32>,
-    act_pad: Vec<u32>,
     avg: Vec<f32>,
     iz: Vec<f32>,
-    terms: Vec<DataTerm>,
-    inv_a: Vec<f32>,
-    c: Vec<f32>,
-    // The solver, (w+2)×(h+2) with a zero border: D, its increment, and the
-    // weights of each pixel's right and lower edges.
-    dpad: Vec<f32>,
-    dd: Vec<f32>,
-    wr: Vec<f32>,
-    wd: Vec<f32>,
+    rb: RedBlack,
     // Occlusion test: nearest D per right-image pixel, and each left pixel's
     // right-image pixel.
     zbuf: Vec<f32>,
@@ -905,24 +1074,267 @@ struct Buffers {
     coarse: Vec<LevelDepth>,
     disagree: Vec<u32>,
     source: Vec<u8>,
+    speckle: SpeckleScratch,
 }
 
-/// One solved pixel's data term, fixed over the fixed-point iterations:
-/// temporal difference I1(warp) − I0 and its gradient, the gradient of the
-/// mean image along the epipolar direction and its derivatives, the
-/// normalisations, and the edge factor of the smoothness weight.
-#[derive(Clone, Copy, Default)]
-struct DataTerm {
-    iz: f32,
-    id: f32,
-    ixd: f32,
-    iyd: f32,
-    ixz: f32,
-    iyz: f32,
-    inv_nd: f32,
-    inv_nx: f32,
-    inv_ny: f32,
-    edge: f32,
+/// remove_speckles' working memory: region labels, the flood fill's stack
+/// and the current region.
+#[derive(Default)]
+struct SpeckleScratch {
+    label: Vec<u32>,
+    stack: Vec<usize>,
+    region: Vec<usize>,
+}
+
+/// The variational refinement's unknowns and coefficients, split by colour
+/// for red-black SOR: colour c holds the pixels with (x + y) % 2 == c,
+/// pixel x of row y at column q = x / 2 of that colour's row y. Each colour
+/// is an (h + 2) × (hw + 2) grid, hw = ⌈w / 2⌉, with a zero border, the two
+/// one after the other. With s = (y + c) % 2, a pixel's right and left
+/// neighbours are the other colour's columns q + s and q + s − 1 of the
+/// same row, the ones above and below column q of rows y ∓ 1. Every update
+/// is then a straight row loop the compiler vectorizes. A pixel not solved
+/// (or past its row's end) has zero coefficients: it stays put and
+/// constrains nothing.
+#[derive(Default)]
+struct RedBlack {
+    hw: usize,
+    stride: usize,
+    /// Elements per colour.
+    size: usize,
+    /// D, its increment, and the weights of each pixel's right and lower
+    /// edges.
+    d: Vec<f32>,
+    dd: Vec<f32>,
+    wr: Vec<f32>,
+    wd: Vec<f32>,
+    /// 1/A and the right-hand side's constant part of each pixel's
+    /// equation A·dD = c + Σ w·dD_neighbour.
+    inv_a: Vec<f32>,
+    c: Vec<f32>,
+    /// 1 where the pixel is solved; where it and its right (lower)
+    /// neighbour are; the smoothness weight's edge factor.
+    solved: Vec<f32>,
+    right: Vec<f32>,
+    down: Vec<f32>,
+    edge: Vec<f32>,
+    /// The data term, fixed over the fixed-point iterations: I1(warp) − I0
+    /// and its gradient; the mean image's gradient along the epipolar
+    /// direction (id) and that gradient's derivatives; the normalisations.
+    iz: Vec<f32>,
+    id: Vec<f32>,
+    ixd: Vec<f32>,
+    iyd: Vec<f32>,
+    ixz: Vec<f32>,
+    iyz: Vec<f32>,
+    inv_nd: Vec<f32>,
+    inv_nx: Vec<f32>,
+    inv_ny: Vec<f32>,
+}
+
+/// `n` elements of `v` from `start`.
+#[inline(always)]
+fn slice_row(v: &[f32], start: usize, n: usize) -> &[f32] {
+    &v[start..start + n]
+}
+
+/// The constants of one refinement.
+#[derive(Clone, Copy)]
+struct Solve {
+    h: usize,
+    iterations: usize,
+    sor_iterations: usize,
+    alpha2: f32,
+    gamma2: f32,
+    delta2: f32,
+    omega: f32,
+}
+
+impl RedBlack {
+    fn reset(&mut self, w: usize, h: usize) {
+        self.hw = w.div_ceil(2);
+        self.stride = self.hw + 2;
+        self.size = self.stride * (h + 2);
+        let n = 2 * self.size;
+        for v in [
+            &mut self.d,
+            &mut self.dd,
+            &mut self.wr,
+            &mut self.wd,
+            &mut self.inv_a,
+            &mut self.c,
+            &mut self.solved,
+            &mut self.right,
+            &mut self.down,
+            &mut self.edge,
+            &mut self.iz,
+            &mut self.id,
+            &mut self.ixd,
+            &mut self.iyd,
+            &mut self.ixz,
+            &mut self.iyz,
+            &mut self.inv_nd,
+            &mut self.inv_nx,
+            &mut self.inv_ny,
+        ] {
+            v.clear();
+            v.resize(n, 0.0);
+        }
+    }
+
+    /// Index of pixel (x, y).
+    fn index(&self, x: usize, y: usize) -> usize {
+        (x + y) % 2 * self.size + (y + 1) * self.stride + x / 2 + 1
+    }
+
+    /// Start of row y of colour c, and of the other colour's row y.
+    fn rows(&self, c: usize, y: usize) -> (usize, usize) {
+        let r = (y + 1) * self.stride + 1;
+        (c * self.size + r, (1 - c) * self.size + r)
+    }
+
+    /// The fixed-point iterations, with AVX2 where the CPU has it (no FMA:
+    /// the results match the plain build's bit for bit).
+    fn solve(&mut self, k: Solve) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") {
+                // SAFETY: the CPU has AVX2.
+                unsafe { self.solve_avx2(k) };
+                return;
+            }
+        }
+        self.solve_rows(k);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn solve_avx2(&mut self, k: Solve) {
+        self.solve_rows(k);
+    }
+
+    #[inline(always)]
+    fn solve_rows(&mut self, k: Solve) {
+        let (hw, stride) = (self.hw, self.stride);
+        for _ in 0..k.iterations {
+            // Smoothness weights from the forward differences of D + dD; each
+            // pixel's weight belongs to its right and lower edges, and only
+            // edges between two solved pixels have one.
+            for c in 0..2 {
+                for y in 0..k.h {
+                    let (me, ot) = self.rows(c, y);
+                    let s = (y + c) % 2;
+                    let (d, dd) = (&self.d, &self.dd);
+                    let (ud, udd) = (&d[me..me + hw], &dd[me..me + hw]);
+                    let (rd, rdd) = (&d[ot + s..ot + s + hw], &dd[ot + s..ot + s + hw]);
+                    let (bd, bdd) = (&d[ot + stride..][..hw], &dd[ot + stride..][..hw]);
+                    let (right, down) = (&self.right[me..me + hw], &self.down[me..me + hw]);
+                    let edge = &self.edge[me..me + hw];
+                    let wr = &mut self.wr[me..me + hw];
+                    let wd = &mut self.wd[me..me + hw];
+                    for q in 0..hw {
+                        let u = ud[q] + udd[q];
+                        let ux = (rd[q] + rdd[q] - u) * right[q];
+                        let uy = (bd[q] + bdd[q] - u) * down[q];
+                        let ws = k.alpha2 / (ux * ux + uy * uy + EPS2).sqrt() * edge[q];
+                        wr[q] = ws * right[q];
+                        wd[q] = ws * down[q];
+                    }
+                }
+            }
+            // Data terms linearised around D + dD, and the parts of each
+            // pixel's equation that stay fixed during SOR.
+            for c in 0..2 {
+                for y in 0..k.h {
+                    let (me, ot) = self.rows(c, y);
+                    let s = (y + c) % 2;
+                    let (dd, d0) = (slice_row(&self.dd, me, hw), slice_row(&self.d, me, hw));
+                    let (iz, id, ixd, iyd) = (
+                        slice_row(&self.iz, me, hw),
+                        slice_row(&self.id, me, hw),
+                        slice_row(&self.ixd, me, hw),
+                        slice_row(&self.iyd, me, hw),
+                    );
+                    let (ixz, iyz) = (slice_row(&self.ixz, me, hw), slice_row(&self.iyz, me, hw));
+                    let (inv_nd, inv_nx, inv_ny) = (
+                        slice_row(&self.inv_nd, me, hw),
+                        slice_row(&self.inv_nx, me, hw),
+                        slice_row(&self.inv_ny, me, hw),
+                    );
+                    let (wr, wd, solved) = (
+                        slice_row(&self.wr, me, hw),
+                        slice_row(&self.wd, me, hw),
+                        slice_row(&self.solved, me, hw),
+                    );
+                    let wl = &self.wr[ot + s - 1..ot + s - 1 + hw];
+                    let wu = &self.wd[ot - stride..ot - stride + hw];
+                    let rd = &self.d[ot + s..ot + s + hw];
+                    let ld = &self.d[ot + s - 1..ot + s - 1 + hw];
+                    let bd = &self.d[ot + stride..ot + stride + hw];
+                    let td = &self.d[ot - stride..ot - stride + hw];
+                    let inv_a = &mut self.inv_a[me..me + hw];
+                    let cst = &mut self.c[me..me + hw];
+                    for q in 0..hw {
+                        let ddq = dd[q];
+                        let z = iz[q] + id[q] * ddq;
+                        let wc = k.delta2 * inv_nd[q] / (z * z * inv_nd[q] + EPS2).sqrt();
+                        let mut a = wc * id[q] * id[q] + ZETA2;
+                        let mut rhs = -wc * iz[q] * id[q];
+
+                        let zx = ixz[q] + ixd[q] * ddq;
+                        let zy = iyz[q] + iyd[q] * ddq;
+                        let wg =
+                            k.gamma2 / (zx * zx * inv_nx[q] + zy * zy * inv_ny[q] + EPS2).sqrt();
+                        a += wg * (ixd[q] * ixd[q] * inv_nx[q] + iyd[q] * iyd[q] * inv_ny[q]);
+                        rhs -= wg * (ixd[q] * ixz[q] * inv_nx[q] + iyd[q] * iyz[q] * inv_ny[q]);
+
+                        let d = d0[q];
+                        a += wr[q] + wl[q] + wd[q] + wu[q];
+                        rhs += wr[q] * (rd[q] - d)
+                            + wl[q] * (ld[q] - d)
+                            + wd[q] * (bd[q] - d)
+                            + wu[q] * (td[q] - d);
+                        inv_a[q] = solved[q] * (1.0 / a);
+                        cst[q] = solved[q] * rhs;
+                    }
+                }
+            }
+            // Red-black SOR: each colour's update reads only the other's.
+            for _ in 0..k.sor_iterations {
+                for c in 0..2 {
+                    let size = self.size;
+                    let (lo, hi) = self.dd.split_at_mut(size);
+                    let (mine, other): (&mut [f32], &[f32]) =
+                        if c == 0 { (lo, hi) } else { (hi, lo) };
+                    for y in 0..k.h {
+                        // As rows(): row y within each colour, and overall.
+                        let local = (y + 1) * stride + 1;
+                        let olocal = local;
+                        let (me, ot) = (c * size + local, (1 - c) * size + local);
+                        let s = (y + c) % 2;
+                        let cst = &self.c[me..me + hw];
+                        let inv_a = &self.inv_a[me..me + hw];
+                        let (wr, wd) = (&self.wr[me..me + hw], &self.wd[me..me + hw]);
+                        let wl = &self.wr[ot + s - 1..ot + s - 1 + hw];
+                        let wu = &self.wd[ot - stride..ot - stride + hw];
+                        let rdd = &other[olocal + s..olocal + s + hw];
+                        let ldd = &other[olocal + s - 1..olocal + s - 1 + hw];
+                        let bdd = &other[olocal + stride..olocal + stride + hw];
+                        let tdd = &other[olocal - stride..olocal - stride + hw];
+                        let dd = &mut mine[local..local + hw];
+                        for q in 0..hw {
+                            let sum = cst[q]
+                                + wr[q] * rdd[q]
+                                + wl[q] * ldd[q]
+                                + wd[q] * bdd[q]
+                                + wu[q] * tdd[q];
+                            dd[q] += k.omega * (sum * inv_a[q] - dd[q]);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// A coarser level's depth after validation, for the coarse fallback.
@@ -1100,18 +1512,18 @@ impl DenseStereo {
 
     #[inline(never)]
     fn search_coarsest(&mut self, level: usize) {
+        let mut patches = std::mem::take(&mut self.buf.patches);
         let v = self.view(level);
         let n = v.g.ws * v.g.hs;
-        let patches: Vec<PatchState> = (0..n)
-            .map(|k| {
-                let mut p = v.search(k);
-                if !p.ok {
-                    // Nothing inside the right image: start from far away.
-                    p.d = v.dmin;
-                }
-                p
-            })
-            .collect();
+        patches.clear();
+        patches.extend((0..n).map(|k| {
+            let mut p = v.search(k);
+            if !p.ok {
+                // Nothing inside the right image: start from far away.
+                p.d = v.dmin;
+            }
+            p
+        }));
         self.buf.patches = patches;
     }
 
@@ -1129,33 +1541,50 @@ impl DenseStereo {
                     2.0 * sample_field(&b.d, coarse.w, coarse.h, x as f32 * 0.5, y as f32 * 0.5);
             }
         }
+        let mut patches = std::mem::take(&mut self.buf.patches);
         let v = self.view(level);
         let n = v.g.ws * v.g.hs;
-        let patches: Vec<PatchState> = (0..n)
-            .map(|k| {
-                let (cx, cy) = v.centre(k);
-                let mut p = PatchState::FAILED;
-                p.d = sample_field(&self.buf.d_init, w, h, cx, cy);
-                p
-            })
-            .collect();
+        patches.clear();
+        patches.extend((0..n).map(|k| {
+            let (cx, cy) = v.centre(k);
+            let mut p = PatchState::FAILED;
+            p.d = sample_field(&self.buf.d_init, w, h, cx, cy);
+            p
+        }));
         self.buf.patches = patches;
     }
 
     /// Red-black sweeps: each patch takes the best of its own and its four
-    /// neighbours' estimates, then runs Gauss-Newton from there.
+    /// neighbours' estimates, then runs Gauss-Newton from there. After the
+    /// first sweep, a patch whose Gauss-Newton converged and whose
+    /// neighbours have not moved since is skipped: it would start from its
+    /// own converged estimate and stop there.
     #[inline(never)]
     fn propagate(&mut self, level: usize) {
         let sweeps = self.config.propagation_sweeps.max(1);
         let iters = (self.config.grad_descent_iterations / sweeps).max(1);
         let mut patches = std::mem::take(&mut self.buf.patches);
+        let mut moved = std::mem::take(&mut self.buf.moved);
+        let mut settled = std::mem::take(&mut self.buf.settled);
         let v = self.view(level);
         let (ws, hs) = (v.g.ws, v.g.hs);
+        moved.clear();
+        moved.resize(ws * hs, true);
+        settled.clear();
+        settled.resize(ws * hs, false);
         for _ in 0..sweeps {
             for colour in 0..2 {
                 for is in 0..hs {
-                    for js in (0..ws).filter(|js| (is + js) % 2 == colour) {
+                    for js in ((is + colour) % 2..ws).step_by(2) {
                         let k = is * ws + js;
+                        let neighbours_moved = (js > 0 && moved[k - 1])
+                            || (js + 1 < ws && moved[k + 1])
+                            || (is > 0 && moved[k - ws])
+                            || (is + 1 < hs && moved[k + ws]);
+                        if settled[k] && !neighbours_moved {
+                            moved[k] = false;
+                            continue;
+                        }
                         let own = patches[k].d;
                         let mut cand = [own, f32::NAN, f32::NAN, f32::NAN, f32::NAN];
                         if js > 0 {
@@ -1170,18 +1599,26 @@ impl DenseStereo {
                         if is + 1 < hs {
                             cand[4] = patches[k + ws].d;
                         }
-                        patches[k] = match v.best_candidate(k, &cand) {
+                        let (p, converged) = match v.best_candidate(k, &cand) {
                             Some((d, e)) => v.refine(k, d, e, iters),
-                            None => PatchState {
-                                d: own,
-                                ..PatchState::FAILED
-                            },
+                            None => (
+                                PatchState {
+                                    d: own,
+                                    ..PatchState::FAILED
+                                },
+                                false,
+                            ),
                         };
+                        moved[k] = !((p.d - own).abs() < GN_MIN_STEP);
+                        settled[k] = converged;
+                        patches[k] = p;
                     }
                 }
             }
         }
         self.buf.patches = patches;
+        self.buf.moved = moved;
+        self.buf.settled = settled;
     }
 
     /// Dense D from the patches. With `validate` (the finest level, and every
@@ -1398,49 +1835,37 @@ impl DenseStereo {
         let masked = level == cfg.finest_level;
         let b = &mut self.buf;
         let solved = |valid: &[bool], i: usize| !masked || valid[i];
-
-        // The solved pixels in SOR order: red ((x + y) even), then black, each
-        // row-major. The others keep their D (increment 0) and constrain
-        // nothing.
-        let pw = w + 2;
         b.act.clear();
-        b.act_pad.clear();
-        let mut n_red = 0;
-        for colour in 0..2 {
-            for y in 0..h {
-                for x in ((y + colour) % 2..w).step_by(2) {
-                    let i = y * w + x;
-                    if solved(&b.valid, i) {
-                        b.act.push(i as u32);
-                        b.act_pad.push(((y + 1) * pw + x + 1) as u32);
-                    }
-                }
-            }
-            if colour == 0 {
-                n_red = b.act.len();
-            }
-        }
+        b.act
+            .extend((0..n as u32).filter(|&i| solved(&b.valid, i as usize)));
 
         // Linearise the warp at the current D: mean and difference of the
         // left and warped right images (an unsolved pixel, or one whose ray
-        // misses the right image, sees its own grey).
+        // misses the right image, sees its own grey), and the epipolar
+        // direction.
         b.avg.clear();
         b.avg.extend_from_slice(&b.i0);
         b.iz.clear();
         b.iz.resize(n, 0.0);
-        b.terms.clear();
+        let rb = &mut b.rb;
+        rb.reset(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let r = rb.index(x, y);
+                rb.d[r] = b.d[y * w + x];
+            }
+        }
         for &i in &b.act {
             let i = i as usize;
             let (x, y) = (i % w, i / w);
-            let mut t = DataTerm::default();
+            let r = rb.index(x, y);
             if let Some(loc) = self.epi.locate(g, g.rays[i], x as f32, y as f32, b.d[i]) {
                 let warped = self.i1.sample(loc[0], loc[1]);
                 b.avg[i] = 0.5 * (b.i0[i] + warped);
                 b.iz[i] = warped - b.i0[i];
                 // The epipolar direction, until the derivatives below.
-                (t.id, t.ixd) = (loc[2], loc[3]);
+                (rb.id[r], rb.ixd[r]) = (loc[2], loc[3]);
             }
-            b.terms.push(t);
         }
         // Derivatives at the solved pixels: central differences clamped at
         // the border (diff_x, diff_y), the second ones composed of the first.
@@ -1456,115 +1881,54 @@ impl DenseStereo {
         } else {
             0.0
         };
-        for (t, &i) in b.terms.iter_mut().zip(&b.act) {
+        for &i in &b.act {
             let i = i as usize;
             let (x, y) = (i % w, i / w);
-            let (ex, ey) = (t.id, t.ixd);
+            let r = rb.index(x, y);
+            let (ex, ey) = (rb.id[r], rb.ixd[r]);
             let (ix, iy) = (dx(avg, x, y), dy(avg, x, y));
             let ixx = 0.5 * (dx(avg, xp(x), y) - dx(avg, xm(x), y));
             let ixy = 0.5 * (dx(avg, x, yp(y)) - dx(avg, x, ym(y)));
             let iyy = 0.5 * (dy(avg, x, yp(y)) - dy(avg, x, ym(y)));
             // Along the epipolar direction: id = ∇I·e, ixd = ∂x∇I·e,
             // iyd = ∂y∇I·e.
-            t.id = ix * ex + iy * ey;
-            t.ixd = ixx * ex + ixy * ey;
-            t.iyd = ixy * ex + iyy * ey;
-            t.iz = iz[i];
-            t.ixz = dx(iz, x, y);
-            t.iyz = dy(iz, x, y);
-            t.inv_nd = 1.0 / (t.id * t.id + ZETA2);
-            t.inv_nx = 1.0 / (t.ixd * t.ixd + ZETA2);
-            t.inv_ny = 1.0 / (t.iyd * t.iyd + ZETA2);
-            t.edge = 1.0 / (1.0 + (b.gx[i] * b.gx[i] + b.gy[i] * b.gy[i]) * inv_edge);
-        }
-
-        let pn = pw * (h + 2);
-        for buf in [&mut b.dpad, &mut b.dd, &mut b.wr, &mut b.wd] {
-            buf.clear();
-            buf.resize(pn, 0.0);
-        }
-        for y in 0..h {
-            b.dpad[(y + 1) * pw + 1..][..w].copy_from_slice(&b.d[y * w..][..w]);
-        }
-        let m = b.act.len();
-        b.inv_a.clear();
-        b.inv_a.resize(m, 0.0);
-        b.c.clear();
-        b.c.resize(m, 0.0);
-        let (delta2, gamma2, alpha2) = (cfg.delta * 0.5, cfg.gamma * 0.5, cfg.alpha * 0.5);
-        let omega = cfg.sor_omega;
-        for _ in 0..cfg.variational_iterations {
-            // Smoothness weights from the forward differences of D + dD; each
-            // pixel's weight belongs to its right and lower edges, and only
-            // edges between two solved pixels have one.
-            for (k, &i) in b.act.iter().enumerate() {
-                let (i, p) = (i as usize, b.act_pad[k] as usize);
-                let x = i % w;
-                let right = x + 1 < w && solved(&b.valid, i + 1);
-                let down = i + w < n && solved(&b.valid, i + w);
-                let u = b.dpad[p] + b.dd[p];
-                let ux = if right {
-                    b.dpad[p + 1] + b.dd[p + 1] - u
-                } else {
-                    0.0
-                };
-                let uy = if down {
-                    b.dpad[p + pw] + b.dd[p + pw] - u
-                } else {
-                    0.0
-                };
-                let ws = alpha2 / (ux * ux + uy * uy + EPS2).sqrt() * b.terms[k].edge;
-                b.wr[p] = if right { ws } else { 0.0 };
-                b.wd[p] = if down { ws } else { 0.0 };
+            let id = ix * ex + iy * ey;
+            let ixd = ixx * ex + ixy * ey;
+            let iyd = ixy * ex + iyy * ey;
+            rb.id[r] = id;
+            rb.ixd[r] = ixd;
+            rb.iyd[r] = iyd;
+            rb.iz[r] = iz[i];
+            rb.ixz[r] = dx(iz, x, y);
+            rb.iyz[r] = dy(iz, x, y);
+            rb.inv_nd[r] = 1.0 / (id * id + ZETA2);
+            rb.inv_nx[r] = 1.0 / (ixd * ixd + ZETA2);
+            rb.inv_ny[r] = 1.0 / (iyd * iyd + ZETA2);
+            rb.edge[r] = 1.0 / (1.0 + (b.gx[i] * b.gx[i] + b.gy[i] * b.gy[i]) * inv_edge);
+            rb.solved[r] = 1.0;
+            if x + 1 < w && solved(&b.valid, i + 1) {
+                rb.right[r] = 1.0;
             }
-            // Data terms linearised around D + dD, and the parts of each
-            // pixel's equation that stay fixed during SOR:
-            //   A·dD = c + Σ w·dD_neighbour.
-            for (k, t) in b.terms.iter().enumerate() {
-                let p = b.act_pad[k] as usize;
-                let dd = b.dd[p];
-                let z = t.iz + t.id * dd;
-                let wc = delta2 * t.inv_nd / (z * z * t.inv_nd + EPS2).sqrt();
-                let mut a = wc * t.id * t.id + ZETA2;
-                let mut rhs = -wc * t.iz * t.id;
-
-                let zx = t.ixz + t.ixd * dd;
-                let zy = t.iyz + t.iyd * dd;
-                let wg = gamma2 / (zx * zx * t.inv_nx + zy * zy * t.inv_ny + EPS2).sqrt();
-                a += wg * (t.ixd * t.ixd * t.inv_nx + t.iyd * t.iyd * t.inv_ny);
-                rhs -= wg * (t.ixd * t.ixz * t.inv_nx + t.iyd * t.iyz * t.inv_ny);
-
-                let (wr, wl, wd, wu) = (b.wr[p], b.wr[p - 1], b.wd[p], b.wd[p - pw]);
-                let d0 = b.dpad[p];
-                a += wr + wl + wd + wu;
-                rhs += wr * (b.dpad[p + 1] - d0)
-                    + wl * (b.dpad[p - 1] - d0)
-                    + wd * (b.dpad[p + pw] - d0)
-                    + wu * (b.dpad[p - pw] - d0);
-                b.inv_a[k] = 1.0 / a;
-                b.c[k] = rhs;
-            }
-            // Red-black SOR over the solved pixels; unsolved neighbours'
-            // increments stay 0 and the border's weights are 0.
-            for _ in 0..cfg.sor_iterations {
-                for range in [0..n_red, n_red..m] {
-                    for k in range {
-                        let p = b.act_pad[k] as usize;
-                        let s = b.c[k]
-                            + b.wr[p] * b.dd[p + 1]
-                            + b.wr[p - 1] * b.dd[p - 1]
-                            + b.wd[p] * b.dd[p + pw]
-                            + b.wd[p - pw] * b.dd[p - pw];
-                        b.dd[p] += omega * (s * b.inv_a[k] - b.dd[p]);
-                    }
-                }
+            if i + w < n && solved(&b.valid, i + w) {
+                rb.down[r] = 1.0;
             }
         }
+
+        rb.solve(Solve {
+            h,
+            iterations: cfg.variational_iterations,
+            sor_iterations: cfg.sor_iterations,
+            alpha2: cfg.alpha * 0.5,
+            gamma2: cfg.gamma * 0.5,
+            delta2: cfg.delta * 0.5,
+            omega: cfg.sor_omega,
+        });
+
         // The refinement's own change counts towards the variance.
         let var = b.var.len() == n;
-        for (k, &i) in b.act.iter().enumerate() {
+        for &i in &b.act {
             let i = i as usize;
-            let change = b.dd[b.act_pad[k] as usize];
+            let change = rb.dd[rb.index(i % w, i / w)];
             b.d[i] += change;
             if var {
                 b.var[i] += change * change;
@@ -1622,7 +1986,7 @@ impl DenseStereo {
         // The size is in finest-level pixels: a quarter per level coarser.
         let speckle = self.config.speckle_size >> (2 * (level - self.config.finest_level));
         if speckle > 0 {
-            remove_speckles(&mut b.valid, &b.d, w, h, speckle);
+            remove_speckles(&mut b.valid, &b.d, w, h, speckle, &mut b.speckle);
         }
     }
 
@@ -1823,11 +2187,23 @@ impl DenseStereo {
 /// Clear `keep` on connected regions (4-neighbours whose D differ by at most
 /// SPECKLE_STEP) smaller than `min_size` pixels, as OpenCV's filterSpeckles.
 #[inline(never)]
-fn remove_speckles(keep: &mut [bool], d: &[f32], w: usize, h: usize, min_size: usize) {
+fn remove_speckles(
+    keep: &mut [bool],
+    d: &[f32],
+    w: usize,
+    h: usize,
+    min_size: usize,
+    scratch: &mut SpeckleScratch,
+) {
     const UNSEEN: u32 = u32::MAX;
-    let mut label = vec![UNSEEN; w * h];
-    let mut stack = Vec::new();
-    let mut region = Vec::new();
+    let SpeckleScratch {
+        label,
+        stack,
+        region,
+    } = scratch;
+    label.clear();
+    label.resize(w * h, UNSEEN);
+    stack.clear();
     for start in 0..w * h {
         if !keep[start] || label[start] != UNSEEN {
             continue;
@@ -1858,7 +2234,7 @@ fn remove_speckles(keep: &mut [bool], d: &[f32], w: usize, h: usize, min_size: u
             }
         }
         if region.len() < min_size {
-            for &i in &region {
+            for &i in region.iter() {
                 keep[i] = false;
             }
         }
