@@ -637,3 +637,37 @@ fn variance_tracks_error() {
         "mse {mse:.3e} vs variance {mvar:.3e}"
     );
 }
+
+#[test]
+fn one_eye_object_has_no_depth() {
+    // A bright object so close to the left camera that the right one cannot
+    // see it, before a textured wall at 3 m. Compared on shape alone (after
+    // mean removal), the object's outline matched the wall's texture in the
+    // right image, and the object took the wall's depth: an obstacle reading
+    // 3 m away. Its brightness differs from the wall's, so it must not.
+    let rig = rectified_rig();
+    let z = 0.15;
+    // The left image's columns from its border to about 200.
+    let mut near = Plane::facing(z, 1.0, noise(21));
+    near.bounds = [-0.64 * z, -0.24 * z, -0.5, 0.5];
+    near.flat = Some(([-1.0, 1.0, -1.0, 1.0], 252.0));
+    let scene = [near, Plane::facing(3.0, 10.0, noise(22))];
+    for level in [1, 3] {
+        let config = DenseStereoConfig {
+            finest_level: level,
+            ..Default::default()
+        };
+        let (depth, gt) = run(&rig, &scene, config);
+        let on_object = |i: usize| (gt[i] - (z as f32).ln()).abs() < 0.5;
+        let n = (0..gt.len()).filter(|&i| on_object(i)).count();
+        let with_depth = (0..gt.len())
+            .filter(|&i| on_object(i) && depth.log_range[i].is_finite())
+            .count();
+        eprintln!("one-eye object, level {level}: {with_depth} of {n} pixels have depth");
+        assert!(n > 1000);
+        assert_eq!(
+            with_depth, 0,
+            "level {level}: the one-eye object took a depth"
+        );
+    }
+}

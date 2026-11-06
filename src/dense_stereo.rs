@@ -156,11 +156,19 @@ pub struct DenseStereoConfig {
     pub min_texture: f32,
     /// A valid patch matches with at most this RMS residual (grey levels).
     pub max_residual: f32,
+    /// A valid patch's mean grey level differs between the eyes by at most
+    /// this. Mean normalization compares the patches' shape only; without
+    /// this test the edge of a saturated object only the left camera saw
+    /// matched an edge on the dark wall behind it in the right image, and
+    /// read 13-30 m instead of under 0.25 m.
+    pub max_brightness_offset: f32,
     /// Drop pixels whose point is hidden in the right image behind a nearer
     /// one.
     pub occlusion_check: bool,
-    /// Drop connected regions of consistent depth smaller than this many
-    /// pixels of the finest level (isolated mismatches); 0 keeps them.
+    /// Drop connected regions of consistent depth covering fewer than this
+    /// many full-resolution pixels (isolated mismatches); 0 keeps them. The
+    /// same image area at every level: 400 is 100 depth-map pixels at level
+    /// 1, 6 at level 3.
     pub speckle_size: usize,
     /// Where the finest level has no valid estimate, use one of this many
     /// coarser levels' (header, step 6); 0 disables it. Coarser patches
@@ -195,8 +203,9 @@ impl Default for DenseStereoConfig {
             max_range: 30.0,
             min_texture: 0.5,
             max_residual: 12.0,
+            max_brightness_offset: 30.0,
             occlusion_check: true,
-            speckle_size: 100,
+            speckle_size: 400,
             coarse_fallback: 2,
         }
     }
@@ -895,6 +904,9 @@ struct PatchState {
     hess: f32,
     /// Where the patch lands in the right image, minus where it is in the left.
     shift: [f32; 2],
+    /// Mean of I1 − I0 over the patch at `d`: how much brighter the right
+    /// image sees it.
+    offset: f32,
     /// The patch lands fully inside the right image.
     inside: bool,
     /// `locate` succeeded (the ray reaches the right image).
@@ -908,6 +920,7 @@ impl PatchState {
         cost: f32::INFINITY,
         hess: 0.0,
         shift: [0.0; 2],
+        offset: f32::INFINITY,
         inside: false,
         ok: false,
     };
@@ -921,6 +934,7 @@ struct Eval {
     grad: f32,
     hess: f32,
     shift: [f32; 2],
+    offset: f32,
     inside: bool,
 }
 
@@ -1035,6 +1049,7 @@ impl LevelView<'_> {
             grad,
             hess,
             shift,
+            offset: sr / n,
             inside,
         })
     }
@@ -1046,6 +1061,7 @@ impl LevelView<'_> {
             cost: e.cost,
             hess: e.hess,
             shift: e.shift,
+            offset: e.offset,
             inside: e.inside,
             ok: true,
         }
@@ -2134,7 +2150,8 @@ impl DenseStereo {
         let min_rise = DISTINCT_RISE * min_hess * DISTINCT_STEP * DISTINCT_STEP;
         map_into(&mut valid_patch, patches.len(), |k| {
             let p = &patches[k];
-            if !(p.ok && p.inside && p.hess >= min_hess && p.ssd <= max_ssd) {
+            let bright = p.offset.abs() <= self.config.max_brightness_offset;
+            if !(p.ok && p.inside && p.hess >= min_hess && p.ssd <= max_ssd && bright) {
                 return false;
             }
             // Distinctness, where validity counts (header, step 5).
@@ -2421,8 +2438,8 @@ impl DenseStereo {
             });
         }
 
-        // The size is in finest-level pixels: a quarter per level coarser.
-        let speckle = self.config.speckle_size >> (2 * (level - self.config.finest_level));
+        // The size is in full-resolution pixels: a quarter per level.
+        let speckle = self.config.speckle_size >> (2 * level);
         if speckle > 0 {
             remove_speckles(&mut b.valid, &b.d, w, h, speckle, &mut b.speckle);
         }

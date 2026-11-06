@@ -7,15 +7,16 @@
 //
 // Options:
 //   --frames a:b:s   frames a..b, every s-th            (default: all)
-//   --level L        finest pyramid level                (default: 0.5)
+//   --level L        finest pyramid level                (default: 1)
 //   --vr N           variational fixed-point iterations  (default: 5)
 //   --sor N          SOR iterations per fixed-point one  (default: 5)
 //   --gd N           Gauss-Newton iterations per patch and level (default: 16)
 //   --sweeps N       red-black propagation sweeps        (default: 2)
 //   --edge S         edge-aware smoothness, grey/px      (default: 0, off)
-//   --speckle N      drop depth regions under N pixels   (default: 100)
+//   --speckle N      drop depth regions under N full-resolution pixels (default: 400)
 //   --fallback N     coarser levels the fallback may fill from, 0 = off (default: 2)
 //   --min-texture T  patch texture threshold, grey levels per pixel        (default: 0.5)
+//   --bright B       largest mean grey-level difference between the eyes   (default: 30)
 //   --out DIR        write <stem>.logr (f32 log-range, little-endian, row-major),
 //                    <stem>.src (u8 source level per pixel, 255 = none) and
 //                    <stem>.png (left image | range, 0.3 m red .. 6 m blue, none black)
@@ -120,6 +121,7 @@ fn main() {
     let speckle: Option<usize> = take("--speckle").map(|v| v.parse().expect("--speckle"));
     let fallback: Option<usize> = take("--fallback").map(|v| v.parse().expect("--fallback"));
     let min_texture: Option<f32> = take("--min-texture").map(|v| v.parse().expect("--min-texture"));
+    let bright: Option<f32> = take("--bright").map(|v| v.parse().expect("--bright"));
     let out = take("--out").map(PathBuf::from);
     let dir = PathBuf::from(
         args.first()
@@ -171,6 +173,7 @@ fn main() {
         grad_descent_iterations: gd.unwrap_or(config.grad_descent_iterations),
         propagation_sweeps: sweeps.unwrap_or(config.propagation_sweeps),
         min_texture: min_texture.unwrap_or(config.min_texture),
+        max_brightness_offset: bright.unwrap_or(config.max_brightness_offset),
         ..config
     };
     let mut stereo = DenseStereo::new(rig, config);
