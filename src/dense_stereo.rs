@@ -6,7 +6,8 @@
 // variational_refinement.cpp), with the correspondence search reduced to one
 // parameter because the rig is calibrated:
 //
-//   1. Pyramid of both images (the frontend's Gaussian pyramid). No
+//   1. Pyramid of both images (the frontend's Gaussian pyramid, blurring f32
+//      levels as the GPU pyramid does; the integer path rounds each level). No
 //      equalization: CLAHE's tone curve varies across the image, so on a
 //      flat surface it paints ramps fixed to the image, not to the scene,
 //      which both eyes see in the same place: they match at zero disparity
@@ -57,7 +58,7 @@
 
 use crate::camera::{DistortionModel, StereoRig};
 use crate::image::Image;
-use crate::pyramid::{Pyramid, PyramidScratch};
+use crate::pyramid::Pyramid;
 use camera_geometry::{CameraModel, CameraProjection, Pixel};
 use nalgebra::Vector3;
 #[cfg(feature = "parallel")]
@@ -1841,7 +1842,8 @@ pub struct DenseStereo {
     levels: Vec<Option<LevelGeom>>,
     pyr0: Pyramid,
     pyr1: Pyramid,
-    pyr_scratch: [PyramidScratch; 2],
+    /// The pyramids' horizontal-pass buffers.
+    pyr_scratch: [Vec<f32>; 2],
     i1: Padded,
     buf: Buffers,
 }
@@ -1885,10 +1887,7 @@ impl DenseStereo {
             levels,
             pyr0: Pyramid::build(&blank, coarsest + 1, 1.0),
             pyr1: Pyramid::build(&blank, coarsest + 1, 1.0),
-            pyr_scratch: [
-                PyramidScratch::new(w, h, 1.0),
-                PyramidScratch::new(w, h, 1.0),
-            ],
+            pyr_scratch: [Vec::new(), Vec::new()],
             i1: Padded::new(),
             buf: Buffers::default(),
             config,
@@ -1941,8 +1940,8 @@ impl DenseStereo {
         let [s0, s1] = &mut self.pyr_scratch;
         let (pyr0, pyr1) = (&mut self.pyr0, &mut self.pyr1);
         join(
-            || pyr0.build_reuse(left, n_levels, s0),
-            || pyr1.build_reuse(right, n_levels, s1),
+            || pyr0.build_f32_reuse(left, n_levels, s0),
+            || pyr1.build_f32_reuse(right, n_levels, s1),
         );
 
         let finest = self.config.finest_level;
@@ -2345,7 +2344,7 @@ impl DenseStereo {
         };
         let rb = &mut b.rb;
         rb.reset(w, h);
-        let (hw, stride) = (rb.hw, rb.stride);
+        let stride = rb.stride;
         let RedBlack {
             d: rd,
             id,

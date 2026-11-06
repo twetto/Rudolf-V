@@ -33,7 +33,7 @@ use crate::image::{Image, Pixel};
 
 // Re-export convolution utilities for other modules that may still need them.
 #[allow(unused_imports)]
-use crate::convolution::{gaussian_kernel_1d, ConvolveScratch};
+use crate::convolution::{ConvolveScratch, gaussian_kernel_1d};
 
 /// A Gaussian image pyramid.
 pub struct Pyramid {
@@ -127,6 +127,27 @@ impl Pyramid {
             u8_levels: Vec::new(),
             padded_levels: Vec::new(),
             pad_border: 0,
+        }
+    }
+
+    /// As `build` (the f32 path) for a u8 image, reusing this pyramid's levels
+    /// and `h_buf`: no allocation once they have the sizes. The levels equal
+    /// `build`'s exactly, and blur f32 levels as the GPU pyramid does, where
+    /// `build_reuse` rounds each level to u8 before the next. Builds `levels`
+    /// only, as `build` does.
+    pub fn build_f32_reuse(&mut self, src: &Image<u8>, num_levels: usize, h_buf: &mut Vec<f32>) {
+        assert!(num_levels >= 1, "pyramid must have at least 1 level");
+        while self.levels.len() < num_levels {
+            self.levels.push(Image::new(1, 1));
+        }
+        self.levels.truncate(num_levels);
+        self.u8_levels.clear();
+        self.padded_levels.clear();
+        self.pad_border = 0;
+        to_f32_image_u8_into(src, &mut self.levels[0]);
+        for l in 1..num_levels {
+            let (done, rest) = self.levels.split_at_mut(l);
+            pyrdown_fused(&done[l - 1], &mut rest[0], h_buf);
         }
     }
 
@@ -1353,6 +1374,32 @@ mod tests {
         );
         assert_eq!(dst_f32.width(), 50);
         assert_eq!(dst_f32.height(), 40);
+    }
+
+    #[test]
+    fn test_build_f32_reuse_equals_build() {
+        // Odd sizes, and a smaller image after a larger one reusing the levels.
+        let mut pyr = Pyramid::build(&Image::<u8>::new(8, 8), 1, 1.0);
+        let mut h_buf = Vec::new();
+        for (w, h) in [(101, 77), (64, 50)] {
+            let data = (0..w * h)
+                .map(|i| ((i * 37 + i / w * 11) % 251) as u8)
+                .collect();
+            let img = Image::from_vec(w, h, data);
+            pyr.build_f32_reuse(&img, 4, &mut h_buf);
+            let reference = Pyramid::build(&img, 4, 1.0);
+            assert_eq!(pyr.levels.len(), 4);
+            for (lvl, (a, b)) in pyr.levels.iter().zip(&reference.levels).enumerate() {
+                assert_eq!(
+                    (a.width(), a.height()),
+                    (b.width(), b.height()),
+                    "level {lvl}"
+                );
+                for ((_, _, va), (x, y, vb)) in a.pixels().zip(b.pixels()) {
+                    assert_eq!(va.to_bits(), vb.to_bits(), "{w}x{h} level {lvl} ({x},{y})");
+                }
+            }
+        }
     }
 
     #[test]
