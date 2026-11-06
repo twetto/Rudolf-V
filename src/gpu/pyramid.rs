@@ -56,6 +56,7 @@ use wgpu::util::DeviceExt;
 use crate::gpu::device::GpuDevice;
 use crate::gpu::image::align_to;
 use crate::image::Image;
+use crate::rectify::RemapTap;
 
 // ---------------------------------------------------------------------------
 // GPU pyramid level
@@ -137,11 +138,14 @@ struct PersistentResources {
     convert_bg: wgpu::BindGroup,
     /// Level 0 goes through per-tile CLAHE LUTs rather than one global LUT.
     clahe: bool,
+    /// Level 0 is rectified through a map (`allocate_rectified`).
+    rectify: bool,
     /// Fused level 0 + 1 bind group (≥ 2 levels); replaces the convert pass
     /// and the first blur pass.
     l0l1_bg: Option<wgpu::BindGroup>,
     level_bgs: Vec<wgpu::BindGroup>,
     _params_bufs: Vec<wgpu::Buffer>,
+    _map: Option<wgpu::Buffer>,
 }
 
 impl GpuPyramid {
@@ -319,9 +323,20 @@ pub struct GpuPyramidPipeline {
     convert_clahe_bgl: wgpu::BindGroupLayout,
     l0l1_clahe_pipeline: wgpu::ComputePipeline,
     l0l1_clahe_bgl: wgpu::BindGroupLayout,
+    /// Rectifying level 0 (pyramid_convert_rect.wgsl): the convert pass's
+    /// layout, with the rectification map in place of the LUT.
+    convert_rect_pipeline: wgpu::ComputePipeline,
     /// Identity 256-entry LUT (u32 per entry) for pyramids allocated without
     /// histogram equalization.
     identity_lut: wgpu::Buffer,
+}
+
+/// What a persistent pyramid's level 0 is made from: the raw frame through a
+/// LUT (CLAHE: tile LUTs and their parameters), or through a rectification
+/// map.
+enum Level0<'a> {
+    Lut(&'a wgpu::Buffer, Option<&'a wgpu::Buffer>),
+    Rectify(&'a wgpu::Buffer),
 }
 
 /// Identity LUT contents: entry i maps to i.
@@ -474,6 +489,24 @@ impl GpuPyramidPipeline {
                     layout: Some(&convert_layout),
                     module: &convert_shader,
                     entry_point: Some("convert_u8"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                });
+
+        let convert_rect_src = include_str!("../shaders/pyramid_convert_rect.wgsl")
+            .replace("{{WG_X}}", &gpu.workgroup_size.x.to_string())
+            .replace("{{WG_Y}}", &gpu.workgroup_size.y.to_string());
+        let convert_rect_shader = gpu.create_compute_shader(wgpu::ShaderModuleDescriptor {
+            label: Some("pyramid_convert_rect.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(convert_rect_src.into()),
+        });
+        let convert_rect_pipeline =
+            gpu.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("convert_rect"),
+                    layout: Some(&convert_layout),
+                    module: &convert_rect_shader,
+                    entry_point: Some("convert_rect"),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     cache: None,
                 });
@@ -678,6 +711,7 @@ impl GpuPyramidPipeline {
             convert_clahe_pipeline,
             convert_clahe_bgl,
             l0l1_clahe_pipeline,
+            convert_rect_pipeline,
             l0l1_clahe_bgl,
             identity_lut,
         }
@@ -713,7 +747,7 @@ impl GpuPyramidPipeline {
         num_levels: usize,
         lut: &wgpu::Buffer,
     ) -> GpuPyramid {
-        self.allocate_inner(gpu, width, height, num_levels, lut, None)
+        self.allocate_inner(gpu, width, height, num_levels, Level0::Lut(lut, None))
     }
 
     /// Like [`allocate_with_lut`](GpuPyramidPipeline::allocate_with_lut), but
@@ -721,6 +755,34 @@ impl GpuPyramidPipeline {
     /// `tile_cols * tile_rows * 256` u32 entries and `params` describes the
     /// tile grid, both rebuilt each frame by
     /// [`GpuClahe`](crate::gpu::clahe::GpuClahe).
+    /// Allocate a pyramid whose level 0 is rectified from the raw frame that
+    /// `upload` stages: each level-0 pixel samples the raw image through its
+    /// tap in `map` (`StereoRectification::map`, row-major, width × height),
+    /// as `StereoRectification::remap` does on the CPU. Rebuilt like
+    /// [`allocate`](GpuPyramidPipeline::allocate)'s pyramids.
+    pub fn allocate_rectified(
+        &self,
+        gpu: &GpuDevice,
+        width: usize,
+        height: usize,
+        num_levels: usize,
+        map: &[RemapTap],
+    ) -> GpuPyramid {
+        assert_eq!(map.len(), width * height, "rectification map size");
+        let buf = gpu
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("pyramid rectification map"),
+                contents: bytemuck::cast_slice(map),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let mut pyr = self.allocate_inner(gpu, width, height, num_levels, Level0::Rectify(&buf));
+        if let Some(res) = pyr.persistent.as_mut() {
+            res._map = Some(buf);
+        }
+        pyr
+    }
+
     pub fn allocate_with_tile_lut(
         &self,
         gpu: &GpuDevice,
@@ -730,7 +792,13 @@ impl GpuPyramidPipeline {
         luts: &wgpu::Buffer,
         params: &wgpu::Buffer,
     ) -> GpuPyramid {
-        self.allocate_inner(gpu, width, height, num_levels, luts, Some(params))
+        self.allocate_inner(
+            gpu,
+            width,
+            height,
+            num_levels,
+            Level0::Lut(luts, Some(params)),
+        )
     }
 
     fn allocate_inner(
@@ -739,10 +807,14 @@ impl GpuPyramidPipeline {
         width: usize,
         height: usize,
         num_levels: usize,
-        lut: &wgpu::Buffer,
-        clahe_params: Option<&wgpu::Buffer>,
+        source: Level0<'_>,
     ) -> GpuPyramid {
         assert!(num_levels >= 1, "pyramid must have at least 1 level");
+        // The convert pass reads the LUT, or the rectification map in its place.
+        let (lut, clahe_params, rectify) = match source {
+            Level0::Lut(lut, clahe) => (lut, clahe, false),
+            Level0::Rectify(map) => (map, None, true),
+        };
         let kernel = [1.0 / 16.0, 4.0 / 16.0, 6.0 / 16.0, 4.0 / 16.0, 1.0 / 16.0];
 
         let (w0, h0) = (width as u32, height as u32);
@@ -834,7 +906,7 @@ impl GpuPyramidPipeline {
             params_bufs.push(params_buf);
         }
 
-        let l0l1_bg = (num_levels >= 2).then(|| {
+        let l0l1_bg = (num_levels >= 2 && !rectify).then(|| {
             let mut entries = vec![
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -874,12 +946,14 @@ impl GpuPyramidPipeline {
             levels,
             persistent: Some(PersistentResources {
                 clahe: clahe_params.is_some(),
+                rectify,
                 raw,
                 raw_view,
                 convert_bg,
                 l0l1_bg,
                 level_bgs,
                 _params_bufs: params_bufs,
+                _map: None,
             }),
         }
     }
@@ -990,6 +1064,8 @@ impl GpuPyramidPipeline {
         } else {
             pass.set_pipeline(if res.clahe {
                 &self.convert_clahe_pipeline
+            } else if res.rectify {
+                &self.convert_rect_pipeline
             } else {
                 &self.convert_pipeline
             });
@@ -1476,7 +1552,76 @@ mod tests {
         println!("GPU_TEST_OK");
     }
 
+    #[test]
+    #[ignore = "GPU integration: run via outer subprocess wrapper"]
+    fn inner_rectified_matches_cpu() {
+        // A rectified pyramid (raw frame through a ZED-like rectification)
+        // against the CPU's: StereoRectification::remap, then the f32 path.
+        use crate::camera::{CameraIntrinsics, DistortionModel, StereoRig};
+        use crate::pyramid::Pyramid;
+        use crate::rectify::StereoRectification;
+        let (w, h) = (320usize, 180usize);
+        let cam = |f: f64, cx: f64, cy: f64| CameraIntrinsics {
+            fx: f,
+            fy: f + 0.2,
+            cx,
+            cy,
+            resolution: [w, h],
+            distortion: vec![-4.26, 46.5, 4.2e-4, 9.1e-6, -23.3, -4.17, 46.1, -19.8],
+            model: DistortionModel::Rational,
+        };
+        let rig = StereoRig::new(
+            cam(239.6, 162.9, 88.4),
+            cam(239.0, 163.3, 90.0),
+            [
+                [0.99999, -0.0035, 0.0039],
+                [0.0035, 0.99999, -0.0031],
+                [-0.0039, 0.0031, 0.99999],
+            ],
+            [-0.12, -2.5e-4, 4.3e-4],
+        );
+        let rect = StereoRectification::new(&rig, 237.8, 164.7, 89.2);
+        let mut rng = 777u32;
+        let mut next = || {
+            rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+            (rng >> 24) as u8
+        };
+        let raw = Image::<u8>::from_vec(w, h, (0..w * h).map(|_| next()).collect());
+
+        let gpu = GpuDevice::new().expect("need Vulkan GPU");
+        let pipeline = GpuPyramidPipeline::new(&gpu);
+        for eye in 0..2 {
+            let mut cpu = Pyramid::build(&Image::<u8>::new(8, 8), 1, 1.0);
+            rect.remap(eye, &raw, &mut cpu.levels[0]);
+            cpu.build_f32_from_level0(4, &mut Vec::new());
+            let pyr = pipeline.allocate_rectified(&gpu, w, h, 4, rect.map(eye));
+            let mut enc = gpu.device.create_command_encoder(&Default::default());
+            pipeline.record_rebuild(&gpu, &mut enc, &raw, &pyr);
+            gpu.queue.submit(std::iter::once(enc.finish()));
+            for lvl in 0..4 {
+                let got = pyr.readback_level(&gpu, lvl);
+                let want = cpu.level(lvl).as_slice();
+                assert_eq!(got.len(), want.len(), "level {lvl} size");
+                let max = got
+                    .iter()
+                    .zip(want)
+                    .map(|(g, c)| (g - c).abs())
+                    .fold(0.0f32, f32::max);
+                eprintln!("[test] eye {eye} level {lvl}: max |GPU - CPU| {max:.2e}");
+                assert!(max < 1e-3, "eye {eye} level {lvl}: max |GPU - CPU| {max}");
+            }
+        }
+        println!("GPU_TEST_OK");
+    }
+
     // Outer wrappers ──────────────────────────────────────────────────────────
+
+    #[test]
+    #[ignore = "requires a real Vulkan GPU"]
+    fn test_rectified_matches_cpu() {
+        let out = run_gpu_test_in_subprocess("gpu::pyramid::tests::inner_rectified_matches_cpu");
+        assert!(out.contains("GPU_TEST_OK"), "inner test failed:\n{out}");
+    }
 
     #[test]
     #[ignore = "requires a real Vulkan GPU"]

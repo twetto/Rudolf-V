@@ -21,6 +21,7 @@ pub mod klt;
 pub mod nms;
 pub mod occupancy;
 pub mod pyramid;
+pub mod rectify;
 pub mod rigid_ransac;
 pub mod shi_tomasi;
 pub mod stereo;

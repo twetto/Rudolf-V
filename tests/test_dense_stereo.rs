@@ -6,6 +6,7 @@ use nalgebra::{Matrix3, Vector3};
 use rudolf_v::camera::{CameraIntrinsics, DistortionModel, StereoRig};
 use rudolf_v::dense_stereo::{DenseDepth, DenseStereo, DenseStereoConfig};
 use rudolf_v::image::Image;
+use rudolf_v::rectify::StereoRectification;
 
 // ---------------------------------------------------------------------------
 // Scene
@@ -392,6 +393,40 @@ fn raw_zed_rational_plane() {
     let s = stats(&depth, &gt, seen_at(&depth, &rig, 2.0));
     eprintln!(
         "raw ZED plane: coverage {:.3} median {:.4} p95 {:.4} bad {:.4}",
+        s.coverage, s.median, s.p95, s.bad
+    );
+    assert!(s.coverage > 0.95, "coverage {}", s.coverage);
+    assert!(s.median < 0.006, "median log error {}", s.median);
+    assert!(s.p95 < 0.025, "p95 log error {}", s.p95);
+    assert!(s.bad < 0.005, "bad {}", s.bad);
+}
+
+#[test]
+fn raw_zed_plane_rectified_first() {
+    // The same raw ZED pair, rectified before matching: the depth is on the
+    // rectified left grid, whose rays are the rectified camera's, turned
+    // back into the raw left camera by the rectification.
+    let rig = zed_raw_rig();
+    let scene = [Plane::facing(2.0, 10.0, noise(9))];
+    let left = render(&rig, 0, &scene);
+    let right = render(&rig, 1, &scene);
+    let (f, cx, cy) = (rig.cam0.fx * 0.99, rig.cam0.cx, rig.cam0.cy);
+    let rect = StereoRectification::new(&rig, f, cx, cy);
+    let r0 = Matrix3::from_fn(|i, j| rect.rotation(0)[i][j]);
+    let mut stereo = DenseStereo::new_rectifying(rect, DenseStereoConfig::default());
+    assert!(stereo.is_rectified());
+    let depth = stereo.compute(&left, &right);
+    let mut gt = Vec::with_capacity(depth.width * depth.height);
+    for y in 0..depth.height {
+        for x in 0..depth.width {
+            let (u, v) = depth.full_res_pixel(x, y);
+            let ray = r0.transpose() * Vector3::new((u - cx) / f, (v - cy) / f, 1.0).normalize();
+            gt.push(cast(&scene, Vector3::zeros(), ray).map_or(f32::NAN, |(s, _)| s.ln() as f32));
+        }
+    }
+    let s = stats(&depth, &gt, seen_at(&depth, &rig, 2.0));
+    eprintln!(
+        "raw ZED plane, rectified first: coverage {:.3} median {:.4} p95 {:.4} bad {:.4}",
         s.coverage, s.median, s.p95, s.bad
     );
     assert!(s.coverage > 0.95, "coverage {}", s.coverage);

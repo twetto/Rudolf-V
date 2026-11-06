@@ -59,6 +59,7 @@
 use crate::camera::{DistortionModel, StereoRig};
 use crate::image::Image;
 use crate::pyramid::Pyramid;
+use crate::rectify::StereoRectification;
 use camera_geometry::{CameraModel, CameraProjection, Pixel};
 use nalgebra::Vector3;
 #[cfg(feature = "parallel")]
@@ -1844,6 +1845,8 @@ pub struct DenseStereo {
     pyr1: Pyramid,
     /// The pyramids' horizontal-pass buffers.
     pyr_scratch: [Vec<f32>; 2],
+    /// Rectifies raw input before matching (`new_rectifying`).
+    rectify: Option<StereoRectification>,
     i1: Padded,
     buf: Buffers,
 }
@@ -1888,10 +1891,27 @@ impl DenseStereo {
             pyr0: Pyramid::build(&blank, coarsest + 1, 1.0),
             pyr1: Pyramid::build(&blank, coarsest + 1, 1.0),
             pyr_scratch: [Vec::new(), Vec::new()],
+            rectify: None,
             i1: Padded::new(),
             buf: Buffers::default(),
             config,
         }
+    }
+
+    /// Matches a raw rig's images after rectifying them (`compute` takes the
+    /// raw images): the rectified pair's epipolar lines are image rows, the
+    /// fastest path. The depth is on the rectified left image's grid; its
+    /// rays are the rectification's camera, and its rotation turns raw rays
+    /// into them (the range along a ray does not change).
+    pub fn new_rectifying(rect: StereoRectification, config: DenseStereoConfig) -> Self {
+        let mut stereo = Self::new(rect.rig(), config);
+        stereo.rectify = Some(rect);
+        stereo
+    }
+
+    /// The rectification of `new_rectifying`.
+    pub fn rectification(&self) -> Option<&StereoRectification> {
+        self.rectify.as_ref()
     }
 
     pub fn config(&self) -> &DenseStereoConfig {
@@ -1939,10 +1959,15 @@ impl DenseStereo {
         let n_levels = self.coarsest + 1;
         let [s0, s1] = &mut self.pyr_scratch;
         let (pyr0, pyr1) = (&mut self.pyr0, &mut self.pyr1);
-        join(
-            || pyr0.build_f32_reuse(left, n_levels, s0),
-            || pyr1.build_f32_reuse(right, n_levels, s1),
-        );
+        let rect = self.rectify.as_ref();
+        let build = |eye: usize, img: &Image<u8>, pyr: &mut Pyramid, s: &mut Vec<f32>| match rect {
+            Some(r) => {
+                r.remap(eye, img, &mut pyr.levels[0]);
+                pyr.build_f32_from_level0(n_levels, s);
+            }
+            None => pyr.build_f32_reuse(img, n_levels, s),
+        };
+        join(|| build(0, left, pyr0, s0), || build(1, right, pyr1, s1));
 
         let finest = self.config.finest_level;
         // Levels the coarse fallback takes depth from: finest+1..=fallback.

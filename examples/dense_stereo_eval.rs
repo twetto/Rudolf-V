@@ -17,6 +17,10 @@
 //   --fallback N     coarser levels the fallback may fill from, 0 = off (default: 2)
 //   --min-texture T  patch texture threshold, grey levels per pixel        (default: 0.5)
 //   --bright B       largest mean grey-level difference between the eyes   (default: 30)
+//   --rectify F,CX,CY  rectify the (raw) images into the pinhole camera F, (CX, CY)
+//                    first; the depth is then on the rectified left grid
+//   --rectified DIR  with --rectify, also write the rectified images to
+//                    DIR/left and DIR/right (rounded to u8)
 //   --out DIR        write <stem>.logr (f32 log-range, little-endian, row-major),
 //                    <stem>.src (u8 source level per pixel, 255 = none) and
 //                    <stem>.png (left image | range, 0.3 m red .. 6 m blue, none black)
@@ -27,6 +31,7 @@
 use rudolf_v::camera::StereoRig;
 use rudolf_v::dense_stereo::{DenseDepth, DenseStereo, DenseStereoConfig};
 use rudolf_v::image::Image;
+use rudolf_v::rectify::StereoRectification;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -77,6 +82,29 @@ fn colour(log_range: f32) -> [u8; 3] {
     [r, g, b]
 }
 
+/// Eye `eye` of a raw pair through the matcher's rectification, rounded to u8.
+fn rectified(rect: &StereoRectification, eye: usize, raw: &Image<u8>) -> Image<u8> {
+    let mut f = Image::new(1, 1);
+    rect.remap(eye, raw, &mut f);
+    let data = f
+        .as_slice()
+        .iter()
+        .map(|v| v.round().clamp(0.0, 255.0) as u8)
+        .collect();
+    Image::from_vec(f.width(), f.height(), data)
+}
+
+fn save_grey(img: &Image<u8>, path: &Path) {
+    image::GrayImage::from_raw(
+        img.width() as u32,
+        img.height() as u32,
+        img.as_slice().to_vec(),
+    )
+    .expect("image size")
+    .save(path)
+    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+}
+
 fn write_outputs(out: &Path, stem: &str, left: &Image<u8>, depth: &DenseDepth) {
     let bytes: Vec<u8> = depth
         .log_range
@@ -122,6 +150,15 @@ fn main() {
     let fallback: Option<usize> = take("--fallback").map(|v| v.parse().expect("--fallback"));
     let min_texture: Option<f32> = take("--min-texture").map(|v| v.parse().expect("--min-texture"));
     let bright: Option<f32> = take("--bright").map(|v| v.parse().expect("--bright"));
+    let rectify: Option<Vec<f64>> = take("--rectify").map(|v| {
+        let p: Vec<f64> = v
+            .split(',')
+            .map(|x| x.parse().expect("--rectify F,CX,CY"))
+            .collect();
+        assert_eq!(p.len(), 3, "--rectify F,CX,CY");
+        p
+    });
+    let rectified_out = take("--rectified").map(PathBuf::from);
     let out = take("--out").map(PathBuf::from);
     let dir = PathBuf::from(
         args.first()
@@ -176,7 +213,18 @@ fn main() {
         max_brightness_offset: bright.unwrap_or(config.max_brightness_offset),
         ..config
     };
-    let mut stereo = DenseStereo::new(rig, config);
+    let mut stereo = match &rectify {
+        Some(k) => {
+            DenseStereo::new_rectifying(StereoRectification::new(&rig, k[0], k[1], k[2]), config)
+        }
+        None => DenseStereo::new(rig, config),
+    };
+    if let Some(dir) = &rectified_out {
+        assert!(rectify.is_some(), "--rectified needs --rectify");
+        for eye in ["left", "right"] {
+            std::fs::create_dir_all(dir.join(eye)).expect("--rectified");
+        }
+    }
     eprintln!(
         "{} pairs, {}x{}, levels {}..={}, {}",
         pairs.len(),
@@ -184,7 +232,9 @@ fn main() {
         pairs[0].1.height(),
         level,
         stereo.coarsest_level(),
-        if stereo.is_rectified() {
+        if stereo.rectification().is_some() {
+            "raw, rectified first"
+        } else if stereo.is_rectified() {
             "rectified"
         } else {
             "raw (epipolar curves)"
@@ -207,8 +257,19 @@ fn main() {
             depth.height,
             depth.level
         );
+        let rect_left = stereo.rectification().map(|r| rectified(r, 0, left));
+        if let (Some(dir), Some(r)) = (&rectified_out, stereo.rectification()) {
+            save_grey(
+                rect_left.as_ref().unwrap(),
+                &dir.join("left").join(format!("{stem}.png")),
+            );
+            save_grey(
+                &rectified(r, 1, right),
+                &dir.join("right").join(format!("{stem}.png")),
+            );
+        }
         if let Some(out) = &out {
-            write_outputs(out, stem, left, &depth);
+            write_outputs(out, stem, rect_left.as_ref().unwrap_or(left), &depth);
         }
     }
     let mut sorted = ms.clone();

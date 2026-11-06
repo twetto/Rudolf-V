@@ -136,7 +136,18 @@ impl Pyramid {
     /// `build_reuse` rounds each level to u8 before the next. Builds `levels`
     /// only, as `build` does.
     pub fn build_f32_reuse(&mut self, src: &Image<u8>, num_levels: usize, h_buf: &mut Vec<f32>) {
+        if self.levels.is_empty() {
+            self.levels.push(Image::new(1, 1));
+        }
+        to_f32_image_u8_into(src, &mut self.levels[0]);
+        self.build_f32_from_level0(num_levels, h_buf);
+    }
+
+    /// As `build_f32_reuse`, from the level 0 already in `levels[0]` (a
+    /// rectified image, for instance).
+    pub fn build_f32_from_level0(&mut self, num_levels: usize, h_buf: &mut Vec<f32>) {
         assert!(num_levels >= 1, "pyramid must have at least 1 level");
+        assert!(!self.levels.is_empty(), "level 0 is missing");
         while self.levels.len() < num_levels {
             self.levels.push(Image::new(1, 1));
         }
@@ -144,7 +155,6 @@ impl Pyramid {
         self.u8_levels.clear();
         self.padded_levels.clear();
         self.pad_border = 0;
-        to_f32_image_u8_into(src, &mut self.levels[0]);
         for l in 1..num_levels {
             let (done, rest) = self.levels.split_at_mut(l);
             pyrdown_fused(&done[l - 1], &mut rest[0], h_buf);
