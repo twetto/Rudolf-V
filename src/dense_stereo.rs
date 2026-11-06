@@ -6,7 +6,11 @@
 // variational_refinement.cpp), with the correspondence search reduced to one
 // parameter because the rig is calibrated:
 //
-//   1. Pyramid of both images (the frontend's Gaussian pyramid).
+//   1. Pyramid of both images (the frontend's Gaussian pyramid). No
+//      equalization: CLAHE's tone curve varies across the image, so on a
+//      flat surface it paints ramps fixed to the image, not to the scene,
+//      which both eyes see in the same place: they match at zero disparity
+//      (a textureless wall at 2 m read as 6 m).
 //   2. Patch inverse search, coarse to fine. Overlapping patches (8×8, stride
 //      4), each running inverse-compositional Gauss-Newton on one parameter D
 //      (below). A patch slides along its centre's epipolar curve
@@ -28,10 +32,18 @@
 //      SOR. Optionally the smoothness weight falls where the left image has an
 //      edge, so depth may break where the grey image does.
 //   5. Validity, at the finest level: a pixel has depth only if a patch over
-//      it has texture along its epipolar direction, matched (residual), lies
-//      inside the right image, and the pixel is not occluded in the right
-//      image (z-buffer of the forward-warped left image). Everything else is
+//      it has texture along its epipolar direction, matched (residual)
+//      distinctly (its SSD rises when D moves two pixels either way: noise
+//      matches every D about equally), lies inside the right image, and the
+//      pixel is not occluded in the right image (z-buffer of the
+//      forward-warped left image). Everything else is
 //      NaN: no depth is invented across textureless regions or occlusions.
+//   6. Coarse fallback (`coarse_fallback`): where the finest level found no
+//      texture, a coarser level's patches, larger in the scene, may have:
+//      such a pixel takes the nearest coarser level's valid estimate, with
+//      that level's variance, unless a finer measurement within the coarse
+//      estimate's support disagrees with it (the coarse patch straddled a
+//      depth edge and may have matched the other surface).
 //
 // THE UNKNOWN D. Per pixel, inverse range scaled to pixels of the current
 // level:  D = ρ · f1 · |t| / 2^level,  ρ = 1 / range,  where the right image
@@ -74,6 +86,20 @@ const SPECKLE_STEP: f32 = 1.0;
 /// At a depth edge, the winning surface's local photometric cost must be this
 /// many times lower than the other surface's, or the pixel has no depth.
 const AMBIGUITY_RATIO: f32 = 2.0;
+/// A finer measurement agrees with a coarse estimate (scaled to its level)
+/// when their D differ by at most DISAGREE or this fraction of its D.
+const FALLBACK_AGREE: f32 = 0.1;
+/// `DenseDepth::source_level` where there is no depth.
+const NO_SOURCE: u8 = u8::MAX;
+/// Distinct match: moving D by DISTINCT_STEP (pixels) either way must raise
+/// the patch's SSD by at least DISTINCT_RISE of what `min_texture` predicts
+/// (n · min_texture² · step²). Noise rises by about zero.
+const DISTINCT_STEP: f32 = 2.0;
+const DISTINCT_RISE: f32 = 0.5;
+/// Along a row, a textureless run is where |∂I/∂x| stays under this many
+/// times `min_texture`; its ends are checked this many pixels inside.
+const FLAT_GRADIENT: f32 = 4.0;
+const FLAT_END_MARGIN: usize = 2;
 
 #[derive(Debug, Clone)]
 pub struct DenseStereoConfig {
@@ -117,7 +143,12 @@ pub struct DenseStereoConfig {
     /// Farthest range searched (metres).
     pub max_range: f64,
     /// A valid patch has at least this RMS image gradient along its epipolar
-    /// direction (grey levels per pixel, after mean removal).
+    /// direction (grey levels per pixel, after mean removal). Sensor noise
+    /// alone that passes it fails the distinctness test (header, step 5)
+    /// down to about half this: with noise σ = 1.5 (a ZED 2i's is 1.6),
+    /// depth appeared on flat surfaces from 0.25. Lower finds more faint
+    /// texture: on a ZED walk 1.0 → 0.5 took coverage of the SDK's depth
+    /// from 52 % to 59 % and errors over 25 % from 4.6 % to 4.2 %.
     pub min_texture: f32,
     /// A valid patch matches with at most this RMS residual (grey levels).
     pub max_residual: f32,
@@ -127,6 +158,15 @@ pub struct DenseStereoConfig {
     /// Drop connected regions of consistent depth smaller than this many
     /// pixels of the finest level (isolated mismatches); 0 keeps them.
     pub speckle_size: usize,
+    /// Where the finest level has no valid estimate, use one of this many
+    /// coarser levels' (header, step 6); 0 disables it. Coarser patches
+    /// straddle more depth edges: on a ZED walk (finest level 1), fills at
+    /// 0.3-0.5 m were too far by over 25 % for 18 % of level-2 pixels, 29 %
+    /// of level 3, 36 % of level 4 and 62 % of level 5. Those levels are
+    /// validated too, so they seed finer ones from valid patches only, as the
+    /// finest level's depth is (on that walk this moved 0.7 % of measured
+    /// pixels by over 1 %).
+    pub coarse_fallback: usize,
 }
 
 impl Default for DenseStereoConfig {
@@ -149,10 +189,11 @@ impl Default for DenseStereoConfig {
             edge_sigma: 0.0,
             min_range: 0.25,
             max_range: 30.0,
-            min_texture: 1.0,
+            min_texture: 0.5,
             max_residual: 12.0,
             occlusion_check: true,
             speckle_size: 100,
+            coarse_fallback: 2,
         }
     }
 }
@@ -169,6 +210,9 @@ pub struct DenseDepth {
     pub log_range: Vec<f32>,
     /// Variance of `log_range`; NaN where there is no estimate.
     pub variance: Vec<f32>,
+    /// Pyramid level each estimate was measured at: `level`, or a coarser
+    /// one where the coarse fallback filled it; u8::MAX where there is none.
+    pub source_level: Vec<u8>,
 }
 
 impl DenseDepth {
@@ -507,6 +551,34 @@ fn copy_level(img: &Image<f32>, out: &mut Vec<f32>) {
 
 /// Bilinear sample of a dense w×h field, clamped to the image.
 #[inline]
+/// Gradient sums of every patch of the grid.
+fn patch_sums(
+    gx: &[f32],
+    gy: &[f32],
+    g: &LevelGeom,
+    psz: usize,
+    st: usize,
+    out: &mut Vec<PatchSums>,
+) {
+    out.clear();
+    for is in 0..g.hs {
+        for js in 0..g.ws {
+            let mut s = PatchSums::default();
+            for y in is * st..is * st + psz {
+                for x in js * st..js * st + psz {
+                    let (gx, gy) = (gx[y * g.w + x], gy[y * g.w + x]);
+                    s.xx += gx * gx;
+                    s.xy += gx * gy;
+                    s.yy += gy * gy;
+                    s.x += gx;
+                    s.y += gy;
+                }
+            }
+            out.push(s);
+        }
+    }
+}
+
 fn sample_field(f: &[f32], w: usize, h: usize, x: f32, y: f32) -> f32 {
     let x = x.clamp(0.0, (w - 1) as f32);
     let y = y.clamp(0.0, (h - 1) as f32);
@@ -834,7 +906,26 @@ struct Buffers {
     wd: Vec<f32>,
     inv_a: Vec<f32>,
     c: Vec<f32>,
+    // Occlusion test: nearest D per right-image pixel, and each left pixel's
+    // right-image pixel.
     zbuf: Vec<f32>,
+    target: Vec<usize>,
+    // Coarse fallback: each coarser level's validated depth (indexed by
+    // level), the integral image of cells a finer measurement disagrees
+    // with, and the level each finest pixel's estimate comes from.
+    coarse: Vec<LevelDepth>,
+    disagree: Vec<u32>,
+    source: Vec<u8>,
+}
+
+/// A coarser level's depth after validation, for the coarse fallback.
+#[derive(Default)]
+struct LevelDepth {
+    w: usize,
+    h: usize,
+    d: Vec<f32>,
+    var: Vec<f32>,
+    valid: Vec<bool>,
 }
 
 /// Dense stereo depth for a calibrated rig.
@@ -922,6 +1013,7 @@ impl DenseStereo {
             level: 0,
             log_range: Vec::new(),
             variance: Vec::new(),
+            source_level: Vec::new(),
         };
         self.compute_into(left, right, &mut out);
         out
@@ -937,6 +1029,8 @@ impl DenseStereo {
             .build_reuse(right, n_levels, &mut self.pyr_scratch);
 
         let finest = self.config.finest_level;
+        // Levels the coarse fallback takes depth from: finest+1..=fallback.
+        let fallback = self.last_validated_level();
         for level in (finest..=self.coarsest).rev() {
             self.prepare_level(level);
             if level == self.coarsest {
@@ -945,10 +1039,25 @@ impl DenseStereo {
                 self.upsample_init(level);
             }
             self.propagate(level);
-            self.densify(level, level == finest);
+            let validate = level <= fallback;
+            self.densify(level, validate);
             self.refine_variational(level);
+            if validate {
+                self.mask(level);
+            }
+            if level > finest && level <= fallback {
+                self.keep_level(level);
+            }
         }
+        self.coarse_fallback();
+        self.reject_contradicted_fills();
         self.finish(out);
+    }
+
+    /// The coarsest level whose patches are validated: the finest, and the
+    /// coarse fallback's.
+    fn last_validated_level(&self) -> usize {
+        (self.config.finest_level + self.config.coarse_fallback).min(self.coarsest)
     }
 
     // The per-level stages run once per level; kept out of line so profiles
@@ -957,32 +1066,13 @@ impl DenseStereo {
     fn prepare_level(&mut self, level: usize) {
         let g = self.levels[level].as_ref().unwrap();
         let (w, h) = (g.w, g.h);
+        let (psz, st) = (self.config.patch_size, self.config.patch_stride);
         let b = &mut self.buf;
         copy_level(self.pyr0.level(level), &mut b.i0);
         diff_x(&b.i0, w, h, &mut b.gx);
         diff_y(&b.i0, w, h, &mut b.gy);
-        self.i1
-            .fill(self.pyr1.level(level), self.config.patch_size + 2);
-
-        let psz = self.config.patch_size;
-        let st = self.config.patch_stride;
-        b.sums.clear();
-        for is in 0..g.hs {
-            for js in 0..g.ws {
-                let mut s = PatchSums::default();
-                for y in is * st..is * st + psz {
-                    for x in js * st..js * st + psz {
-                        let (gx, gy) = (b.gx[y * w + x], b.gy[y * w + x]);
-                        s.xx += gx * gx;
-                        s.xy += gx * gy;
-                        s.yy += gy * gy;
-                        s.x += gx;
-                        s.y += gy;
-                    }
-                }
-                b.sums.push(s);
-            }
-        }
+        self.i1.fill(self.pyr1.level(level), psz + 2);
+        patch_sums(&b.gx, &b.gy, g, psz, st, &mut b.sums);
     }
 
     fn view(&self, level: usize) -> LevelView<'_> {
@@ -1087,10 +1177,11 @@ impl DenseStereo {
         self.buf.patches = patches;
     }
 
-    /// Dense D from the patches. At the finest level, also which pixels a
-    /// valid patch covers and their variance.
+    /// Dense D from the patches. With `validate` (the finest level, and every
+    /// level for the coarse fallback), also which pixels a valid patch covers
+    /// and their variance.
     #[inline(never)]
-    fn densify(&mut self, level: usize, finest: bool) {
+    fn densify(&mut self, level: usize, validate: bool) {
         let mut d = std::mem::take(&mut self.buf.d);
         let mut valid = std::mem::take(&mut self.buf.valid);
         let mut var = std::mem::take(&mut self.buf.var);
@@ -1117,11 +1208,15 @@ impl DenseStereo {
             p.hess.max(1e-6) / sigma2
         }));
         valid_patch.clear();
-        valid_patch.extend(
-            patches
-                .iter()
-                .map(|p| p.ok && p.inside && p.hess >= min_hess && p.ssd <= max_ssd),
-        );
+        let min_rise = DISTINCT_RISE * min_hess * DISTINCT_STEP * DISTINCT_STEP;
+        valid_patch.extend(patches.iter().enumerate().map(|(k, p)| {
+            if !(p.ok && p.inside && p.hess >= min_hess && p.ssd <= max_ssd) {
+                return false;
+            }
+            // Distinctness, where validity counts (header, step 5).
+            let rise = |d: f32| v.eval::<false>(k, d).map_or(0.0, |e| e.ssd - p.ssd);
+            !validate || rise(p.d - DISTINCT_STEP).min(rise(p.d + DISTINCT_STEP)) >= min_rise
+        }));
         // Pixels using a patch: its footprint, extended to the image's far
         // edge for the last row and column of patches.
         samplers.clear();
@@ -1147,7 +1242,7 @@ impl DenseStereo {
         }));
 
         d.resize(w * h, 0.0);
-        if finest {
+        if validate {
             valid.clear();
             valid.resize(w * h, false);
             var.clear();
@@ -1197,7 +1292,7 @@ impl DenseStereo {
                         let wk = photo * precision[k];
                         sw += wk;
                         swd += wk * patches[k].d;
-                        if finest && valid_patch[k] && nc < MAX_COVER {
+                        if validate && valid_patch[k] && nc < MAX_COVER {
                             cand[nc] = (k, wk);
                             nc += 1;
                         }
@@ -1471,7 +1566,7 @@ impl DenseStereo {
             }
         }
         // The refinement's own change counts towards the variance.
-        let var = masked && !b.var.is_empty();
+        let var = b.var.len() == n;
         for y in 0..h {
             for x in 0..w {
                 let i = y * w + x;
@@ -1484,10 +1579,10 @@ impl DenseStereo {
         }
     }
 
-    /// Mask, occlusion test and conversion to log-range at the finest level.
+    /// Clamp D to the searched range, and drop occluded pixels and speckles
+    /// from `valid`.
     #[inline(never)]
-    fn finish(&mut self, out: &mut DenseDepth) {
-        let level = self.config.finest_level;
+    fn mask(&mut self, level: usize) {
         let g = self.levels[level].as_ref().unwrap();
         let (w, h) = (g.w, g.h);
         let n = w * h;
@@ -1498,7 +1593,6 @@ impl DenseStereo {
             b.d[i] = b.d[i].clamp(dmin, dmax);
         }
 
-        let mut visible = vec![true; n];
         if self.config.occlusion_check {
             // Forward-warp D into the right image, keep the nearest (largest
             // D) per right pixel, and drop left pixels that lost by more than
@@ -1506,7 +1600,8 @@ impl DenseStereo {
             const MARGIN: f32 = 1.0;
             b.zbuf.clear();
             b.zbuf.resize(n, f32::NEG_INFINITY);
-            let mut target = vec![usize::MAX; n];
+            b.target.clear();
+            b.target.resize(n, usize::MAX);
             for y in 0..h {
                 for x in 0..w {
                     let i = y * w + x;
@@ -1517,32 +1612,210 @@ impl DenseStereo {
                         let (qx, qy) = (loc[0].round(), loc[1].round());
                         if qx >= 0.0 && qy >= 0.0 && qx < w as f32 && qy < h as f32 {
                             let q = qy as usize * w + qx as usize;
-                            target[i] = q;
+                            b.target[i] = q;
                             b.zbuf[q] = b.zbuf[q].max(b.d[i]);
                         }
                     }
                 }
             }
             for i in 0..n {
-                if target[i] != usize::MAX && b.zbuf[target[i]] > b.d[i] + MARGIN {
-                    visible[i] = false;
+                let q = b.target[i];
+                if q != usize::MAX && b.zbuf[q] > b.d[i] + MARGIN {
+                    b.valid[i] = false;
                 }
             }
         }
 
-        let mut keep: Vec<bool> = (0..n).map(|i| b.valid[i] && visible[i]).collect();
-        if self.config.speckle_size > 0 {
-            remove_speckles(&mut keep, &b.d, w, h, self.config.speckle_size);
+        // The size is in finest-level pixels: a quarter per level coarser.
+        let speckle = self.config.speckle_size >> (2 * (level - self.config.finest_level));
+        if speckle > 0 {
+            remove_speckles(&mut b.valid, &b.d, w, h, speckle);
         }
+    }
 
+    /// Keep a coarser level's validated depth for the coarse fallback.
+    fn keep_level(&mut self, level: usize) {
+        let g = self.levels[level].as_ref().unwrap();
+        let b = &mut self.buf;
+        if b.coarse.len() <= level {
+            b.coarse.resize_with(level + 1, LevelDepth::default);
+        }
+        let c = &mut b.coarse[level];
+        (c.w, c.h) = (g.w, g.h);
+        c.d.clone_from(&b.d);
+        c.var.clone_from(&b.var);
+        c.valid.clone_from(&b.valid);
+    }
+
+    /// Fill finest-level pixels without a valid estimate from the nearest
+    /// coarser level that has one, finest first. A coarse estimate is used
+    /// only if every finest-level measurement within its support (the
+    /// patches over its cell) agrees with it: a coarse patch over a depth
+    /// edge may have matched the far surface while the near one is
+    /// textureless (a white box before a textured wall), and filling the box
+    /// with the wall's depth would hide it.
+    #[inline(never)]
+    fn coarse_fallback(&mut self) {
+        let finest = self.config.finest_level;
+        let g = self.levels[finest].as_ref().unwrap();
+        let (w, h) = (g.w, g.h);
+        let reach = self.config.patch_size - 1;
+        let b = &mut self.buf;
+        b.source.clear();
+        b.source.extend(
+            b.valid
+                .iter()
+                .map(|&v| if v { finest as u8 } else { NO_SOURCE }),
+        );
+        let fallback = (finest + self.config.coarse_fallback).min(self.coarsest);
+        for level in finest + 1..=fallback {
+            let k = level - finest;
+            let f = (1usize << k) as f32;
+            let c = &b.coarse[level];
+            let (cw, ch) = (c.w, c.h);
+            // Finest pixel x is coarse pixel x / 2^k: its nearest cell.
+            let cell = |x: usize, y: usize| {
+                let half = 1usize << (k - 1);
+                (((y + half) >> k).min(ch - 1), ((x + half) >> k).min(cw - 1))
+            };
+            // Count the disagreeing measurements per cell, then integrate:
+            // cell (cx, cy) counts at (cx + 1, cy + 1).
+            let iw = cw + 1;
+            b.disagree.clear();
+            b.disagree.resize(iw * (ch + 1), 0);
+            for y in 0..h {
+                for x in 0..w {
+                    let i = y * w + x;
+                    let (cy, cx) = cell(x, y);
+                    let j = cy * cw + cx;
+                    if !b.valid[i] || !c.valid[j] {
+                        continue;
+                    }
+                    let (df, dc) = (b.d[i], f * c.d[j]);
+                    if (df - dc).abs() > DISAGREE.max(FALLBACK_AGREE * df) {
+                        b.disagree[(cy + 1) * iw + cx + 1] += 1;
+                    }
+                }
+            }
+            for cy in 1..=ch {
+                for cx in 1..=cw {
+                    let p = cy * iw + cx;
+                    b.disagree[p] = b.disagree[p] + b.disagree[p - 1] + b.disagree[p - iw]
+                        - b.disagree[p - iw - 1];
+                }
+            }
+            let ii = &b.disagree;
+            for y in 0..h {
+                for x in 0..w {
+                    let i = y * w + x;
+                    if b.source[i] != NO_SOURCE {
+                        continue;
+                    }
+                    let (cy, cx) = cell(x, y);
+                    let j = cy * cw + cx;
+                    if !c.valid[j] {
+                        continue;
+                    }
+                    let (x0, x1) = (cx.saturating_sub(reach), (cx + reach + 1).min(cw));
+                    let (y0, y1) = (cy.saturating_sub(reach), (cy + reach + 1).min(ch));
+                    if ii[y1 * iw + x1] + ii[y0 * iw + x0] > ii[y0 * iw + x1] + ii[y1 * iw + x0] {
+                        continue;
+                    }
+                    b.d[i] = f * c.d[j];
+                    b.var[i] = f * f * c.var[j];
+                    b.source[i] = level as u8;
+                }
+            }
+        }
+    }
+
+    /// A textureless region matches the right image at many depths, but not
+    /// at its outline: filled with the wall's depth, a textureless box
+    /// before the wall lands on the wall's texture along one side, a strip as
+    /// wide as the disparity error. Disparity moves pixels along the
+    /// epipolar line, so the test runs along it: along each image row (the
+    /// epipolar line of a rectified pair, close to it for a side-by-side
+    /// rig), a fill is dropped if its own pixel, or either end of its
+    /// textureless run (FLAT_GRADIENT; FLAT_END_MARGIN inside, at the fill's
+    /// D give or take half a pixel of its level), differs from the right
+    /// image by more than `max_residual`, or the right image does not see it.
+    #[inline(never)]
+    fn reject_contradicted_fills(&mut self) {
+        if self.config.coarse_fallback == 0 {
+            return;
+        }
+        let finest = self.config.finest_level;
+        let g = self.levels[finest].as_ref().unwrap();
+        let (w, h) = (g.w, g.h);
+        let max_residual = self.config.max_residual;
+        let flat_gradient = FLAT_GRADIENT * self.config.min_texture;
+        let (epi, i1) = (&self.epi, &self.i1);
+        let b = &mut self.buf;
+        let (i0, gx) = (&b.i0, &b.gx);
+        let filled = |src: u8| src != NO_SOURCE && src as usize != finest;
+        // Right-image grey at pixel (x, y) seen at D, if inside the image.
+        let seen_at = |x: usize, y: usize, d: f32| -> Option<f32> {
+            let loc = epi.locate(g, g.rays[y * w + x], x as f32, y as f32, d)?;
+            let inside = loc[0] >= 0.0
+                && loc[1] >= 0.0
+                && loc[0] <= (w - 1) as f32
+                && loc[1] <= (h - 1) as f32;
+            inside.then(|| i1.sample(loc[0], loc[1]))
+        };
+        let agrees = |x: usize, y: usize, d: f32| {
+            seen_at(x, y, d).is_some_and(|v| (v - i0[y * w + x]).abs() <= max_residual)
+        };
+        for y in 0..h {
+            let row = y * w;
+            let mut x = 0;
+            while x < w {
+                // The next run: textureless pixels, or a single textured one.
+                let first = x;
+                let flat = gx[row + x].abs() < flat_gradient;
+                x += 1;
+                while flat && x < w && gx[row + x].abs() < flat_gradient {
+                    x += 1;
+                }
+                let last = x - 1;
+                let m = FLAT_END_MARGIN.min((last - first) / 2);
+                for xx in first..=last {
+                    let src = b.source[row + xx];
+                    if !filled(src) {
+                        continue;
+                    }
+                    let d = b.d[row + xx];
+                    let half = 0.5 * (1usize << (src as usize - finest)) as f32;
+                    // An end at the image border meets no texture.
+                    let end = |xe: usize, border: bool| {
+                        border || [d, d - half, d + half].iter().any(|&dd| agrees(xe, y, dd))
+                    };
+                    let ok = agrees(xx, y, d)
+                        && (!flat || (end(first + m, first == 0) && end(last - m, last == w - 1)));
+                    if !ok {
+                        b.source[row + xx] = NO_SOURCE;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Conversion to log-range at the finest level.
+    #[inline(never)]
+    fn finish(&mut self, out: &mut DenseDepth) {
+        let level = self.config.finest_level;
+        let g = self.levels[level].as_ref().unwrap();
+        let n = g.w * g.h;
+        let b = &self.buf;
         let ln_s = (g.s as f32).ln();
-        out.width = w;
-        out.height = h;
+        out.width = g.w;
+        out.height = g.h;
         out.level = level;
         out.log_range.resize(n, f32::NAN);
         out.variance.resize(n, f32::NAN);
+        out.source_level.clear();
+        out.source_level.extend_from_slice(&b.source);
         for i in 0..n {
-            if keep[i] {
+            if b.source[i] != NO_SOURCE {
                 let d = b.d[i];
                 out.log_range[i] = ln_s - d.ln();
                 out.variance[i] = b.var[i] / (d * d);

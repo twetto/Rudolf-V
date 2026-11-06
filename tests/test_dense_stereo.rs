@@ -492,6 +492,20 @@ fn occluding_box() {
     );
 }
 
+/// Pixels within `margin` of the flat rectangle's interior on a wall facing
+/// the camera at `z` (map pixels, rectified_rig).
+fn flat_interior(
+    depth: &DenseDepth,
+    z: f64,
+    half: [f64; 2],
+    margin: f64,
+) -> impl Fn(usize, usize) -> bool {
+    let s = (1usize << depth.level) as f64;
+    let (cx, cy) = (319.5 / s, 239.5 / s);
+    let (hx, hy) = (half[0] * 500.0 / z / s, half[1] * 500.0 / z / s);
+    move |x, y| (x as f64 - cx).abs() < hx - margin && (y as f64 - cy).abs() < hy - margin
+}
+
 #[test]
 fn textureless_wall_has_no_depth() {
     let rig = rectified_rig();
@@ -499,27 +513,101 @@ fn textureless_wall_has_no_depth() {
     // A 1.2 m × 1.0 m flat rectangle in the middle of the view.
     wall.flat = Some(([-0.6, 0.6, -0.5, 0.5], 140.0));
     let scene = [wall];
-    let (depth, _) = run(&rig, &scene, DenseStereoConfig::default());
+    let strict = DenseStereoConfig {
+        coarse_fallback: 0,
+        ..Default::default()
+    };
+    let (depth, gt) = run(&rig, &scene, strict);
+    // 0.6 m at 2 m is 150 px at full size, 75 at level 1; 10 px is the patch
+    // side and densification overlap at this level.
+    let inside = flat_interior(&depth, 2.0, [0.6, 0.5], 10.0);
     let (w, h) = (depth.width, depth.height);
-    // The rectangle in the map: 0.6 m at 2 m is 150 px at full size, 75 at level 1.
-    let s = (1usize << depth.level) as f64;
-    let (cx, cy) = (319.5 / s, 239.5 / s);
-    let (hx, hy) = (0.6 * 500.0 / 2.0 / s, 0.5 * 500.0 / 2.0 / s);
-    let reach = 10.0; // patch side and densification overlap at this level
-    let mut inside = 0usize;
+    let mut n = 0usize;
     let mut with_depth = 0usize;
     for y in 0..h {
         for x in 0..w {
-            let (dx, dy) = ((x as f64 - cx).abs(), (y as f64 - cy).abs());
-            if dx < hx - reach && dy < hy - reach {
-                inside += 1;
+            if inside(x, y) {
+                n += 1;
                 with_depth += depth.log_range[y * w + x].is_finite() as usize;
             }
         }
     }
-    eprintln!("flat rectangle: {with_depth} of {inside} pixels have depth");
-    assert!(inside > 1000);
+    eprintln!("flat rectangle, finest level only: {with_depth} of {n} pixels have depth");
+    assert!(n > 1000);
     assert_eq!(with_depth, 0, "depth invented on a textureless wall");
+
+    // The coarse fallback may fill it from coarser patches that reach its
+    // textured surroundings: then with the wall's depth, and less certain
+    // than the measured wall around it.
+    let (depth, _) = run(&rig, &scene, DenseStereoConfig::default());
+    let (mut filled, mut wrong, mut var_filled, mut var_measured, mut measured) =
+        (0usize, 0usize, 0.0f64, 0.0f64, 0usize);
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            let e = depth.log_range[i];
+            if !e.is_finite() {
+                continue;
+            }
+            if inside(x, y) {
+                filled += 1;
+                wrong += ((e - gt[i]).abs() > 0.1f32.ln_1p()) as usize;
+                var_filled += depth.variance[i] as f64;
+                assert!(depth.source_level[i] as usize > depth.level);
+            } else if depth.source_level[i] as usize == depth.level {
+                measured += 1;
+                var_measured += depth.variance[i] as f64;
+            }
+        }
+    }
+    let (var_filled, var_measured) = (
+        var_filled / filled.max(1) as f64,
+        var_measured / measured as f64,
+    );
+    eprintln!(
+        "flat rectangle, coarse fallback: {filled} of {n} pixels, {wrong} off by over 10 %; \
+         variance {var_filled:.2e} vs {var_measured:.2e} measured"
+    );
+    assert_eq!(
+        wrong, 0,
+        "the fallback filled the rectangle with a wrong depth"
+    );
+    assert!(filled == 0 || var_filled > var_measured);
+}
+
+#[test]
+fn textureless_box_keeps_its_own_depth() {
+    // A box at 1 m without any texture before a textured wall at 3 m. Coarse
+    // patches over its outline see mostly the wall and may match it: the
+    // fallback must not fill the box with the wall's depth (an obstacle
+    // would vanish).
+    let rig = rectified_rig();
+    let mut white = Plane::facing(1.0, 0.25, noise(9));
+    white.flat = Some(([-1.0, 1.0, -1.0, 1.0], 215.0));
+    let scene = [white, Plane::facing(3.0, 10.0, noise(10))];
+    let (depth, gt) = run(&rig, &scene, DenseStereoConfig::default());
+    // The box's interior, a patch side in from its outline: patches over the
+    // outline match the wall and carry its depth that far in.
+    let inside = flat_interior(&depth, 1.0, [0.25, 0.25], 8.0);
+    let (w, h) = (depth.width, depth.height);
+    let (mut n, mut with_depth, mut wrong) = (0usize, 0usize, 0usize);
+    for y in 0..h {
+        for x in 0..w {
+            if !inside(x, y) {
+                continue;
+            }
+            let i = y * w + x;
+            n += 1;
+            let e = depth.log_range[i];
+            if e.is_finite() {
+                with_depth += 1;
+                wrong += ((e - gt[i]).abs() > 0.1) as usize;
+            }
+        }
+    }
+    eprintln!("textureless box: {with_depth} of {n} pixels have depth, {wrong} not the box's");
+    assert!(n > 5000);
+    assert_eq!(wrong, 0, "the textureless box took another surface's depth");
 }
 
 #[test]

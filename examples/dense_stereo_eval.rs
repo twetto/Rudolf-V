@@ -7,11 +7,14 @@
 //
 // Options:
 //   --frames a:b:s   frames a..b, every s-th            (default: all)
-//   --level L        finest pyramid level                (default: 1)
+//   --level L        finest pyramid level                (default: 0.5)
 //   --vr N           variational fixed-point iterations  (default: 5)
 //   --edge S         edge-aware smoothness, grey/px      (default: 0, off)
 //   --speckle N      drop depth regions under N pixels   (default: 100)
-//   --out DIR        write <stem>.logr (f32 log-range, little-endian, row-major) and
+//   --fallback N     coarser levels the fallback may fill from, 0 = off (default: 2)
+//   --min-texture T  patch texture threshold, grey levels per pixel        (default: 0.5)
+//   --out DIR        write <stem>.logr (f32 log-range, little-endian, row-major),
+//                    <stem>.src (u8 source level per pixel, 255 = none) and
 //                    <stem>.png (left image | range, 0.3 m red .. 6 m blue, none black)
 //
 // One JSON line per frame (file stem, milliseconds, coverage), a summary on stderr.
@@ -77,6 +80,7 @@ fn write_outputs(out: &Path, stem: &str, left: &Image<u8>, depth: &DenseDepth) {
         .flat_map(|v| v.to_le_bytes())
         .collect();
     std::fs::write(out.join(format!("{stem}.logr")), bytes).expect("write .logr");
+    std::fs::write(out.join(format!("{stem}.src")), &depth.source_level).expect("write .src");
 
     let (w, h) = (depth.width, depth.height);
     let s = 1usize << depth.level;
@@ -108,6 +112,8 @@ fn main() {
     let vr: usize = take("--vr").map_or(5, |v| v.parse().expect("--vr"));
     let edge: f32 = take("--edge").map_or(0.0, |v| v.parse().expect("--edge"));
     let speckle: Option<usize> = take("--speckle").map(|v| v.parse().expect("--speckle"));
+    let fallback: Option<usize> = take("--fallback").map(|v| v.parse().expect("--fallback"));
+    let min_texture: Option<f32> = take("--min-texture").map(|v| v.parse().expect("--min-texture"));
     let out = take("--out").map(PathBuf::from);
     let dir = PathBuf::from(
         args.first()
@@ -154,6 +160,8 @@ fn main() {
     };
     let config = DenseStereoConfig {
         speckle_size: speckle.unwrap_or(config.speckle_size),
+        coarse_fallback: fallback.unwrap_or(config.coarse_fallback),
+        min_texture: min_texture.unwrap_or(config.min_texture),
         ..config
     };
     let mut stereo = DenseStereo::new(rig, config);
