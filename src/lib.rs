@@ -8,6 +8,7 @@ pub mod camera;
 pub mod checkerboard;
 pub mod convert;
 pub mod convolution;
+pub mod dense_stereo;
 pub mod essential;
 pub mod fast;
 pub mod frontend;
