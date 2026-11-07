@@ -28,7 +28,9 @@
 # for samply's source lines. RV_CROSS_HOST overrides the ssh host.
 #
 # Needs: rustup target add aarch64-unknown-linux-gnu; cargo install
-# cargo-zigbuild; zig and llvm-strip on PATH.
+# cargo-zigbuild (0.24 or newer with Rust 1.99: older ones reject the
+# --fix-cortex-a53-843419 linker flag rustc now passes); zig and llvm-strip
+# on PATH.
 set -euo pipefail
 
 # One shared ssh connection for every copy and run: the Pi's ufw rate-limits

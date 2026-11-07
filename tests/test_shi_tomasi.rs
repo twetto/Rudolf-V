@@ -10,7 +10,7 @@ fn make_checkerboard(img_size: usize, cell_size: usize, lo: u8, hi: u8) -> Image
         for x in 0..img_size {
             let cx = x / cell_size;
             let cy = y / cell_size;
-            img.set(x, y, if (cx + cy) % 2 == 0 { lo } else { hi });
+            img.set(x, y, if (cx + cy).is_multiple_of(2) { lo } else { hi });
         }
     }
     img

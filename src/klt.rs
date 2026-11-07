@@ -291,6 +291,7 @@ impl KltTracker {
         curr_pyramid: &Pyramid,
         features: &[Feature],
         results: &mut Vec<TrackedFeature>,
+        #[cfg_attr(feature = "parallel", allow(unused_variables))] // sequential path only
         scratch: &mut KltScratch,
     ) {
         let num_levels = self
@@ -329,7 +330,6 @@ impl KltTracker {
                 )
                 .collect();
             *results = par_results;
-            return;
         }
 
         // ── Sequential path ─────────────────────────────────────────────
@@ -771,8 +771,8 @@ impl KltTracker {
             // image value doesn't affect the result, but the read must be valid).
             let warp_in_bounds = bx_i >= 0
                 && by_i >= 0
-                && bx_i + stride as isize + 1 <= curr_img.width() as isize
-                && by_i + side + 1 <= curr_img.height() as isize;
+                && bx_i + (stride as isize) < curr_img.width() as isize
+                && by_i + side < curr_img.height() as isize;
 
             let mut b0 = 0.0f32;
             let mut b1 = 0.0f32;
@@ -1069,8 +1069,8 @@ impl KltTracker {
 
             let warp_in_bounds = bx_i >= 0
                 && by_i >= 0
-                && bx_i + side + 1 <= curr_img.width() as isize
-                && by_i + side + 1 <= curr_img.height() as isize;
+                && bx_i + side < curr_img.width() as isize
+                && by_i + side < curr_img.height() as isize;
 
             let mut b0 = 0i32;
             let mut b1 = 0i32;
@@ -1284,8 +1284,8 @@ impl KltTracker {
 
             let warp_in_bounds = bx_i >= 0
                 && by_i >= 0
-                && bx_i + stride as isize + 1 <= curr_img.width() as isize
-                && by_i + side + 1 <= curr_img.height() as isize;
+                && bx_i + (stride as isize) < curr_img.width() as isize
+                && by_i + side < curr_img.height() as isize;
 
             let mut b0 = 0i32;
             let mut b1 = 0i32;
@@ -1495,9 +1495,9 @@ unsafe fn extract_template_gradients(
     }
     #[cfg(target_arch = "aarch64")]
     {
-        return extract_template_gradients_neon(
+        extract_template_gradients_neon(
             r_m1, r_0, r_1, r_p2, bx, count, w00, w10, w01, w11, t_out, gx_out, gy_out,
-        );
+        )
     }
     #[cfg(not(target_arch = "aarch64"))]
     extract_template_gradients_scalar(
@@ -1792,48 +1792,6 @@ unsafe fn warp_and_accumulate_fixed(
     }
 }
 
-/// Fixed-point IC accumulation: b0 = Σ gx·(t-w), b1 = Σ gy·(t-w).
-///
-/// All inputs are i16, accumulates in i32.
-/// AVX2: _mm256_madd_epi16 processes 16 i16 elements → 8 i32 per cycle.
-/// NEON: vmull_s16/vaddq_s32 processes 4 i16 → 4 i32 per instruction.
-#[inline]
-fn accumulate_ic_fixed(t: &[i16], w: &[i16], gx: &[i16], gy: &[i16]) -> (i32, i32) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx2") {
-            return unsafe { accumulate_ic_fixed_avx2(t, w, gx, gy) };
-        }
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        return unsafe { accumulate_ic_fixed_neon(t, w, gx, gy) };
-    }
-    #[allow(unreachable_code)]
-    accumulate_ic_fixed_scalar(t, w, gx, gy)
-}
-
-/// Scalar fixed-point IC accumulation.
-#[inline]
-fn accumulate_ic_fixed_scalar(t: &[i16], w: &[i16], gx: &[i16], gy: &[i16]) -> (i32, i32) {
-    debug_assert_eq!(t.len(), w.len());
-    debug_assert_eq!(t.len(), gx.len());
-    debug_assert_eq!(t.len(), gy.len());
-
-    let mut b0 = 0i32;
-    let mut b1 = 0i32;
-
-    for i in 0..t.len() {
-        unsafe {
-            let e = *t.get_unchecked(i) as i32 - *w.get_unchecked(i) as i32;
-            b0 += *gx.get_unchecked(i) as i32 * e;
-            b1 += *gy.get_unchecked(i) as i32 * e;
-        }
-    }
-
-    (b0, b1)
-}
-
 // ==========================================================================
 // AVX2 fixed-point implementations (_mm256_madd_epi16)
 //
@@ -2100,56 +2058,6 @@ unsafe fn extract_template_gradients_fixed_u8_scalar(
         h11 += gy as i32 * gy as i32;
     }
     (h00, h01, h11)
-}
-
-/// AVX2 fixed-point IC accumulation.
-///
-/// For 529 elements (23×23 patch): 33 full iterations (16 elements each)
-/// + 1-element scalar tail. Each iteration: 1 sub + 2 madd + 2 add = 5 ops.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn accumulate_ic_fixed_avx2(t: &[i16], w: &[i16], gx: &[i16], gy: &[i16]) -> (i32, i32) {
-    use std::arch::x86_64::*;
-
-    let n = t.len();
-    let chunks = n / 16;
-
-    let mut sum_b0 = _mm256_setzero_si256();
-    let mut sum_b1 = _mm256_setzero_si256();
-
-    let t_ptr = t.as_ptr();
-    let w_ptr = w.as_ptr();
-    let gx_ptr = gx.as_ptr();
-    let gy_ptr = gy.as_ptr();
-
-    for i in 0..chunks {
-        let off = i * 16;
-        // Load 16 i16 values each.
-        let vt = _mm256_loadu_si256(t_ptr.add(off) as *const __m256i);
-        let vw = _mm256_loadu_si256(w_ptr.add(off) as *const __m256i);
-        let ve = _mm256_sub_epi16(vt, vw); // e = t - w (i16)
-
-        let vgx = _mm256_loadu_si256(gx_ptr.add(off) as *const __m256i);
-        let vgy = _mm256_loadu_si256(gy_ptr.add(off) as *const __m256i);
-
-        // madd: pairs of i16 × i16 → i32, then adjacent pairs summed.
-        // result[k] = gx[2k]*e[2k] + gx[2k+1]*e[2k+1]
-        sum_b0 = _mm256_add_epi32(sum_b0, _mm256_madd_epi16(vgx, ve));
-        sum_b1 = _mm256_add_epi32(sum_b1, _mm256_madd_epi16(vgy, ve));
-    }
-
-    // Horizontal sum of 8 i32 lanes.
-    let mut b0 = hsum256_epi32(sum_b0);
-    let mut b1 = hsum256_epi32(sum_b1);
-
-    // Scalar tail.
-    for i in (chunks * 16)..n {
-        let e = *t_ptr.add(i) as i32 - *w_ptr.add(i) as i32;
-        b0 += *gx_ptr.add(i) as i32 * e;
-        b1 += *gy_ptr.add(i) as i32 * e;
-    }
-
-    (b0, b1)
 }
 
 /// Horizontal sum of 8 i32 lanes in a __m256i → single i32.
@@ -2443,70 +2351,6 @@ unsafe fn ic_iterate_patch_neon(
     }
 
     (vaddvq_f32(v_b0), vaddvq_f32(v_b1))
-}
-
-// ==========================================================================
-// NEON fixed-point implementations (aarch64 — RPi 4, Apple Silicon)
-//
-// vmull_s16: 4 × (i16 × i16 → i32) — widening multiply.
-// vmlal_s16: fused multiply-accumulate long — same but adds to accumulator.
-// vaddq_s32: 4 × i32 add.
-//
-// NEON is 128-bit, so processes 8 i16 per load but only 4 per multiply
-// (widening from 64→128 bits). Use high/low halves explicitly.
-// ==========================================================================
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn accumulate_ic_fixed_neon(t: &[i16], w: &[i16], gx: &[i16], gy: &[i16]) -> (i32, i32) {
-    use std::arch::aarch64::*;
-
-    let n = t.len();
-    let chunks = n / 8; // Process 8 i16 per iteration (two vmull/vmlal pairs).
-
-    let mut sum_b0 = vdupq_n_s32(0);
-    let mut sum_b1 = vdupq_n_s32(0);
-
-    let t_ptr = t.as_ptr();
-    let w_ptr = w.as_ptr();
-    let gx_ptr = gx.as_ptr();
-    let gy_ptr = gy.as_ptr();
-
-    for i in 0..chunks {
-        let off = i * 8;
-
-        // Load 8 i16 values.
-        let vt = vld1q_s16(t_ptr.add(off));
-        let vw = vld1q_s16(w_ptr.add(off));
-        let ve = vsubq_s16(vt, vw); // e = t - w (i16)
-
-        let vgx = vld1q_s16(gx_ptr.add(off));
-        let vgy = vld1q_s16(gy_ptr.add(off));
-
-        // Low 4 elements: widening multiply-accumulate.
-        let e_lo = vget_low_s16(ve);
-        let e_hi = vget_high_s16(ve);
-        let gx_lo = vget_low_s16(vgx);
-        let gx_hi = vget_high_s16(vgx);
-        let gy_lo = vget_low_s16(vgy);
-        let gy_hi = vget_high_s16(vgy);
-
-        sum_b0 = vmlal_s16(sum_b0, gx_lo, e_lo); // b0 += gx[0..4] * e[0..4]
-        sum_b0 = vmlal_s16(sum_b0, gx_hi, e_hi); // b0 += gx[4..8] * e[4..8]
-        sum_b1 = vmlal_s16(sum_b1, gy_lo, e_lo);
-        sum_b1 = vmlal_s16(sum_b1, gy_hi, e_hi);
-    }
-
-    let mut b0 = vaddvq_s32(sum_b0);
-    let mut b1 = vaddvq_s32(sum_b1);
-
-    for i in (chunks * 8)..n {
-        let e = *t_ptr.add(i) as i32 - *w_ptr.add(i) as i32;
-        b0 += *gx_ptr.add(i) as i32 * e;
-        b1 += *gy_ptr.add(i) as i32 * e;
-    }
-
-    (b0, b1)
 }
 
 // ==========================================================================
@@ -3205,37 +3049,6 @@ mod tests {
             (ic_dy - fx_dy).abs() < 1.5,
             "IC vs Fixed dy: {ic_dy:.2} vs {fx_dy:.2}"
         );
-    }
-
-    #[test]
-    fn test_fixed_accumulate_matches_scalar() {
-        let n = 529;
-        let t: Vec<i16> = (0..n).map(|i| (i % 256) as i16).collect();
-        let w: Vec<i16> = (0..n).map(|i| ((i + 1) % 256) as i16).collect();
-        let gx: Vec<i16> = (0..n).map(|i| ((i * 7) as f32).sin() as i16).collect();
-        let gy: Vec<i16> = (0..n).map(|i| ((i * 13) as f32).cos() as i16).collect();
-
-        let (b0, b1) = accumulate_ic_fixed_scalar(&t, &w, &gx, &gy);
-        let (d_b0, d_b1) = accumulate_ic_fixed(&t, &w, &gx, &gy);
-
-        assert_eq!(b0, d_b0, "fixed accumulate b0 mismatch");
-        assert_eq!(b1, d_b1, "fixed accumulate b1 mismatch");
-    }
-
-    #[test]
-    fn test_fixed_accumulate_odd_length() {
-        // Non-multiple-of-16 length to test tail handling.
-        let n = 37; // 37 = 2 chunks of 16 + 5 tail
-        let t: Vec<i16> = (0..n).map(|i| (i % 128) as i16).collect();
-        let w: Vec<i16> = (0..n).map(|i| ((i + 3) % 128) as i16).collect();
-        let gx: Vec<i16> = (0..n).map(|i| (i * 2 - 37) as i16).collect();
-        let gy: Vec<i16> = (0..n).map(|i| (i * 3 - 50) as i16).collect();
-
-        let (s_b0, s_b1) = accumulate_ic_fixed_scalar(&t, &w, &gx, &gy);
-        let (d_b0, d_b1) = accumulate_ic_fixed(&t, &w, &gx, &gy);
-
-        assert_eq!(s_b0, d_b0, "fixed odd len b0 mismatch");
-        assert_eq!(s_b1, d_b1, "fixed odd len b1 mismatch");
     }
 
     // ===== u8 bilinear path tests =====

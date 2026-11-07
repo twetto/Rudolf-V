@@ -617,7 +617,7 @@ impl GpuFrontend {
         } else {
             Vec::new()
         };
-        let mut tracking = false;
+        let tracking;
         let mut separate_pyr = None;
 
         if fused {
@@ -1316,7 +1316,7 @@ mod tests {
         let mut fe = GpuFrontend::new(&gpu, config, 160, 120);
 
         let (features, stats) = fe.process(&gpu, &img);
-        assert!(features.len() > 0, "first frame should detect features");
+        assert!(!features.is_empty(), "first frame should detect features");
         assert_eq!(stats.tracked, 0, "nothing to track on first frame");
         assert!(stats.new_detections > 0);
         assert_eq!(stats.total, features.len());
@@ -1794,9 +1794,7 @@ mod gpu_clahe_bench {
                     })
                     .collect()
             }
-            Err(_) => (0..40)
-                .map(|i| moving_scene_pub(w, h, i as i32 * 2, i as i32))
-                .collect(),
+            Err(_) => (0..40).map(|i| moving_scene_pub(w, h, i * 2, i)).collect(),
         };
         let base = GpuFrontendConfig {
             histeq: HistEqMethod::Clahe {
@@ -1839,7 +1837,7 @@ mod gpu_clahe_bench {
         let mut t_cpu = Vec::new();
         let mut t_gpu = Vec::new();
         let (mut n_cpu, mut n_gpu) = (0usize, 0usize);
-        let mut run = |fe: &mut GpuFrontend, img: &Image<u8>, n: &mut usize| -> f64 {
+        let run = |fe: &mut GpuFrontend, img: &Image<u8>, n: &mut usize| -> f64 {
             let t0 = Instant::now();
             fe.submit(&gpu, img);
             let (_, st) = fe.collect(&gpu);

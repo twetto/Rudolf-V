@@ -253,16 +253,6 @@ pub fn equalize_histogram_into(image: &Image<u8>, out: &mut Image<u8>) {
     }
 }
 
-/// Wrapper to send a raw pointer across threads.
-/// SAFETY: The caller must guarantee non-overlapping writes.
-#[cfg(feature = "parallel")]
-#[derive(Clone, Copy)]
-struct SendPtr(*mut u8);
-#[cfg(feature = "parallel")]
-unsafe impl Send for SendPtr {}
-#[cfg(feature = "parallel")]
-unsafe impl Sync for SendPtr {}
-
 /// Build a 256-entry lookup table from a histogram and total pixel count.
 fn build_lut(hist: &[u32; 256], total: usize) -> [u8; 256] {
     let mut cdf = [0u32; 256];
@@ -354,12 +344,12 @@ impl ClaheMap {
         let cols = if tile_size == 0 {
             0
         } else {
-            (w + tile_size - 1) / tile_size
+            w.div_ceil(tile_size)
         };
         let rows = if tile_size == 0 {
             0
         } else {
-            (h + tile_size - 1) / tile_size
+            h.div_ceil(tile_size)
         };
         if w == 0 || h == 0 || tile_size == 0 {
             return Self {
@@ -551,6 +541,7 @@ pub fn equalize_clahe_into(
 /// Always compiled: it is the non-aarch64 implementation AND the reference the
 /// NEON path is asserted bit-equal against, so it cannot rot unnoticed.
 #[inline]
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))] // only the tests call it there
 fn remap_row_scalar(
     src_row: &[u8],
     dst_row: &mut [u8],
@@ -821,8 +812,8 @@ mod tests {
 
         // --- clahe, tile 32 ---
         let tile = 32usize;
-        let cols = (W + tile - 1) / tile;
-        let rows = (H + tile - 1) / tile;
+        let cols = W.div_ceil(tile);
+        let rows = H.div_ceil(tile);
         let src = img.as_slice();
         let stride = img.stride();
         let t = Instant::now();
@@ -866,8 +857,8 @@ mod tests {
         fn scalar_clahe(img: &Image<u8>, tile: usize, clip: f32) -> Image<u8> {
             let w = img.width();
             let h = img.height();
-            let cols = (w + tile - 1) / tile;
-            let rows = (h + tile - 1) / tile;
+            let cols = w.div_ceil(tile);
+            let rows = h.div_ceil(tile);
             let src = img.as_slice();
             let stride = img.stride();
             let luts: Vec<[u8; 256]> = (0..rows * cols)
@@ -1016,8 +1007,8 @@ mod tests {
         let stride = img.stride();
 
         for &tile in &[32usize, 64, 256] {
-            let cols = (W + tile - 1) / tile;
-            let rows = (H + tile - 1) / tile;
+            let cols = W.div_ceil(tile);
+            let rows = H.div_ceil(tile);
             let reps = 200;
 
             // (a) LUT construction only

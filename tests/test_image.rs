@@ -166,8 +166,8 @@ fn normalized_roundtrip_preserves_extremes() {
     let img = Image::from_vec(6, 1, data.clone());
     let f = convert::u8_to_f32_normalized(&img);
     let back = convert::f32_normalized_to_u8(&f);
-    for i in 0..6 {
-        assert_eq!(back.get(i, 0), data[i], "roundtrip mismatch at pixel {i}");
+    for (i, &v) in data.iter().enumerate() {
+        assert_eq!(back.get(i, 0), v, "roundtrip mismatch at pixel {i}");
     }
 }
 

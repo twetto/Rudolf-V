@@ -87,7 +87,7 @@ fn main() {
     // Layout: all CPU levels on top row, all GPU levels on bottom row.
     // Levels are scaled to the height of level 0 for easy comparison.
     let target_h = cpu_pyr.level(0).height();
-    let target_h_u32 = target_h as u32;
+    let _target_h_u32 = target_h as u32;
 
     // Compute the width of each scaled level panel.
     let panel_widths: Vec<usize> = (0..num_levels)
@@ -175,7 +175,7 @@ fn main() {
     )
     .expect("failed to open window");
 
-    window.limit_update_rate(Some(std::time::Duration::from_millis(16)));
+    window.set_target_fps(60);
 
     eprintln!("[gpu_pyramid] window open — press Escape or close to exit");
 
@@ -213,7 +213,7 @@ fn checkerboard(width: usize, height: usize, tile: usize) -> Image<u8> {
         .map(|i| {
             let x = i % width;
             let y = i / width;
-            if (x / tile + y / tile) % 2 == 0 {
+            if (x / tile + y / tile).is_multiple_of(2) {
                 220
             } else {
                 40

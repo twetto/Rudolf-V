@@ -28,7 +28,7 @@
 //       Zero-motion sanity check: uses the same image as both frames.
 //       All features should track with ~0 displacement.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use minifb::{Key, Window, WindowOptions};
 
@@ -146,7 +146,7 @@ fn run_synthetic(
         },
     )
     .expect("window creation failed");
-    window.limit_update_rate(Some(Duration::from_millis(33)));
+    window.set_target_fps(30);
 
     let mut fb = vec![0u32; win_w * win_h];
     let mut frame_idx = 0usize;
@@ -177,7 +177,7 @@ fn run_synthetic(
         let pyr_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         // --- Redetect features periodically ---
-        let redetect = frame_idx % REDETECT_INTERVAL == 0 || features.is_empty();
+        let redetect = frame_idx.is_multiple_of(REDETECT_INTERVAL) || features.is_empty();
         let detect_ms;
         if redetect {
             let t0 = Instant::now();
@@ -308,7 +308,7 @@ fn run_static(
         },
     )
     .expect("window failed");
-    window.limit_update_rate(Some(Duration::from_millis(16)));
+    window.set_target_fps(60);
 
     // Render once with scale as runtime parameter.
     render_panels_scaled(
@@ -326,7 +326,7 @@ fn run_static(
 // ---------------------------------------------------------------------------
 
 fn render_panels(
-    fb: &mut Vec<u32>,
+    fb: &mut [u32],
     win_w: usize,
     frame1: &Image<u8>,
     frame2: &Image<u8>,
@@ -345,7 +345,7 @@ fn render_panels(
 }
 
 fn render_panels_scaled(
-    fb: &mut Vec<u32>,
+    fb: &mut [u32],
     win_w: usize,
     scale: usize,
     frame1: &Image<u8>,
@@ -441,13 +441,13 @@ fn grey(v: u8) -> u32 {
     0xFF000000 | (c << 16) | (c << 8) | c
 }
 
-fn set_pixel(fb: &mut Vec<u32>, w: usize, x: usize, y: usize, color: u32) {
+fn set_pixel(fb: &mut [u32], w: usize, x: usize, y: usize, color: u32) {
     if y * w + x < fb.len() {
         fb[y * w + x] = color;
     }
 }
 
-fn draw_circle(fb: &mut Vec<u32>, w: usize, cx: usize, cy: usize, r: usize, color: u32) {
+fn draw_circle(fb: &mut [u32], w: usize, cx: usize, cy: usize, r: usize, color: u32) {
     // Midpoint circle algorithm — outline only.
     let r = r as isize;
     let mut x = 0isize;
@@ -480,7 +480,7 @@ fn draw_circle(fb: &mut Vec<u32>, w: usize, cx: usize, cy: usize, r: usize, colo
     }
 }
 
-fn draw_line(fb: &mut Vec<u32>, w: usize, x0: usize, y0: usize, x1: usize, y1: usize, color: u32) {
+fn draw_line(fb: &mut [u32], w: usize, x0: usize, y0: usize, x1: usize, y1: usize, color: u32) {
     // Bresenham line.
     let (mut x0, mut y0) = (x0 as isize, y0 as isize);
     let (x1, y1) = (x1 as isize, y1 as isize);
@@ -514,7 +514,7 @@ fn draw_line(fb: &mut Vec<u32>, w: usize, x0: usize, y0: usize, x1: usize, y1: u
     }
 }
 
-fn draw_cross(fb: &mut Vec<u32>, w: usize, cx: usize, cy: usize, r: usize, color: u32) {
+fn draw_cross(fb: &mut [u32], w: usize, cx: usize, cy: usize, r: usize, color: u32) {
     let r = r as isize;
     let cx = cx as isize;
     let cy = cy as isize;

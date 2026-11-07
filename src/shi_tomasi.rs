@@ -265,9 +265,7 @@ impl ShiTomasiScratch {
                 self.cell_winners.clear();
                 self.cell_winners.resize(n_cells, None);
             } else {
-                for winner in &mut self.cell_winners {
-                    *winner = None;
-                }
+                self.cell_winners.fill(None);
             }
 
             blur_tensor_cols_collect(
@@ -286,7 +284,7 @@ impl ShiTomasiScratch {
                 &mut self.cell_winners,
             );
 
-            return self.cell_winners.iter().filter_map(Clone::clone).collect();
+            self.cell_winners.iter().filter_map(Clone::clone).collect()
         }
 
         #[cfg(not(feature = "parallel"))]
@@ -295,9 +293,7 @@ impl ShiTomasiScratch {
                 self.cell_winners.clear();
                 self.cell_winners.resize(n_cells, None);
             } else {
-                for winner in &mut self.cell_winners {
-                    *winner = None;
-                }
+                self.cell_winners.fill(None);
             }
 
             blur_tensor_cols_collect(
@@ -626,7 +622,6 @@ fn blur_tensor_rows_5(
                     w, row, k0, k1, k2, k3, k4, ix2, iy2, ixiy, tmp_xx_row, tmp_yy_row, tmp_xy_row,
                 );
             });
-        return;
     }
 
     #[cfg(not(feature = "parallel"))]
@@ -698,7 +693,6 @@ fn blur_tensor_rows_5(
 }
 
 #[cfg(feature = "parallel")]
-#[allow(clippy::too_many_arguments)]
 fn blur_tensor_row_5(
     w: usize,
     row: usize,
@@ -836,7 +830,6 @@ fn blur_tensor_cols_collect_5(
                     );
                 }
             });
-        return;
     }
 
     #[cfg(not(feature = "parallel"))]
@@ -864,7 +857,6 @@ fn blur_tensor_cols_collect_5(
 }
 
 #[cfg(feature = "parallel")]
-#[allow(clippy::too_many_arguments)]
 fn collect_row_5_cell_row(
     w: usize,
     y: usize,
@@ -965,7 +957,7 @@ fn collect_row_5_cell_row(
                 continue;
             }
 
-            if winner.as_ref().map_or(true, |prev| score > prev.score) {
+            if winner.as_ref().is_none_or(|prev| score > prev.score) {
                 *winner = Some(Feature {
                     x: x as f32,
                     y: y as f32,
@@ -980,7 +972,6 @@ fn collect_row_5_cell_row(
 }
 
 #[cfg(not(feature = "parallel"))]
-#[allow(clippy::too_many_arguments)]
 fn collect_row_5(
     w: usize,
     y: usize,
@@ -1097,7 +1088,7 @@ fn collect_row_5(
                 continue;
             }
 
-            if winner.as_ref().map_or(true, |prev| score > prev.score) {
+            if winner.as_ref().is_none_or(|prev| score > prev.score) {
                 *winner = Some(Feature {
                     x: x as f32,
                     y: y as f32,
@@ -1113,7 +1104,6 @@ fn collect_row_5(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-#[allow(clippy::too_many_arguments)]
 unsafe fn collect_cell_5_avx2(
     x_start: usize,
     x_end: usize,
@@ -1372,7 +1362,7 @@ mod tests {
             for x in 0..img_size {
                 let cx = x / cell_size;
                 let cy = y / cell_size;
-                img.set(x, y, if (cx + cy) % 2 == 0 { lo } else { hi });
+                img.set(x, y, if (cx + cy).is_multiple_of(2) { lo } else { hi });
             }
         }
         img

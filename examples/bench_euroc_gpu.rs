@@ -51,7 +51,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!("Usage: {} <euroc_dataset_path> [max_frames]", args[0]);
-        eprintln!("");
+        eprintln!();
         eprintln!("Environment variables:");
         eprintln!("  RUDOLF_HISTEQ=global|clahe|none");
         eprintln!("  RUDOLF_FEATURES=200");
@@ -237,8 +237,8 @@ fn main() {
 
     // --- Warmup: 5 frames (or fewer if dataset is tiny) ---
     let warmup = 5.min(num_frames);
-    for i in 0..warmup {
-        frontend.process(&gpu, &frames[i]);
+    for frame in &frames[..warmup] {
+        frontend.process(&gpu, frame);
     }
     frontend.reset();
     println!("Warmup: {} frames", warmup);
@@ -326,7 +326,7 @@ fn main() {
         num_frames as f64 / bench_elapsed.as_secs_f64()
     );
     println!("═══════════════════════════════════════════════════════════════════");
-    println!("");
+    println!();
     println!(
         "  {:12} {:>8} {:>8} {:>8} {:>8}",
         "Stage", "Mean", "Min", "Max", "Median"
@@ -347,10 +347,10 @@ fn main() {
     );
     print_stat("TOTAL", &acc.total);
 
-    println!("");
+    println!();
     println!("  Per-frame CSV written to stderr. Redirect with:");
     println!("    cargo run --example bench_euroc_gpu --release -- <path> 2>bench.csv");
-    println!("");
+    println!();
 }
 
 fn print_stat(label: &str, vals: &[f64]) {

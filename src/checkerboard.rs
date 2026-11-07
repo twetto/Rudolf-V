@@ -496,7 +496,7 @@ impl CheckerboardDetector {
             let small = reuse(&mut sc.half, image.width() / 2, image.height() / 2);
             half_size_into(image, small);
             let found = self.detect_at_scale(small, &mut sc.response_half)?;
-            self.from_half_size(image, found)
+            self.refine_from_half_size(image, found)
         })
     }
 
@@ -516,7 +516,7 @@ impl CheckerboardDetector {
             let small = reuse(&mut sc.half, image.width() / 2, image.height() / 2);
             half_size_into(image, small);
             let found = self.search(small, &half)?;
-            self.from_half_size(image, found)
+            self.refine_from_half_size(image, found)
         })
     }
 
@@ -533,7 +533,7 @@ impl CheckerboardDetector {
 
     /// A lattice found in the half-size image, refined in `image` and ordered,
     /// if its lines are smooth there too.
-    fn from_half_size(
+    fn refine_from_half_size(
         &self,
         image: &Image<u8>,
         (corners, half): (Vec<Vec<[f32; 2]>>, usize),

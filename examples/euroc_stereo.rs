@@ -56,7 +56,7 @@ fn list_euroc_images(cam_dir: &Path) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(&data_dir)
         .unwrap()
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().map_or(false, |e| e == "png"))
+        .filter(|p| p.extension().is_some_and(|e| e == "png"))
         .collect();
     files.sort();
     files

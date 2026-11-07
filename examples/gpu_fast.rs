@@ -235,7 +235,7 @@ fn render_panels(
 }
 
 fn render_multilevel(
-    img: &Image<u8>,
+    _img: &Image<u8>,
     gpu: &GpuDevice,
     det: &mut GpuFastDetector,
     pyr: &rudolf_v::gpu::pyramid::GpuPyramid,
