@@ -26,11 +26,17 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+          targets: aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
-      # Reported, not enforced yet: the existing warnings are being cleaned
-      # up file by file (issue #3), then this gets `-- -D warnings`.
       - name: Clippy
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      # The NEON paths only compile for aarch64. minifb (an example
+      # dev-dependency) builds a little C, hence the cross compiler.
+      - name: Clippy for aarch64
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          cargo clippy -p rudolf-v --target aarch64-unknown-linux-gnu --all-targets -- -D warnings
       # The CPU library alone: nothing outside src/gpu may need wgpu.
       - name: Check without the gpu feature
         run: cargo check -p rudolf-v --no-default-features --all-targets
