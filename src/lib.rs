@@ -8,6 +8,7 @@ pub mod camera;
 pub mod checkerboard;
 pub mod convert;
 pub mod convolution;
+pub mod dense_stereo;
 pub mod essential;
 pub mod fast;
 pub mod frontend;
@@ -20,8 +21,14 @@ pub mod klt;
 pub mod nms;
 pub mod occupancy;
 pub mod pyramid;
+pub mod rectify;
 pub mod rigid_ransac;
+pub mod sgbm;
 pub mod shi_tomasi;
 pub mod stereo;
+#[cfg(unix)]
+pub mod stereo_net;
+#[cfg(unix)]
+pub mod tensorrt;
 
 pub use camera_geometry;

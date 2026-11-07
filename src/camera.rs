@@ -17,6 +17,9 @@ pub enum DistortionModel {
     None,
     RadTan,
     Equidistant,
+    /// OpenCV's rational model, 8 coefficients [k1, k2, p1, p2, k3, k4, k5, k6]
+    /// (ZED SDK factory calibrations).
+    Rational,
 }
 
 /// Pinhole camera intrinsics with optional radial-tangential distortion.
@@ -32,8 +35,9 @@ pub struct CameraIntrinsics {
     pub cy: f64,
     /// Image resolution [width, height].
     pub resolution: [usize; 2],
-    /// Radial-tangential distortion coefficients [k1, k2, p1, p2].
-    /// Empty if no distortion model.
+    /// Distortion coefficients for `model`: [k1, k2, p1, p2] (radtan),
+    /// [k1, k2, k3, k4] (equidistant) or [k1, k2, p1, p2, k3, k4, k5, k6]
+    /// (rational). Empty if no distortion model.
     pub distortion: Vec<f64>,
     /// Projection/distortion interpretation for `distortion`.
     pub model: DistortionModel,
@@ -96,6 +100,11 @@ impl CameraIntrinsics {
             .or_else(|| parse_bracket_values(&content, "distortion_coeffs:"))
             .unwrap_or_default();
         let model = parse_projection_model(&content, &distortion)?;
+        let distortion = if model == DistortionModel::None {
+            Vec::new()
+        } else {
+            distortion
+        };
 
         Ok(CameraIntrinsics {
             fx: intrinsics[0],
@@ -129,6 +138,11 @@ impl CameraIntrinsics {
             DistortionModel::Equidistant => CameraProjection::pinhole_equidistant(
                 intrinsics,
                 distortion4(&self.distortion),
+                self.resolution,
+            ),
+            DistortionModel::Rational => CameraProjection::pinhole_rational(
+                intrinsics,
+                distortion8(&self.distortion),
                 self.resolution,
             ),
         }
@@ -353,17 +367,23 @@ fn parse_projection_model(content: &str, distortion: &[f64]) -> Result<Distortio
     let camera_model = parse_scalar_value(content, "camera_model:").unwrap_or("pinhole");
     let distortion_model = parse_scalar_value(content, "distortion_model:").unwrap_or("");
     match (camera_model, distortion_model) {
-        ("pinhole", "" | "none") if distortion.is_empty() => Ok(DistortionModel::None),
+        // Rectified calibrations often list `none` with zero coefficients.
+        ("pinhole", "none") if distortion.iter().all(|&k| k == 0.0) => Ok(DistortionModel::None),
+        ("pinhole", "") if distortion.is_empty() => Ok(DistortionModel::None),
         ("pinhole", "radtan" | "radial-tangential") => {
-            validate_distortion_len("radtan", distortion)?;
+            validate_distortion_len("radtan", distortion, 4)?;
             Ok(DistortionModel::RadTan)
         }
         ("pinhole", "equidistant") => {
-            validate_distortion_len("equidistant", distortion)?;
+            validate_distortion_len("equidistant", distortion, 4)?;
             Ok(DistortionModel::Equidistant)
         }
+        ("pinhole", "rational_polynomial" | "rational") => {
+            validate_distortion_len("rational", distortion, 8)?;
+            Ok(DistortionModel::Rational)
+        }
         ("pinhole", "") if !distortion.is_empty() => {
-            validate_distortion_len("implicit radtan", distortion)?;
+            validate_distortion_len("implicit radtan", distortion, 4)?;
             Ok(DistortionModel::RadTan)
         }
         _ => Err(format!(
@@ -378,15 +398,19 @@ fn parse_scalar_value<'a>(content: &'a str, key: &str) -> Option<&'a str> {
         .find_map(|line| line.trim().strip_prefix(key).map(str::trim))
 }
 
-fn validate_distortion_len(name: &str, distortion: &[f64]) -> Result<(), String> {
-    if distortion.len() == 4 {
+fn validate_distortion_len(name: &str, distortion: &[f64], expected: usize) -> Result<(), String> {
+    if distortion.len() == expected {
         Ok(())
     } else {
         Err(format!(
-            "{name} distortion expected 4 values, got {}",
+            "{name} distortion expected {expected} values, got {}",
             distortion.len()
         ))
     }
+}
+
+fn distortion8(distortion: &[f64]) -> [f64; 8] {
+    std::array::from_fn(|i| distortion.get(i).copied().unwrap_or(0.0))
 }
 
 fn distortion4(distortion: &[f64]) -> [f64; 4] {
@@ -666,5 +690,52 @@ cam1:
                 .abs()
                 < 1e-12
         );
+    }
+
+    #[test]
+    fn test_kalibr_camchain_rational_zed() {
+        // ZED 2i factory calibration as exported to Kalibr (raw images).
+        let camchain = r#"cam0:
+  camera_model: pinhole
+  intrinsics: [958.0499877929688, 958.364990234375, 643.2249755859375, 362.3590087890625]
+  distortion_model: rational_polynomial
+  distortion_coeffs: [-0.5764279961585999, 28.025299072265625, -3.6843000998487696e-05,
+    -0.00027499301359057426, -11.46560001373291, -0.4730679988861084, 27.756500244140625,
+    -8.833189964294434]
+  resolution: [1280, 720]
+cam1:
+  camera_model: pinhole
+  intrinsics: [955.2849731445312, 955.5399780273438, 644.780029296875, 367.343505859375]
+  distortion_model: rational_polynomial
+  distortion_coeffs: [-4.018050193786621, 19.540700912475586, -2.1755000489065424e-05,
+    -0.0001793120027286932, -8.16450023651123, -3.937230110168457, 19.188400268554688,
+    -6.666619777679443]
+  resolution: [1280, 720]
+  T_cn_cnm1:
+  - [0.999984351, 0.003146175, -0.004622436, -0.119868005]
+  - [-0.003142531, 0.999994737, 0.000795437, 0.000731885]
+  - [0.004624914, -0.000780899, 0.999989027, -0.001205486]
+  - [0.0, 0.0, 0.0, 1.0]
+"#;
+        let path = std::env::temp_dir().join(format!(
+            "rudolf_v_test_camchain_{}_{}.yaml",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, camchain).unwrap();
+        let rig = StereoRig::from_kalibr_camchain(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(rig.cam0.model, DistortionModel::Rational);
+        assert_eq!(rig.cam1.distortion.len(), 8);
+        // cv2.projectPoints with cam0's calibration.
+        let pixel = rig
+            .cam0
+            .projection()
+            .project(nalgebra::Vector3::new(0.3, -0.2, 2.0))
+            .unwrap();
+        assert!((pixel.x() - 786.464309215).abs() < 1e-6);
+        assert!((pixel.y() - 266.827864422).abs() < 1e-6);
+        assert!((rig.baseline_meters() - 0.11988).abs() < 1e-4);
     }
 }

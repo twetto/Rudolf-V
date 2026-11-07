@@ -1,5 +1,6 @@
 pub mod checkerboard;
 pub mod clahe;
+pub mod dense_stereo;
 pub mod device;
 pub mod fast;
 pub mod frontend;
@@ -7,3 +8,4 @@ pub mod histeq;
 pub mod image;
 pub mod klt;
 pub mod pyramid;
+pub mod sgbm;

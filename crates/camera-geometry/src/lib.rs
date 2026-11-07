@@ -65,6 +65,7 @@ pub enum CameraProjection {
     Pinhole(Pinhole),
     PinholeRadTan(PinholeRadTan),
     PinholeEquidistant(EquidistantFisheye),
+    PinholeRational(PinholeRational),
 }
 
 impl CameraProjection {
@@ -88,6 +89,14 @@ impl CameraProjection {
         Self::PinholeEquidistant(EquidistantFisheye::new(intrinsics, distortion, resolution))
     }
 
+    pub fn pinhole_rational(
+        intrinsics: [f64; 4],
+        distortion: [f64; 8],
+        resolution: [usize; 2],
+    ) -> Self {
+        Self::PinholeRational(PinholeRational::new(intrinsics, distortion, resolution))
+    }
+
     pub fn from_kalibr_parts(
         camera_model: &str,
         distortion_model: Option<&str>,
@@ -109,6 +118,11 @@ impl CameraProjection {
                 array4_from_slice("equidistant distortion", distortion)?,
                 resolution,
             )),
+            ("pinhole", "rational_polynomial" | "rational") => Ok(Self::pinhole_rational(
+                intrinsics,
+                array8_from_slice("rational distortion", distortion)?,
+                resolution,
+            )),
             (camera_model, distortion_model) => Err(format!(
                 "unsupported camera projection camera_model={camera_model}, distortion_model={distortion_model}"
             )),
@@ -122,6 +136,7 @@ impl CameraModel for CameraProjection {
             Self::Pinhole(camera) => camera.unproject(pixel),
             Self::PinholeRadTan(camera) => camera.unproject(pixel),
             Self::PinholeEquidistant(camera) => camera.unproject(pixel),
+            Self::PinholeRational(camera) => camera.unproject(pixel),
         }
     }
 
@@ -130,6 +145,7 @@ impl CameraModel for CameraProjection {
             Self::Pinhole(camera) => camera.project(point),
             Self::PinholeRadTan(camera) => camera.project(point),
             Self::PinholeEquidistant(camera) => camera.project(point),
+            Self::PinholeRational(camera) => camera.project(point),
         }
     }
 
@@ -138,6 +154,7 @@ impl CameraModel for CameraProjection {
             Self::Pinhole(camera) => camera.project_jacobian(point),
             Self::PinholeRadTan(camera) => camera.project_jacobian(point),
             Self::PinholeEquidistant(camera) => camera.project_jacobian(point),
+            Self::PinholeRational(camera) => camera.project_jacobian(point),
         }
     }
 
@@ -146,6 +163,7 @@ impl CameraModel for CameraProjection {
             Self::Pinhole(camera) => camera.image_size(),
             Self::PinholeRadTan(camera) => camera.image_size(),
             Self::PinholeEquidistant(camera) => camera.image_size(),
+            Self::PinholeRational(camera) => camera.image_size(),
         }
     }
 }
@@ -236,22 +254,171 @@ impl PinholeRadTan {
 
     fn distort_with_jacobian(&self, p: Vector2<f64>) -> (Vector2<f64>, Matrix2<f64>) {
         let [k1, k2, p1, p2] = self.distortion;
-        let x = p.x;
-        let y = p.y;
-        let r2 = x * x + y * y;
+        let r2 = p.norm_squared();
         let radial = 1.0 + k1 * r2 + k2 * r2 * r2;
         let dr = k1 + 2.0 * k2 * r2;
-        let distorted = Vector2::new(
-            x * radial + 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x),
-            y * radial + p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y,
-        );
-        let jacobian = Matrix2::new(
-            radial + 2.0 * x * x * dr + 2.0 * p1 * y + 6.0 * p2 * x,
-            2.0 * x * y * dr + 2.0 * p1 * x + 2.0 * p2 * y,
-            2.0 * x * y * dr + 2.0 * p1 * x + 2.0 * p2 * y,
-            radial + 2.0 * y * y * dr + 6.0 * p1 * y + 2.0 * p2 * x,
-        );
-        (distorted, jacobian)
+        radial_tangential(p, radial, dr, p1, p2)
+    }
+}
+
+/// Radial-tangential distortion of normalised point `p` and its Jacobian,
+/// given the radial factor and its derivative with respect to r².
+fn radial_tangential(
+    p: Vector2<f64>,
+    radial: f64,
+    dr: f64,
+    p1: f64,
+    p2: f64,
+) -> (Vector2<f64>, Matrix2<f64>) {
+    let x = p.x;
+    let y = p.y;
+    let r2 = x * x + y * y;
+    let distorted = Vector2::new(
+        x * radial + 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x),
+        y * radial + p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y,
+    );
+    let jacobian = Matrix2::new(
+        radial + 2.0 * x * x * dr + 2.0 * p1 * y + 6.0 * p2 * x,
+        2.0 * x * y * dr + 2.0 * p1 * x + 2.0 * p2 * y,
+        2.0 * x * y * dr + 2.0 * p1 * x + 2.0 * p2 * y,
+        radial + 2.0 * y * y * dr + 6.0 * p1 * y + 2.0 * p2 * x,
+    );
+    (distorted, jacobian)
+}
+
+/// OpenCV's rational model (`CALIB_RATIONAL_MODEL`): the radial factor is a
+/// ratio of polynomials in r², plus tangential terms. Coefficients in
+/// OpenCV's order, `[k1, k2, p1, p2, k3, k4, k5, k6]`; the ZED SDK's factory
+/// calibration uses it.
+///
+/// With large coefficients (a ZED 2i has k2 ≈ 28, k5 ≈ 28) the ratio turns
+/// back on itself outside the calibrated field of view, which would fold far
+/// off-axis points into the image. The model is only used out to the radius
+/// where the distorted radius stops growing (found at construction); beyond
+/// it there is no projection and no ray.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PinholeRational {
+    pub intrinsics: [f64; 4],
+    pub distortion: [f64; 8],
+    pub resolution: [usize; 2],
+    /// Largest undistorted r² the model is used for.
+    max_r2: f64,
+}
+
+impl PinholeRational {
+    pub fn new(intrinsics: [f64; 4], distortion: [f64; 8], resolution: [usize; 2]) -> Self {
+        let mut camera = Self {
+            intrinsics,
+            distortion,
+            resolution,
+            max_r2: 0.0,
+        };
+        camera.max_r2 = camera.monotonic_r2();
+        camera
+    }
+
+    /// Radial factor N(r²)/D(r²) and its derivative with respect to r²;
+    /// None where the denominator is not positive.
+    fn radial(&self, r2: f64) -> Option<(f64, f64)> {
+        let [k1, k2, _, _, k3, k4, k5, k6] = self.distortion;
+        let n = 1.0 + r2 * (k1 + r2 * (k2 + r2 * k3));
+        let d = 1.0 + r2 * (k4 + r2 * (k5 + r2 * k6));
+        if !(d > MIN_NORM) {
+            return None;
+        }
+        let dn = k1 + r2 * (2.0 * k2 + 3.0 * k3 * r2);
+        let dd = k4 + r2 * (2.0 * k5 + 3.0 * k6 * r2);
+        Some((n / d, (dn * d - n * dd) / (d * d)))
+    }
+
+    /// The model is usable at r² while the denominator is positive and the
+    /// distorted radius r·radial(r²) still grows: radial + 2r²·radial' > 0.
+    fn usable(&self, r2: f64) -> bool {
+        self.radial(r2)
+            .is_some_and(|(radial, dr)| radial > 0.0 && radial + 2.0 * r2 * dr > 0.0)
+    }
+
+    /// Largest r² up to which the model is usable throughout (at most
+    /// r = 10, 84° off axis).
+    fn monotonic_r2(&self) -> f64 {
+        const LIMIT: f64 = 100.0;
+        const STEP: f64 = 1.0e-3;
+        let mut lo = 0.0;
+        while lo < LIMIT {
+            let next = lo + STEP;
+            if !self.usable(next) {
+                // Bisect the boundary between lo (usable) and next.
+                let mut hi = next;
+                for _ in 0..40 {
+                    let mid = 0.5 * (lo + hi);
+                    if self.usable(mid) {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                return lo;
+            }
+            lo = next;
+        }
+        LIMIT
+    }
+
+    fn distort_with_jacobian(&self, p: Vector2<f64>) -> Option<(Vector2<f64>, Matrix2<f64>)> {
+        let [_, _, p1, p2, ..] = self.distortion;
+        let r2 = p.norm_squared();
+        if r2 > self.max_r2 {
+            return None;
+        }
+        let (radial, dr) = self.radial(r2)?;
+        Some(radial_tangential(p, radial, dr, p1, p2))
+    }
+}
+
+impl CameraModel for PinholeRational {
+    fn unproject(&self, pixel: Pixel) -> Option<UnitBearing> {
+        let [fx, fy, cx, cy] = self.intrinsics;
+        valid_intrinsics(fx, fy)?;
+        let target = Vector2::new((pixel.x() - cx) / fx, (pixel.y() - cy) / fy);
+        let mut undistorted = target;
+        for _ in 0..20 {
+            let (estimate, jacobian) = self.distort_with_jacobian(undistorted)?;
+            let step = jacobian.lu().solve(&(estimate - target))?;
+            undistorted -= step;
+            if step.norm_squared() < 1.0e-24 {
+                break;
+            }
+        }
+        // Newton can wander off a folded model: accept only a true inverse.
+        let (estimate, _) = self.distort_with_jacobian(undistorted)?;
+        if (estimate - target).norm_squared() > 1.0e-18 {
+            return None;
+        }
+        UnitBearing::try_new(Vector3::new(undistorted.x, undistorted.y, 1.0))
+    }
+
+    fn project(&self, point: Vector3<f64>) -> Option<Pixel> {
+        let [fx, fy, cx, cy] = self.intrinsics;
+        valid_intrinsics(fx, fy)?;
+        valid_point(&point)?;
+        let (p, _) =
+            self.distort_with_jacobian(Vector2::new(point.x / point.z, point.y / point.z))?;
+        Some(Pixel::new(fx * p.x + cx, fy * p.y + cy))
+    }
+
+    fn project_jacobian(&self, point: Vector3<f64>) -> Option<Matrix2x3<f64>> {
+        let [fx, fy, _, _] = self.intrinsics;
+        valid_intrinsics(fx, fy)?;
+        valid_point(&point)?;
+        let iz = 1.0 / point.z;
+        let normalized = Vector2::new(point.x * iz, point.y * iz);
+        let (_, distortion) = self.distort_with_jacobian(normalized)?;
+        let pinhole = Matrix2x3::new(iz, 0.0, -point.x * iz * iz, 0.0, iz, -point.y * iz * iz);
+        Some(Matrix2::new(fx, 0.0, 0.0, fy) * distortion * pinhole)
+    }
+
+    fn image_size(&self) -> [usize; 2] {
+        self.resolution
     }
 }
 
@@ -503,6 +670,12 @@ fn array4_from_slice(name: &str, values: &[f64]) -> Result<[f64; 4], String> {
         .map_err(|_| format!("{name} expected 4 values, got {}", values.len()))
 }
 
+fn array8_from_slice(name: &str, values: &[f64]) -> Result<[f64; 8], String> {
+    values
+        .try_into()
+        .map_err(|_| format!("{name} expected 8 values, got {}", values.len()))
+}
+
 fn array2(section: &str, key: &str) -> Result<[f64; 2], String> {
     bracket_values(section, key)?
         .try_into()
@@ -614,6 +787,68 @@ mod tests {
         assert_tangent_jacobian(&camera, Pixel::new(10.0, 500.0));
     }
 
+    /// ZED 2i S/N 33632745 left camera, HD720 factory calibration.
+    fn zed_rational() -> PinholeRational {
+        PinholeRational::new(
+            [
+                958.0499877929688,
+                958.364990234375,
+                643.2249755859375,
+                362.3590087890625,
+            ],
+            [
+                -0.5764279961585999,
+                28.025299072265625,
+                -3.6843000998487696e-05,
+                -0.00027499301359057426,
+                -11.46560001373291,
+                -0.4730679988861084,
+                27.756500244140625,
+                -8.833189964294434,
+            ],
+            [1280, 720],
+        )
+    }
+
+    #[test]
+    fn rational_contract() {
+        let camera = zed_rational();
+        // cv2.projectPoints with the same calibration.
+        for (point, expected) in [
+            (Vector3::new(0.3, -0.2, 2.0), [786.464309215, 266.827864422]),
+            (Vector3::new(-1.2, 0.6, 1.5), [-54.165351115, 711.035156805]),
+            (Vector3::new(0.9, 0.5, 1.0), [1384.847175556, 774.624580229]),
+        ] {
+            let pixel = camera.project(point).unwrap();
+            assert_relative_eq!(pixel.x(), expected[0], epsilon = 1.0e-6);
+            assert_relative_eq!(pixel.y(), expected[1], epsilon = 1.0e-6);
+        }
+        assert_roundtrip(
+            &camera,
+            &[
+                Pixel::new(643.225, 362.359),
+                Pixel::new(0.0, 0.0),
+                Pixel::new(1279.0, 719.0),
+                Pixel::new(0.0, 719.0),
+            ],
+            1.0e-8,
+        );
+        assert_projection_jacobian(&camera, Vector3::new(0.3, -0.2, 2.0));
+        assert_projection_jacobian(&camera, Vector3::new(-0.7, 0.4, 1.0));
+        assert_tangent_jacobian(&camera, Pixel::new(20.0, 700.0));
+    }
+
+    #[test]
+    fn rational_has_no_projection_where_it_folds() {
+        let camera = zed_rational();
+        // This calibration's distorted radius peaks near 49° off axis; beyond
+        // that it shrinks again and would put the point back in the image.
+        assert!(camera.project(Vector3::new(1.1, 0.0, 1.0)).is_some()); // 47.7°
+        assert!(camera.project(Vector3::new(1.3, 0.0, 1.0)).is_none()); // 52.4°
+        assert!(camera.project(Vector3::new(3.0, 2.0, 1.0)).is_none());
+        assert!(camera.unproject(Pixel::new(-2000.0, 360.0)).is_none());
+    }
+
     #[test]
     fn kalibr_parts_map_to_single_projection_models() {
         let intrinsics = [500.0, 500.0, 320.0, 240.0];
@@ -646,6 +881,25 @@ mod tests {
             .unwrap(),
             CameraProjection::PinholeEquidistant(_)
         ));
+        assert!(matches!(
+            CameraProjection::from_kalibr_parts(
+                "pinhole",
+                Some("rational_polynomial"),
+                intrinsics,
+                &[-0.5, 28.0, 0.0, 0.0, -11.0, -0.4, 27.0, -8.0],
+                resolution,
+            )
+            .unwrap(),
+            CameraProjection::PinholeRational(_)
+        ));
+        assert!(CameraProjection::from_kalibr_parts(
+            "pinhole",
+            Some("rational_polynomial"),
+            intrinsics,
+            &[0.1, 0.01, 0.001, 0.0001],
+            resolution,
+        )
+        .is_err());
         assert!(CameraProjection::from_kalibr_parts(
             "double-sphere",
             None,
