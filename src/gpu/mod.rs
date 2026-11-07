@@ -8,3 +8,4 @@ pub mod histeq;
 pub mod image;
 pub mod klt;
 pub mod pyramid;
+pub mod sgbm;

@@ -25,6 +25,9 @@
 //                    DIR/left and DIR/right (rounded to u8)
 //   --gpu            match on the GPU (gpu/dense_stereo.rs; a rectified pair,
 //                    or --rectify)
+//   --sgbm           semi-global block matching instead (sgbm.rs; a rectified
+//                    pair), on --level; --sgbm-paths 4 for rows and columns
+//                    only; with --gpu on the GPU (gpu/sgbm.rs)
 //   --trt ENGINE     depth from a stereo network's TensorRT engine instead
 //                    (stereo_net.rs: LAS2 or Light ESS; a rectified pair), on
 //                    --level's grid; with --trt-lib LIB (librv_trt.so, from
@@ -42,8 +45,10 @@ use rudolf_v::camera::StereoRig;
 use rudolf_v::dense_stereo::{DenseDepth, DenseStereo, DenseStereoConfig, SemiGlobal};
 use rudolf_v::gpu::dense_stereo::GpuDenseStereo;
 use rudolf_v::gpu::device::GpuDevice;
+use rudolf_v::gpu::sgbm::GpuSgbm;
 use rudolf_v::image::Image;
 use rudolf_v::rectify::StereoRectification;
+use rudolf_v::sgbm::{Sgbm, SgbmConfig};
 use rudolf_v::stereo_net::{StereoNet, StereoNetConfig};
 use rudolf_v::tensorrt::TrtEngine;
 use std::path::{Path, PathBuf};
@@ -146,34 +151,61 @@ fn write_outputs(out: &Path, stem: &str, left: &Image<u8>, depth: &DenseDepth) {
         .expect("write png");
 }
 
-/// One pair's depth: from the network with `net`, else on the GPU with
-/// `gpu`, else on the CPU.
-fn compute(
-    stereo: &mut DenseStereo,
-    gpu: &mut Option<(GpuDevice, GpuDenseStereo)>,
-    net: &mut Option<StereoNet>,
-    left: &Image<u8>,
-    right: &Image<u8>,
-    depth: &mut DenseDepth,
-) {
-    match (net, gpu) {
-        (Some(net), _) => net
-            .compute_into(left, right, depth)
-            .unwrap_or_else(|e| panic!("--trt: {e}")),
-        (None, Some((dev, matcher))) => matcher.compute_into(dev, left, right, depth),
-        (None, None) => stereo.compute_into(left, right, depth),
+/// What computes the depth.
+enum Matcher {
+    /// Our matcher on the CPU (the `DenseStereo` main always builds).
+    Cpu,
+    Gpu(GpuDevice, GpuDenseStereo),
+    Sgbm(Sgbm),
+    GpuSgbm(GpuDevice, GpuSgbm),
+    Net(StereoNet),
+}
+
+impl Matcher {
+    fn name(&self) -> String {
+        let sgbm = |s: &SgbmConfig, n: usize| format!("SGBM ({n} disparities, {} paths)", s.paths);
+        match self {
+            Matcher::Cpu => "the CPU".into(),
+            Matcher::Gpu(dev, _) => dev.adapter_info.name.clone(),
+            Matcher::Sgbm(s) => format!("the CPU, {}", sgbm(s.config(), s.num_disparities())),
+            Matcher::GpuSgbm(dev, _) => format!("{}, SGBM", dev.adapter_info.name),
+            Matcher::Net(net) => {
+                format!("TensorRT ({:?}, {:?} input)", net.kind(), net.input_size())
+            }
+        }
+    }
+
+    /// One pair's depth.
+    fn compute(
+        &mut self,
+        stereo: &mut DenseStereo,
+        left: &Image<u8>,
+        right: &Image<u8>,
+        depth: &mut DenseDepth,
+    ) {
+        match self {
+            Matcher::Cpu => stereo.compute_into(left, right, depth),
+            Matcher::Gpu(dev, m) => m.compute_into(dev, left, right, depth),
+            Matcher::Sgbm(m) => m.compute_into(left, right, depth),
+            Matcher::GpuSgbm(dev, m) => m.compute_into(dev, left, right, depth),
+            Matcher::Net(net) => net
+                .compute_into(left, right, depth)
+                .unwrap_or_else(|e| panic!("--trt: {e}")),
+        }
     }
 }
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
-    let use_gpu = match args.iter().position(|a| a == "--gpu") {
+    let mut flag = |name: &str| match args.iter().position(|a| a == name) {
         Some(i) => {
             args.remove(i);
             true
         }
         None => false,
     };
+    let use_gpu = flag("--gpu");
+    let use_sgbm = flag("--sgbm");
     let mut take = |flag: &str| -> Option<String> {
         let i = args.iter().position(|a| a == flag)?;
         args.remove(i);
@@ -210,6 +242,7 @@ fn main() {
         p
     });
     let rectified_out = take("--rectified").map(PathBuf::from);
+    let sgbm_paths: usize = take("--sgbm-paths").map_or(8, |v| v.parse().expect("--sgbm-paths"));
     let trt = take("--trt").map(PathBuf::from);
     let trt_lib = take("--trt-lib").unwrap_or_else(|| "librv_trt.so".into());
     let trt_plugin = take("--trt-plugin").map(PathBuf::from);
@@ -221,21 +254,6 @@ fn main() {
     );
 
     let (rig, lefts, right_dir) = open_sequence(&dir);
-    let mut net = trt.as_ref().map(|engine| {
-        assert!(
-            rectify.is_none(),
-            "--trt needs a rectified pair, not --rectify"
-        );
-        let plugins: Vec<&Path> = trt_plugin.iter().map(|p| p.as_path()).collect();
-        let engine = TrtEngine::load(Path::new(&trt_lib), engine, &plugins)
-            .unwrap_or_else(|e| panic!("--trt: {e}"));
-        let config = StereoNetConfig {
-            level,
-            min_confidence: conf,
-            ..Default::default()
-        };
-        StereoNet::new(engine, None, &rig, config).unwrap_or_else(|e| panic!("--trt: {e}"))
-    });
     let (a, b, step) = match frames {
         Some(f) => {
             let p: Vec<usize> = f
@@ -288,7 +306,7 @@ fn main() {
         Some(k) => {
             DenseStereo::new_rectifying(StereoRectification::new(&rig, k[0], k[1], k[2]), config)
         }
-        None => DenseStereo::new(rig, config),
+        None => DenseStereo::new(rig.clone(), config),
     };
     if let Some(dir) = &rectified_out {
         assert!(rectify.is_some(), "--rectified needs --rectify");
@@ -296,11 +314,48 @@ fn main() {
             std::fs::create_dir_all(dir.join(eye)).expect("--rectified");
         }
     }
-    let mut gpu = use_gpu.then(|| {
-        let dev = GpuDevice::new().expect("--gpu needs a Vulkan GPU");
-        let matcher = GpuDenseStereo::new(&dev, &stereo);
-        (dev, matcher)
-    });
+    let device = || GpuDevice::new().expect("--gpu needs a Vulkan GPU");
+    let mut matcher = if let Some(engine) = &trt {
+        assert!(
+            rectify.is_none(),
+            "--trt needs a rectified pair, not --rectify"
+        );
+        let plugins: Vec<&Path> = trt_plugin.iter().map(|p| p.as_path()).collect();
+        let engine = TrtEngine::load(Path::new(&trt_lib), engine, &plugins)
+            .unwrap_or_else(|e| panic!("--trt: {e}"));
+        let config = StereoNetConfig {
+            level,
+            min_confidence: conf,
+            ..Default::default()
+        };
+        let net =
+            StereoNet::new(engine, None, &rig, config).unwrap_or_else(|e| panic!("--trt: {e}"));
+        Matcher::Net(net)
+    } else if use_sgbm {
+        assert!(
+            rectify.is_none(),
+            "--sgbm needs a rectified pair, not --rectify"
+        );
+        let config = SgbmConfig {
+            level,
+            paths: sgbm_paths,
+            ..Default::default()
+        };
+        let cpu = Sgbm::new(&rig, config);
+        if use_gpu {
+            let dev = device();
+            let m = GpuSgbm::new(&dev, &cpu);
+            Matcher::GpuSgbm(dev, m)
+        } else {
+            Matcher::Sgbm(cpu)
+        }
+    } else if use_gpu {
+        let dev = device();
+        let m = GpuDenseStereo::new(&dev, &stereo);
+        Matcher::Gpu(dev, m)
+    } else {
+        Matcher::Cpu
+    };
     eprintln!(
         "{} pairs, {}x{}, levels {}..={}, {}, on {}",
         pairs.len(),
@@ -315,11 +370,7 @@ fn main() {
         } else {
             "raw (epipolar curves)"
         },
-        match (&net, &gpu) {
-            (Some(net), _) => format!("TensorRT ({:?}, {:?} input)", net.kind(), net.input_size()),
-            (None, Some((dev, _))) => dev.adapter_info.name.clone(),
-            (None, None) => "the CPU".to_string(),
-        }
+        matcher.name()
     );
 
     let mut depth = DenseDepth {
@@ -330,19 +381,12 @@ fn main() {
         variance: Vec::new(),
         source_level: Vec::new(),
     };
-    compute(
-        &mut stereo,
-        &mut gpu,
-        &mut net,
-        &pairs[0].1,
-        &pairs[0].2,
-        &mut depth,
-    ); // warm-up
+    matcher.compute(&mut stereo, &pairs[0].1, &pairs[0].2, &mut depth); // warm-up
     let mut ms = Vec::with_capacity(pairs.len());
     let mut coverage = 0.0f64;
     for (stem, left, right) in &pairs {
         let t = Instant::now();
-        compute(&mut stereo, &mut gpu, &mut net, left, right, &mut depth);
+        matcher.compute(&mut stereo, left, right, &mut depth);
         let dt = t.elapsed().as_secs_f64() * 1e3;
         ms.push(dt);
         coverage += depth.coverage() as f64;

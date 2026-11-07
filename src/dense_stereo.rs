@@ -1580,7 +1580,7 @@ struct Buffers {
 /// remove_speckles' working memory: each pixel's run, and per run its
 /// union-find parent, first pixel, length and (at a root) its region's size.
 #[derive(Default)]
-struct SpeckleScratch {
+pub(crate) struct SpeckleScratch {
     run_of: Vec<u32>,
     parent: Vec<u32>,
     start: Vec<u32>,
@@ -3217,7 +3217,7 @@ impl DenseStereo {
 /// Regions are found a row at a time: runs of connected pixels along the
 /// row, joined to the runs above them by union-find.
 #[inline(never)]
-fn remove_speckles(
+pub(crate) fn remove_speckles(
     keep: &mut [bool],
     d: &[f32],
     w: usize,
