@@ -54,20 +54,13 @@ struct AxisBlend {
 /// The blend for every coordinate along one axis. It depends only on the image
 /// size and tile size, so `GpuClahe` builds it once and every frame's
 /// `TileLuts` shares it: `apply` then does no division, floor or clamp, which
-/// made up most of the CPU LBP cost under CLAHE. Same expressions as the
-/// level-0 shaders, so the results stay bit-identical.
+/// made up most of the CPU LBP cost under CLAHE. Built from
+/// `histeq::tile_blend`, the level-0 shaders' expression, so the results stay
+/// bit-identical.
 fn axis_blend(n_px: usize, n_tiles: usize, tile_size: usize) -> Arc<[AxisBlend]> {
-    let ts = tile_size as f32;
     (0..n_px)
         .map(|p| {
-            let f = p as f32 / ts - 0.5;
-            let t0 = f.floor().max(0.0) as usize;
-            let t1 = (t0 + 1).min(n_tiles - 1);
-            let a = if t0 == t1 {
-                0.0
-            } else {
-                ((p as f32 - (t0 as f32 + 0.5) * ts) / ts).clamp(0.0, 1.0)
-            };
+            let (t0, t1, a) = crate::histeq::tile_blend(p, tile_size, n_tiles);
             AxisBlend {
                 t0: t0 as u32,
                 t1: t1 as u32,
@@ -91,8 +84,13 @@ pub struct TileLuts {
 
 impl TileLuts {
     /// The equalized value of raw pixel `v` at `(x, y)`: the bilinear blend of
-    /// the four surrounding tile LUTs. Mirrors the remap loop of
-    /// `histeq::equalize_clahe_into` and the level-0 shaders.
+    /// the four surrounding tile LUTs.
+    ///
+    /// Same blend as `histeq::ClaheMap::remap_row` on the CPU path, in point
+    /// form rather than per row; both index with `histeq::tile_blend` (here
+    /// through the tables `axis_blend` builds). The authority is `shaders/pyramid_convert_clahe.wgsl`: this
+    /// exists so a CPU consumer gets exactly the value the GPU produced, which
+    /// is why `tile_blend` carries the shader's form.
     #[inline]
     pub fn apply(&self, x: usize, y: usize, v: u8) -> u8 {
         let bx = self.cols[x];

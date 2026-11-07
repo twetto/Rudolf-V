@@ -95,8 +95,7 @@ Frontend, EuRoC V1_01_easy (752×480), mean time per frame:
   no histogram equalization): 1.11–1.13 ms for the GPU frontend, 1.37–1.40 ms
   for OpenCV.
 - A Raspberry Pi 4 runs the CPU frontend at 12.7 ms per frame (7.6 ms on four
-  cores). Its GPU frontend takes 116 ms, and needs a device-limits fix for
-  VideoCore that is not on `main` yet.
+  cores). Its GPU frontend takes 116 ms.
 
 Dense stereo, Orin Nano at 15 W, one 1280×720 pair to depth on a 160×90 grid,
 on the GPU:

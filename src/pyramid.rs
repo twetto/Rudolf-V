@@ -34,6 +34,7 @@ use crate::image::{Image, Pixel};
 // Re-export convolution utilities for other modules that may still need them.
 #[allow(unused_imports)]
 use crate::convolution::{ConvolveScratch, gaussian_kernel_1d};
+use crate::histeq::ClaheMap;
 
 /// A Gaussian image pyramid.
 pub struct Pyramid {
@@ -71,6 +72,22 @@ pub struct Pyramid {
 ///
 /// Contains integer intermediate buffers for the hot `build_reuse` path,
 /// plus ping-pong u8 buffers for cascading levels.
+/// What to apply to `src` while it is copied into pyramid level 0.
+///
+/// Fusing preprocessing here saves a full-resolution read and write per frame,
+/// because level 0 already touches every pixel. Global equalization has always
+/// taken this path (`Lut`); `Clahe` extends it to a spatially varying map,
+/// which cannot be expressed as a single 256-entry table.
+#[derive(Copy, Clone)]
+pub enum PyrPreproc<'a> {
+    /// Plain copy.
+    None,
+    /// One 256-entry LUT for every pixel (global histogram equalization).
+    Lut(&'a [u8; 256]),
+    /// Per-tile LUTs with bilinear blending (CLAHE).
+    Clahe(&'a ClaheMap),
+}
+
 pub struct PyramidScratch {
     /// Horizontal-pass intermediate (u16, un-normalized, max 4080).
     /// Sized for the largest level (level 0 dimensions).
@@ -190,6 +207,21 @@ impl Pyramid {
         scratch: &mut PyramidScratch,
         lut: Option<&[u8; 256]>,
     ) {
+        let pre = match lut {
+            Some(l) => PyrPreproc::Lut(l),
+            None => PyrPreproc::None,
+        };
+        self.build_reuse_preproc(src, num_levels, scratch, pre);
+    }
+
+    /// As `build_reuse_lut`, but the level-0 pass can also apply a CLAHE map.
+    pub fn build_reuse_preproc(
+        &mut self,
+        src: &Image<u8>,
+        num_levels: usize,
+        scratch: &mut PyramidScratch,
+        pre: PyrPreproc<'_>,
+    ) {
         assert!(num_levels >= 1);
 
         // Ensure we have enough level slots.
@@ -220,7 +252,17 @@ impl Pyramid {
             let src_stride = src.stride();
             let dst_slice = self.u8_levels[0].as_mut_slice();
             let src_slice = src.as_slice();
-            if let Some(lut) = lut {
+            // Preprocessing is fused here because level 0 already reads every
+            // pixel: a LUT costs a table lookup with no extra traffic, and a
+            // CLAHE map costs its blend without a separate image.
+            if let PyrPreproc::Clahe(map) = pre {
+                debug_assert_eq!(map.width(), sw);
+                debug_assert_eq!(map.height(), sh);
+                for (y, dst_row) in dst_slice.chunks_mut(sw).take(sh).enumerate() {
+                    let src_off = y * src_stride;
+                    map.remap_row(&src_slice[src_off..src_off + sw], dst_row, y);
+                }
+            } else if let PyrPreproc::Lut(lut) = pre {
                 if src_stride == sw {
                     crate::histeq::remap_lut(&src_slice[..sw * sh], dst_slice, lut);
                 } else {
@@ -1532,5 +1574,145 @@ mod tests {
             );
             prev_var = var;
         }
+    }
+}
+
+#[cfg(test)]
+mod fused_clahe_tests {
+    use super::*;
+    use crate::histeq::{self, ClaheMap};
+
+    /// Fusing CLAHE into level 0 must change nothing but the timing. Compares
+    /// the fused pyramid against the old two-pass route (materialise an
+    /// equalized image, then build a plain pyramid from it) across u8 level 0
+    /// AND every f32 level -- a level-0 match alone would not catch a mistake
+    /// in what the later levels are derived from.
+    #[test]
+    fn fused_clahe_matches_two_pass() {
+        let mut seed = 0xC0FFEEu32;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed >> 24) as u8
+        };
+        let mut checked = 0;
+        for &(w, h) in &[(320usize, 200usize), (317, 61), (97, 43)] {
+            let img = Image::from_vec(w, h, (0..w * h).map(|_| rnd()).collect());
+            for &tile in &[16usize, 32, 64] {
+                for &clip in &[1.0f32, 4.0] {
+                    let levels = 3;
+
+                    // fused
+                    let map = ClaheMap::build(&img, tile, clip);
+                    let mut fused = Pyramid {
+                        levels: Vec::new(),
+                        u8_levels: Vec::new(),
+                        padded_levels: Vec::new(),
+                        pad_border: 0,
+                    };
+                    let mut sc = PyramidScratch::new(w, h, 1.0);
+                    fused.build_reuse_preproc(&img, levels, &mut sc, PyrPreproc::Clahe(&map));
+
+                    // two-pass
+                    let mut eq = Image::new(w, h);
+                    histeq::equalize_clahe_into(&img, tile, clip, &mut eq);
+                    let mut two = Pyramid {
+                        levels: Vec::new(),
+                        u8_levels: Vec::new(),
+                        padded_levels: Vec::new(),
+                        pad_border: 0,
+                    };
+                    let mut sc2 = PyramidScratch::new(w, h, 1.0);
+                    two.build_reuse_preproc(&eq, levels, &mut sc2, PyrPreproc::None);
+
+                    assert_eq!(
+                        fused.u8_level(0).as_slice(),
+                        two.u8_level(0).as_slice(),
+                        "u8 level 0 differs: {w}x{h} tile={tile} clip={clip}"
+                    );
+                    for l in 0..levels {
+                        assert_eq!(
+                            fused.level(l).as_slice(),
+                            two.level(l).as_slice(),
+                            "f32 level {l} differs: {w}x{h} tile={tile} clip={clip}"
+                        );
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        println!("fused == two-pass over {checked} (size, tile, clip) combinations");
+    }
+
+    /// Quantify the fusion: two-pass (materialise an equalized image, then build
+    /// a plain pyramid) vs fused (CLAHE applied during level 0). Run with:
+    ///   cargo test --release fused_clahe_cost -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn fused_clahe_cost() {
+        use std::time::Instant;
+        const W: usize = 320;
+        const H: usize = 200;
+        let Some(p) = std::env::var_os("RUDOLF_BENCH_FRAMES") else {
+            eprintln!("set RUDOLF_BENCH_FRAMES to a raw 320x200 u8 frame cache to run this");
+            return;
+        };
+        let all = std::fs::read(p).expect("RUDOLF_BENCH_FRAMES");
+        let off = 15000 * W * H;
+        let img = Image::from_vec(W, H, all[off..off + W * H].to_vec());
+        let levels = 3;
+        let reps = 300;
+        let tile = 32usize;
+        let clip = 4.0f32;
+
+        let mut pyr = Pyramid {
+            levels: Vec::new(),
+            u8_levels: Vec::new(),
+            padded_levels: Vec::new(),
+            pad_border: 0,
+        };
+        let mut sc = PyramidScratch::new(W, H, 1.0);
+        let mut eq = Image::new(W, H);
+
+        // warm both paths so neither pays first-touch page faults
+        crate::histeq::equalize_clahe_into(&img, tile, clip, &mut eq);
+        pyr.build_reuse_preproc(&eq, levels, &mut sc, PyrPreproc::None);
+        let m0 = ClaheMap::build(&img, tile, clip);
+        pyr.build_reuse_preproc(&img, levels, &mut sc, PyrPreproc::Clahe(&m0));
+
+        let t = Instant::now();
+        for _ in 0..reps {
+            crate::histeq::equalize_clahe_into(&img, tile, clip, &mut eq);
+            pyr.build_reuse_preproc(&eq, levels, &mut sc, PyrPreproc::None);
+        }
+        let two = t.elapsed().as_secs_f64() / reps as f64 * 1e3;
+
+        let t = Instant::now();
+        for _ in 0..reps {
+            let map = ClaheMap::build(&img, tile, clip);
+            pyr.build_reuse_preproc(&img, levels, &mut sc, PyrPreproc::Clahe(&map));
+        }
+        let fused = t.elapsed().as_secs_f64() / reps as f64 * 1e3;
+
+        // reference: what global costs through the same pyramid
+        let t = Instant::now();
+        for _ in 0..reps {
+            let lut = crate::histeq::equalize_histogram_lut(&img);
+            pyr.build_reuse_preproc(&img, levels, &mut sc, PyrPreproc::Lut(&lut));
+        }
+        let glob = t.elapsed().as_secs_f64() / reps as f64 * 1e3;
+
+        println!("histeq+pyramid, 320x200, tile=32, {levels} levels:");
+        println!("  two-pass CLAHE : {two:.3} ms");
+        println!(
+            "  fused CLAHE    : {fused:.3} ms   ({:.3} ms saved, {:.2}x)",
+            two - fused,
+            two / fused
+        );
+        println!(
+            "  global (ref)   : {glob:.3} ms   (fused CLAHE is {:.2}x global)",
+            fused / glob
+        );
     }
 }
