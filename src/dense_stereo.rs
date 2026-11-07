@@ -97,6 +97,9 @@ pub(crate) const AMBIGUITY_RATIO: f32 = 2.0;
 pub(crate) const FALLBACK_AGREE: f32 = 0.1;
 /// `DenseDepth::source_level` where there is no depth.
 pub(crate) const NO_SOURCE: u8 = u8::MAX;
+/// `DenseDepth::source_level` where only textureless patches the
+/// semi-global search placed cover the pixel (`SemiGlobal`).
+pub const INFERRED: u8 = u8::MAX - 1;
 /// Distinct match: moving D by DISTINCT_STEP (pixels) either way must raise
 /// the patch's SSD by at least DISTINCT_RISE of what `min_texture` predicts
 /// (n · min_texture² · step²). Noise rises by about zero.
@@ -181,6 +184,42 @@ pub struct DenseStereoConfig {
     /// finest level's depth is (on that walk this moved 0.7 % of measured
     /// pixels by over 1 %).
     pub coarse_fallback: usize,
+    /// Semi-global search at the finest level (`SemiGlobal`); None: off.
+    pub semi_global: Option<SemiGlobal>,
+}
+
+/// Semi-global matching (Hirschmüller 2008) on the finest level's patch
+/// grid, for the pixels no valid patch covers: patch costs at each whole
+/// pixel of D, summed along paths over the patch grid with a penalty for D
+/// changing between neighbouring patches. Valid patches keep their D and
+/// anchor the sums; a patch that failed validation (most often for lack of
+/// texture) takes the sum's minimum if it is unique. Those pixels' source is
+/// INFERRED, and they face the fills' check (`reject_contradicted_fills`)
+/// before the coarse fallback's do.
+#[derive(Debug, Clone, Copy)]
+pub struct SemiGlobal {
+    /// Penalty for D changing by one pixel between neighbouring patches, in
+    /// units of a patch at the texture threshold one pixel off
+    /// (n · min_texture²).
+    pub p1: f32,
+    /// Penalty for a larger change, same units.
+    pub p2: f32,
+    /// A unique minimum: every D more than a pixel from it sums at least
+    /// 1 / (1 − uniqueness) times as much (OpenCV's uniquenessRatio / 100).
+    pub uniqueness: f32,
+    /// Path directions: 4 (rows and columns) or 8 (and diagonals).
+    pub paths: usize,
+}
+
+impl Default for SemiGlobal {
+    fn default() -> Self {
+        Self {
+            p1: 1.0,
+            p2: 8.0,
+            uniqueness: 0.1,
+            paths: 8,
+        }
+    }
 }
 
 impl Default for DenseStereoConfig {
@@ -209,6 +248,7 @@ impl Default for DenseStereoConfig {
             occlusion_check: true,
             speckle_size: 400,
             coarse_fallback: 2,
+            semi_global: None,
         }
     }
 }
@@ -1527,6 +1567,14 @@ struct Buffers {
     disagree: Vec<u32>,
     source: Vec<u8>,
     speckle: SpeckleScratch,
+    // Semi-global search: per patch and whole pixel of D, the cost, one
+    // path's sum and all paths' sum; per patch its D and right-image sampler
+    // if it is inferred; per pixel whether only inferred patches cover it.
+    sg_cost: Vec<f32>,
+    sg_path: Vec<f32>,
+    sg_total: Vec<f32>,
+    sg_patches: Vec<Option<(f32, ShiftSampler)>>,
+    inferred: Vec<bool>,
 }
 
 /// remove_speckles' working memory: each pixel's run, and per run its
@@ -2004,6 +2052,7 @@ impl DenseStereo {
         let finest = self.config.finest_level;
         // Levels the coarse fallback takes depth from: finest+1..=fallback.
         let fallback = self.last_validated_level();
+        self.buf.inferred.clear();
         for level in (finest..=self.coarsest).rev() {
             self.prepare_level(level);
             if level == self.coarsest {
@@ -2014,6 +2063,9 @@ impl DenseStereo {
             self.propagate(level);
             let validate = level <= fallback;
             self.densify(level, validate);
+            if let Some(sg) = self.config.semi_global.filter(|_| level == finest) {
+                self.semi_global(level, sg);
+            }
             self.refine_variational(level);
             if validate {
                 self.mask(level);
@@ -2231,6 +2283,244 @@ impl DenseStereo {
         self.buf.moved = moved;
         self.buf.settled = settled;
         self.buf.steps = steps;
+    }
+
+    /// Depth for the pixels no valid patch covers, from the semi-global sum
+    /// of costs (`SemiGlobal`). A valid patch's cost is a parabola as deep
+    /// as a patch can cost, centred on its D: the paths carry the
+    /// measurements into textureless regions without moving them. Any other
+    /// patch's is its truncated SSD at each whole pixel of D. Such a patch
+    /// whose sum has a unique minimum takes it (refined by a parabola
+    /// through its neighbours) if the patch lies inside the right image
+    /// there, within `max_residual` and `max_brightness_offset`. A pixel
+    /// takes the weighted mean of those patches over it if they agree within
+    /// DISAGREE (DIS's weights, without the precision: these patches have
+    /// next to no texture). Its variance is a placeholder: a pixel of D,
+    /// plus the patches' spread.
+    #[inline(never)]
+    fn semi_global(&mut self, level: usize, sg: SemiGlobal) {
+        let mut cost = std::mem::take(&mut self.buf.sg_cost);
+        let mut path = std::mem::take(&mut self.buf.sg_path);
+        let mut total = std::mem::take(&mut self.buf.sg_total);
+        let mut inferred_patches = std::mem::take(&mut self.buf.sg_patches);
+        let v = self.view(level);
+        let (w, h) = (v.g.w, v.g.h);
+        let (ws, hs) = (v.g.ws, v.g.hs);
+        let np = ws * hs;
+        let (psz, st) = (self.config.patch_size, self.config.patch_stride);
+        let n = (psz * psz) as f32;
+        // D = dmin + s, s = 0..nd (the last clamped to dmax), as `search`.
+        let nd = ((v.dmax - v.dmin).ceil() as usize).max(1) + 1;
+        let cap = n * CANDIDATE_TRUNCATION * CANDIDATE_TRUNCATION;
+        let unit = n * self.config.min_texture * self.config.min_texture;
+        let (p1, p2) = (sg.p1 * unit, sg.p2 * unit);
+        let (patches, valid_patch) = (&self.buf.patches, &self.buf.valid_patch);
+
+        // A position where the patch leaves the right image is not
+        // evidence against that D (near the left border, near D are not
+        // observable): it costs as much as the patch's best inside one. A
+        // patch whose sum has its minimum there gets no depth.
+        cost.resize(np * nd, 0.0);
+        each_with(
+            rows(&mut cost, nd).enumerate(),
+            || [0.0f32; MAX_PATCH * MAX_PATCH],
+            |res, (k, c)| {
+                if valid_patch[k] {
+                    let at = patches[k].d - v.dmin;
+                    for (s, c) in c.iter_mut().enumerate() {
+                        let e = s as f32 - at;
+                        *c = cap * (e * e).min(1.0);
+                    }
+                    return;
+                }
+                let mut best = cap;
+                for (s, c) in c.iter_mut().enumerate() {
+                    let d = (v.dmin + s as f32).min(v.dmax);
+                    *c = match v.eval::<true>(k, d, res) {
+                        Some(e) if e.inside => e.cost,
+                        _ => f32::NAN,
+                    };
+                    best = best.min(*c);
+                }
+                for c in c.iter_mut().filter(|c| c.is_nan()) {
+                    *c = best;
+                }
+            },
+        );
+
+        // Each direction's path sums, patch after patch along it:
+        // L(p, s) = C(p, s) + min(L(q, s), L(q, s ± 1) + P1, min L(q) + P2)
+        //           − min L(q), q the patch before p.
+        const DIRS: [(isize, isize); 8] = [
+            (1, 0),
+            (-1, 0),
+            (0, 1),
+            (0, -1),
+            (1, 1),
+            (-1, -1),
+            (1, -1),
+            (-1, 1),
+        ];
+        total.clear();
+        total.resize(np * nd, 0.0);
+        path.resize(np * nd, 0.0);
+        for &(dx, dy) in &DIRS[..sg.paths.clamp(4, 8)] {
+            for i in 0..hs {
+                let is = if dy < 0 { hs - 1 - i } else { i };
+                for j in 0..ws {
+                    let js = if dx < 0 { ws - 1 - j } else { j };
+                    let k = is * ws + js;
+                    let c = &cost[k * nd..(k + 1) * nd];
+                    let (qj, qi) = (js as isize - dx, is as isize - dy);
+                    if qj < 0 || qi < 0 || qj >= ws as isize || qi >= hs as isize {
+                        path[k * nd..(k + 1) * nd].copy_from_slice(c);
+                    } else {
+                        let q = qi as usize * ws + qj as usize;
+                        let (prev, cur) = if q < k {
+                            let (a, b) = path.split_at_mut(k * nd);
+                            (&a[q * nd..(q + 1) * nd], &mut b[..nd])
+                        } else {
+                            let (a, b) = path.split_at_mut(q * nd);
+                            (&b[..nd], &mut a[k * nd..(k + 1) * nd])
+                        };
+                        let m = prev.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+                        for s in 0..nd {
+                            let mut best = prev[s].min(m + p2);
+                            if s > 0 {
+                                best = best.min(prev[s - 1] + p1);
+                            }
+                            if s + 1 < nd {
+                                best = best.min(prev[s + 1] + p1);
+                            }
+                            cur[s] = c[s] + best - m;
+                        }
+                    }
+                    for (t, l) in total[k * nd..(k + 1) * nd]
+                        .iter_mut()
+                        .zip(&path[k * nd..(k + 1) * nd])
+                    {
+                        *t += l;
+                    }
+                }
+            }
+        }
+
+        // The patches without a valid estimate: D and right-image sampler
+        // where the sum has a unique minimum and the patch passes.
+        let max_ssd = self.config.max_residual * self.config.max_residual * n;
+        map_with(
+            &mut inferred_patches,
+            np,
+            || [0.0f32; MAX_PATCH * MAX_PATCH],
+            |res, k| {
+                if valid_patch[k] {
+                    return None;
+                }
+                let t = &total[k * nd..(k + 1) * nd];
+                let (sb, best) =
+                    t.iter()
+                        .copied()
+                        .enumerate()
+                        .fold(
+                            (0, f32::INFINITY),
+                            |b, (s, c)| if c < b.1 { (s, c) } else { b },
+                        );
+                let unique = t
+                    .iter()
+                    .enumerate()
+                    .all(|(s, &c)| s.abs_diff(sb) <= 1 || c * (1.0 - sg.uniqueness) >= best);
+                if !unique {
+                    return None;
+                }
+                let mut d = v.dmin + sb as f32;
+                if sb > 0 && sb + 1 < nd {
+                    let (a, c) = (t[sb - 1], t[sb + 1]);
+                    let den = a - 2.0 * best + c;
+                    if den > 0.0 {
+                        d += 0.5 * (a - c) / den;
+                    }
+                }
+                let d = d.clamp(v.dmin, v.dmax);
+                let e = v.eval::<false>(k, d, res)?;
+                let bright = e.offset.abs() <= self.config.max_brightness_offset;
+                if !(e.inside && e.ssd <= max_ssd && bright) {
+                    return None;
+                }
+                let (js, is) = (k % ws, k / ws);
+                let xs = (
+                    js * st,
+                    if js + 1 == ws {
+                        w - 1
+                    } else {
+                        js * st + psz - 1
+                    },
+                );
+                let ys = (
+                    is * st,
+                    if is + 1 == hs {
+                        h - 1
+                    } else {
+                        is * st + psz - 1
+                    },
+                );
+                Some((d, ShiftSampler::new(v.i1, e.shift, xs, ys)))
+            },
+        );
+
+        let span = |c: usize, count: usize| {
+            let last = (c / st).min(count - 1);
+            let first = if c + 1 >= psz {
+                (c + 1 - psz).div_ceil(st)
+            } else {
+                0
+            };
+            (first.min(last), last)
+        };
+        let i1 = &self.i1;
+        let b = &mut self.buf;
+        b.inferred.clear();
+        b.inferred.resize(w * h, false);
+        let fill = rows(&mut b.d, w)
+            .zip(rows(&mut b.var, w))
+            .zip(rows(&mut b.valid, w))
+            .zip(rows(&mut b.inferred, w));
+        let i0 = &b.i0;
+        fill.enumerate()
+            .for_each(|(y, (((d, var), valid), inferred))| {
+                let (is0, is1) = span(y, hs);
+                for x in 0..w {
+                    if valid[x] {
+                        continue;
+                    }
+                    let (js0, js1) = span(x, ws);
+                    let (mut sw, mut swd, mut swd2) = (0.0f32, 0.0f32, 0.0f32);
+                    let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+                    for is in is0..=is1 {
+                        for js in js0..=js1 {
+                            let Some((dk, s)) = &inferred_patches[is * ws + js] else {
+                                continue;
+                            };
+                            let wk = 1.0 / (s.sample(i1, x, y) - i0[y * w + x]).abs().max(1.0);
+                            sw += wk;
+                            swd += wk * dk;
+                            swd2 += wk * dk * dk;
+                            lo = lo.min(*dk);
+                            hi = hi.max(*dk);
+                        }
+                    }
+                    if sw > 0.0 && hi - lo <= DISAGREE {
+                        let mean = swd / sw;
+                        d[x] = mean;
+                        var[x] = 1.0 + (swd2 / sw - mean * mean).max(0.0);
+                        valid[x] = true;
+                        inferred[x] = true;
+                    }
+                }
+            });
+        self.buf.sg_cost = cost;
+        self.buf.sg_path = path;
+        self.buf.sg_total = total;
+        self.buf.sg_patches = inferred_patches;
     }
 
     /// Dense D from the patches. With `validate` (the finest level, and every
@@ -2595,11 +2885,15 @@ impl DenseStereo {
         let reach = self.config.patch_size - 1;
         let b = &mut self.buf;
         b.source.clear();
-        b.source.extend(
-            b.valid
-                .iter()
-                .map(|&v| if v { finest as u8 } else { NO_SOURCE }),
-        );
+        b.source.extend(b.valid.iter().enumerate().map(|(i, &v)| {
+            if !v {
+                NO_SOURCE
+            } else if b.inferred.get(i) == Some(&true) {
+                INFERRED
+            } else {
+                finest as u8
+            }
+        }));
         let fallback = (finest + self.config.coarse_fallback).min(self.coarsest);
         for level in finest + 1..=fallback {
             let k = level - finest;
@@ -2689,7 +2983,7 @@ impl DenseStereo {
     /// image by more than `max_residual`, or the right image does not see it.
     #[inline(never)]
     fn reject_contradicted_fills(&mut self) {
-        if self.config.coarse_fallback == 0 {
+        if self.config.coarse_fallback == 0 && self.config.semi_global.is_none() {
             return;
         }
         let finest = self.config.finest_level;
@@ -2732,7 +3026,11 @@ impl DenseStereo {
                         continue;
                     }
                     let d = d[row + xx];
-                    let half = 0.5 * (1usize << (src as usize - finest)) as f32;
+                    let half = if src == INFERRED {
+                        0.5
+                    } else {
+                        0.5 * (1usize << (src as usize - finest)) as f32
+                    };
                     // An end at the image border meets no texture.
                     let end = |xe: usize, border: bool| {
                         border || [d, d - half, d + half].iter().any(|&dd| agrees(xe, y, dd))

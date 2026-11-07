@@ -17,6 +17,8 @@
 //   --fallback N     coarser levels the fallback may fill from, 0 = off (default: 2)
 //   --min-texture T  patch texture threshold, grey levels per pixel        (default: 0.5)
 //   --bright B       largest mean grey-level difference between the eyes   (default: 30)
+//   --sgm P1,P2[,U[,PATHS]]  semi-global fill at the finest level (SemiGlobal:
+//                    penalties, uniqueness, 4 or 8 paths)
 //   --rectify F,CX,CY  rectify the (raw) images into the pinhole camera F, (CX, CY)
 //                    first; the depth is then on the rectified left grid
 //   --rectified DIR  with --rectify, also write the rectified images to
@@ -31,7 +33,7 @@
 // All images are decoded before the first frame, so a profiler sees the matcher.
 
 use rudolf_v::camera::StereoRig;
-use rudolf_v::dense_stereo::{DenseDepth, DenseStereo, DenseStereoConfig};
+use rudolf_v::dense_stereo::{DenseDepth, DenseStereo, DenseStereoConfig, SemiGlobal};
 use rudolf_v::gpu::dense_stereo::GpuDenseStereo;
 use rudolf_v::gpu::device::GpuDevice;
 use rudolf_v::image::Image;
@@ -175,6 +177,17 @@ fn main() {
     let fallback: Option<usize> = take("--fallback").map(|v| v.parse().expect("--fallback"));
     let min_texture: Option<f32> = take("--min-texture").map(|v| v.parse().expect("--min-texture"));
     let bright: Option<f32> = take("--bright").map(|v| v.parse().expect("--bright"));
+    let sgm = take("--sgm").map(|v| {
+        let p: Vec<&str> = v.split(',').collect();
+        let num = |i: usize| p.get(i).map(|x| x.parse::<f32>().expect("--sgm"));
+        let d = SemiGlobal::default();
+        SemiGlobal {
+            p1: num(0).unwrap_or(d.p1),
+            p2: num(1).unwrap_or(d.p2),
+            uniqueness: num(2).unwrap_or(d.uniqueness),
+            paths: num(3).map_or(d.paths, |x| x as usize),
+        }
+    });
     let rectify: Option<Vec<f64>> = take("--rectify").map(|v| {
         let p: Vec<f64> = v
             .split(',')
@@ -236,6 +249,7 @@ fn main() {
         propagation_sweeps: sweeps.unwrap_or(config.propagation_sweeps),
         min_texture: min_texture.unwrap_or(config.min_texture),
         max_brightness_offset: bright.unwrap_or(config.max_brightness_offset),
+        semi_global: sgm,
         ..config
     };
     let mut stereo = match &rectify {

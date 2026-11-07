@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Score dense stereo on a ZED recording against the SDK's NEURAL_LIGHT depth, next to OpenCV DIS.
+"""Score dense stereo on a ZED recording against the SDK's NEURAL_LIGHT depth, next to OpenCV DIS and SGBM.
 
     python3 zed_record.py extract walk.svo2 walk --every 10        # on the Orin
     cargo run --release --example dense_stereo_eval -- walk/rect --out ours > ours/frames.jsonl
     cargo run --release --example dense_stereo_eval -- walk/raw --out raw > raw/frames.jsonl  # optional
     python3 -I zed_eval.py walk ours [--raw raw] [--png DIR] [--png-every 20]
-                                     [--dis fast medium fast:0] [--threads 1] [--on-ours]
+                                     [--dis fast medium fast:0] [--sgbm 2 2:hh 8:sgbm:3]
+                                     [--threads 1] [--on-ours]
 
 The SDK's depth (rectified left camera) is sampled on the depth maps' grid (level 1: every other
 pixel). DIS runs as the robot pipeline's fallback does (mr-neuro-nav: preset FAST, spatial
@@ -15,8 +16,22 @@ sampled on the same grid.
 i.e. a quarter of its half-resolution input; ours computes every pixel of that grid, scale 0).
 DIS is timed on its calc() alone, the downsampling to half resolution apart (ours includes its
 pyramid). Every frame starts without a flow: DIS takes any flow of the right size it is passed
-as its initial estimate. --on-ours also scores each DIS configuration
-on only the pixels where ours has depth: the same pixels, so errors compare like for like.
+as its initial estimate.
+--sgbm scores OpenCV's semi-global matching, SCALE[:MODE[:BLOCK]]: images downsampled SCALE times
+(a divisor of the grid's, which samples the disparity), MODE sgbm (5 paths), hh (8), 3way or hh4,
+BLOCK the matching window (default 5). Its settings follow OpenCV's stereo_match sample (P1, P2 =
+8, 32 x BLOCK^2, uniqueness 10 %, left-right check within 1 px) with ours' range (0.25 m and
+farther) and speckle filter (400 full-resolution pixels, 1 px of disparity). Both images are
+padded on the left by the disparity range (zeros) and the result cropped back: SGBM leaves its
+first numDisparities columns (37 % of a ZED image) empty otherwise. Pixels whose match falls left
+of the right image are dropped (ours' test; with repeated-border padding 6 % of SGBM's depth
+matched there). Timed on compute() alone, padding included.
+--nn scores a stereo network's disparity from nn_infer.py (its TensorRT engine on the Orin),
+DIR[:CONF]: DIR holds meta.json (the network's image size; the full image was resized to it) and
+<stem>.disp (float16 disparity in the network's pixels), with :CONF also <stem>.conf, pixels under
+CONF dropped. Each grid pixel takes the nearest network pixel's disparity.
+--on-ours also scores each DIS, SGBM and network configuration on only the pixels where ours has depth: the
+same pixels, so errors compare like for like.
 Our raw-image depth is warped onto the rectified grid through the SDK's rectification rotation,
 found from SIFT matches between raw and rectified left images.
 
@@ -237,6 +252,10 @@ def main():
     ap.add_argument("--png-every", type=int, default=20)
     ap.add_argument("--dis", nargs="+", default=["fast"], metavar="PRESET[:SCALE]",
                     help="DIS configurations to score: ultrafast, fast or medium, optionally :finest scale")
+    ap.add_argument("--sgbm", nargs="*", default=[], metavar="SCALE[:MODE[:BLOCK]]",
+                    help="SGBM configurations to score: image downsampling, sgbm/hh/3way/hh4, window")
+    ap.add_argument("--nn", nargs="*", default=[], metavar="DIR[:CONF]",
+                    help="network disparity maps (nn_infer.py), optionally with a confidence threshold")
     ap.add_argument("--threads", type=int, help="OpenCV threads (default: OpenCV's choice)")
     ap.add_argument("--on-ours", action="store_true", help="also score DIS where ours has depth")
     args = ap.parse_args()
@@ -275,6 +294,32 @@ def main():
         dis[name] = d
     first_dis = next(iter(dis))
 
+    modes = {"sgbm": cv2.STEREO_SGBM_MODE_SGBM, "hh": cv2.STEREO_SGBM_MODE_HH,
+             "3way": cv2.STEREO_SGBM_MODE_SGBM_3WAY, "hh4": cv2.STEREO_SGBM_MODE_HH4}
+    sgbm = {}  # name -> (downsampling, matcher, disparity range)
+    for spec in args.sgbm:
+        parts = spec.split(":")
+        sc, mode = int(parts[0]), parts[1] if len(parts) > 1 else "sgbm"
+        bs = int(parts[2]) if len(parts) > 2 else 5
+        assert s % sc == 0, f"--sgbm {spec}: the downsampling must divide the grid's ({s})"
+        nd = int(np.ceil(K[0, 0] * baseline / (0.25 * sc) / 16)) * 16
+        m = cv2.StereoSGBM_create(minDisparity=0, numDisparities=nd, blockSize=bs, P1=8 * bs * bs,
+                                  P2=32 * bs * bs, disp12MaxDiff=1, preFilterCap=63, uniquenessRatio=10,
+                                  speckleWindowSize=max(1, 400 // (sc * sc)), speckleRange=1, mode=modes[mode])
+        sgbm[f"SGBM {mode}, 1/{sc} resolution, block {bs}"] = (sc, m, nd)
+    first_sgbm = next(iter(sgbm), None)
+
+    nets = {}  # name -> (directory, grid-to-network pixel rows and columns, scale to full-resolution disparity, threshold)
+    for spec in args.nn:
+        d, _, c = spec.partition(":")
+        meta = json.load(open(os.path.join(d, "meta.json")))
+        w, h, fw, fh = meta["width"], meta["height"], meta["full_width"], meta["full_height"]
+        u = np.clip(np.rint((xs * s + 0.5) * w / fw - 0.5), 0, w - 1).astype(int)
+        v = np.clip(np.rint((ys * s + 0.5) * h / fh - 0.5), 0, h - 1).astype(int)
+        name = meta["name"] + (f", confidence >= {c}" if c else "")
+        nets[name] = (d, (v, u), (h, w), fw / w, float(c) if c else None)
+    first_nn = next(iter(nets), None)
+
     if args.raw:
         K_raw, d_raw, _ = camchain(os.path.join(args.src, "raw/camchain.yaml"))
         R = rectification(args.src, stems, K, K_raw, d_raw)
@@ -284,17 +329,20 @@ def main():
         RX, RY = np.round(uv[..., 0]).astype(int), np.round(uv[..., 1]).astype(int)
         inside = (RX >= 0) & (RY >= 0) & (RX < W) & (RY < H)
 
-    scores = {"ours": Score(), **{name: Score() for name in dis}}
+    others = list(dis) + list(sgbm) + list(nets)
+    scores = {"ours": Score(), **{name: Score() for name in others}}
     if args.on_ours:
-        scores.update({f"{name}, where ours has depth": Score() for name in dis})
+        scores.update({f"{name}, where ours has depth": Score() for name in others})
     if os.path.exists(os.path.join(args.ours, stems[0] + ".src")):
         scores["ours, finest level only"] = Score()
         scores["ours, coarse fallback only"] = Score()
+        scores["ours, semi-global inferred only"] = Score()
     if args.raw:
         scores["ours, raw images"] = Score()
     if args.png:
         os.makedirs(args.png, exist_ok=True)
     dis_ms = {name: [] for name in dis}
+    sgbm_ms = {name: [] for name in sgbm}
     resize_ms = []
     for k, stem in enumerate(stems):
         z = cv2.imread(os.path.join(args.src, "rect/depth", stem + ".png"), -1)[::s, ::s][:H, :W] / 1000.0
@@ -315,15 +363,40 @@ def main():
             with np.errstate(all="ignore"):
                 est[name] = np.where(disp > 0, np.log(K[0, 0] * baseline / disp * n_dis), np.nan).astype(np.float32)
             est[name][(est[name] < np.log(0.25)) | (est[name] > np.log(30))] = np.nan
+        small = {1: (left, right)}  # images downsampled by SGBM's factors
+        for name, (sc, m, nd) in sgbm.items():
+            if sc not in small:
+                small[sc] = tuple(cv2.resize(im, (im.shape[1] // sc, im.shape[0] // sc), interpolation=cv2.INTER_AREA)
+                                  for im in (left, right))
+            a, b = (cv2.copyMakeBorder(im, 0, 0, nd, 0, cv2.BORDER_CONSTANT) for im in small[sc])
+            t0 = time.perf_counter()
+            raw_disp = m.compute(a, b)
+            sgbm_ms[name].append((time.perf_counter() - t0) * 1e3)
+            disp = raw_disp[:, nd:].astype(np.float32) / 16
+            disp[disp > np.arange(disp.shape[1])] = 0  # matched left of the right image
+            disp = disp[:: s // sc, :: s // sc][:H, :W] * sc
+            n_sc = 1 / rays(K, xs * s + 0.5 * (sc - 1), ys * s + 0.5 * (sc - 1))[..., 2]
+            with np.errstate(all="ignore"):
+                est[name] = np.where(disp > 0, np.log(K[0, 0] * baseline / disp * n_sc), np.nan).astype(np.float32)
+            est[name][(est[name] < np.log(0.25)) | (est[name] > np.log(30))] = np.nan
+        for name, (d, (v, u), shape, scale, thr) in nets.items():
+            disp = np.fromfile(os.path.join(d, stem + ".disp"), "<f2").reshape(shape).astype(np.float32)
+            if thr is not None:
+                disp[np.fromfile(os.path.join(d, stem + ".conf"), "<f2").reshape(shape) < thr] = 0
+            disp = disp[v, u] * scale
+            with np.errstate(all="ignore"):
+                est[name] = np.where(disp > 0, np.log(K[0, 0] * baseline / disp * n_grid), np.nan).astype(np.float32)
+            est[name][(est[name] < np.log(0.25)) | (est[name] > np.log(30))] = np.nan
         d_logr = est[first_dis]
         if args.on_ours:
-            for name in dis:
+            for name in others:
                 est[f"{name}, where ours has depth"] = np.where(np.isfinite(ours), est[name], np.nan)
         src_path = os.path.join(args.ours, stem + ".src")
         if os.path.exists(src_path):  # source level per pixel: split measured / coarse fallback
             src = np.fromfile(src_path, np.uint8).reshape(H, W)
             for name, sel in (("ours, finest level only", src == frames[0]["level"]),
-                              ("ours, coarse fallback only", (src != 255) & (src != frames[0]["level"]))):
+                              ("ours, coarse fallback only", (src < 254) & (src != frames[0]["level"])),
+                              ("ours, semi-global inferred only", src == 254)):
                 est[name] = np.where(sel, ours, np.nan).astype(np.float32)
         if args.raw:
             raw = np.fromfile(os.path.join(args.raw, stem + ".logr"), "<f4").reshape(H, W)
@@ -343,6 +416,14 @@ def main():
             if args.raw:
                 rows.append(np.hstack([label(colour(raw), f"ours on raw images ({pct(raw)})"),
                                        label(err_colour(d_logr - sdk), "DIS vs SDK", True)]))
+            if first_sgbm:
+                g = est[first_sgbm]
+                rows.append(np.hstack([label(colour(g), f"OpenCV {first_sgbm} ({pct(g)})", True),
+                                       label(err_colour(g - sdk), "SGBM vs SDK", True)]))
+            if first_nn:
+                g = est[first_nn]
+                rows.append(np.hstack([label(colour(g), f"{first_nn} ({pct(g)})", True),
+                                       label(err_colour(g - sdk), "network vs SDK", True)]))
             legend = np.full((30, 2 * W, 3), 255, np.uint8)
             cv2.putText(legend, "range 0.3 m red .. 6 m blue, black = none; error red = nearer than SDK, blue = "
                         "farther, full at 20 %; line: obstacle band", (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
@@ -351,7 +432,7 @@ def main():
 
     ours_ms = [f["ms"] for f in frames if "ms" in f]
     print(f"{len(stems)} frames, {W}x{H} grid; ms per pair, median: ours {np.median(ours_ms):.1f} (where it ran); "
-          + ", ".join(f"{name} {np.median(t):.2f}" for name, t in dis_ms.items())
+          + ", ".join(f"{name} {np.median(t):.2f}" for name, t in {**dis_ms, **sgbm_ms}.items())
           + f" plus {np.median(resize_ms):.2f} to downsample (this machine, {cv2.getNumThreads()} OpenCV threads)")
     for name, sc in scores.items():
         report(name, sc)
