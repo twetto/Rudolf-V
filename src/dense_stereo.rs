@@ -67,45 +67,45 @@ use rayon::prelude::*;
 
 /// Floor on a patch's residual standard deviation (grey levels) when its
 /// variance is estimated: a perfect match is not infinitely certain.
-const NOISE_FLOOR: f32 = 1.0;
+pub(crate) const NOISE_FLOOR: f32 = 1.0;
 /// OpenCV's variational refinement constants: ζ regularises the data-term
 /// normalisation and the system's diagonal, ε the robust penalty Ψ.
-const ZETA2: f32 = 0.01;
-const EPS2: f32 = 1e-6;
+pub(crate) const ZETA2: f32 = 0.01;
+pub(crate) const EPS2: f32 = 1e-6;
 /// GN stops when a step moves D by less than this (pixels of the level).
-const GN_MIN_STEP: f32 = 1e-3;
+pub(crate) const GN_MIN_STEP: f32 = 1e-3;
 /// Candidates are compared on squared residuals capped at this (grey
 /// levels), so on a patch straddling a depth edge the surface most of the
 /// patch shows wins, not the one that best hides a few mismatched pixels.
-const CANDIDATE_TRUNCATION: f32 = 10.0;
+pub(crate) const CANDIDATE_TRUNCATION: f32 = 10.0;
 /// Largest supported patch side (stack buffer for one patch's residuals).
 const MAX_PATCH: usize = 16;
 /// One patch's residuals, for comparing candidates.
 type Residuals = [f32; MAX_PATCH * MAX_PATCH];
 /// Two candidates closer than this (pixels) are the same candidate.
-const SAME_CANDIDATE: f32 = 0.25;
+pub(crate) const SAME_CANDIDATE: f32 = 0.25;
 /// Patches over one pixel whose D differ by more than this (pixels) lie on
 /// different surfaces.
-const DISAGREE: f32 = 1.0;
+pub(crate) const DISAGREE: f32 = 1.0;
 /// Neighbours in one speckle region differ by at most this much D (pixels).
-const SPECKLE_STEP: f32 = 1.0;
+pub(crate) const SPECKLE_STEP: f32 = 1.0;
 /// At a depth edge, the winning surface's local photometric cost must be this
 /// many times lower than the other surface's, or the pixel has no depth.
-const AMBIGUITY_RATIO: f32 = 2.0;
+pub(crate) const AMBIGUITY_RATIO: f32 = 2.0;
 /// A finer measurement agrees with a coarse estimate (scaled to its level)
 /// when their D differ by at most DISAGREE or this fraction of its D.
-const FALLBACK_AGREE: f32 = 0.1;
+pub(crate) const FALLBACK_AGREE: f32 = 0.1;
 /// `DenseDepth::source_level` where there is no depth.
-const NO_SOURCE: u8 = u8::MAX;
+pub(crate) const NO_SOURCE: u8 = u8::MAX;
 /// Distinct match: moving D by DISTINCT_STEP (pixels) either way must raise
 /// the patch's SSD by at least DISTINCT_RISE of what `min_texture` predicts
 /// (n · min_texture² · step²). Noise rises by about zero.
-const DISTINCT_STEP: f32 = 2.0;
-const DISTINCT_RISE: f32 = 0.5;
+pub(crate) const DISTINCT_STEP: f32 = 2.0;
+pub(crate) const DISTINCT_RISE: f32 = 0.5;
 /// Along a row, a textureless run is where |∂I/∂x| stays under this many
 /// times `min_texture`; its ends are checked this many pixels inside.
-const FLAT_GRADIENT: f32 = 4.0;
-const FLAT_END_MARGIN: usize = 2;
+pub(crate) const FLAT_GRADIENT: f32 = 4.0;
+pub(crate) const FLAT_END_MARGIN: usize = 2;
 
 #[derive(Debug, Clone)]
 pub struct DenseStereoConfig {
@@ -1217,7 +1217,7 @@ impl RowSums {
 }
 
 /// Valid patches over one pixel, at most.
-const MAX_COVER: usize = 16;
+pub(crate) const MAX_COVER: usize = 16;
 
 impl Densify<'_> {
     /// Patches covering coordinate c along one axis: first..=last.
@@ -1442,10 +1442,11 @@ impl Densify<'_> {
             *c = (self.local_cost(x, y, k), patches[k].d);
         }
         let costs = &costs[..nc];
-        let (win_cost, win_d) = costs
-            .iter()
-            .copied()
-            .fold((f32::INFINITY, lo), |b, c| if c.0 < b.0 { c } else { b });
+        let (win_cost, win_d) =
+            costs
+                .iter()
+                .copied()
+                .fold((f32::INFINITY, lo), |b, c| if c.0 < b.0 { c } else { b });
         // The other surface's best; a winner that is not clearly better
         // leaves the pixel without depth.
         let rival = costs
@@ -1822,6 +1823,28 @@ impl RedBlack {
     }
 }
 
+/// One level's geometry for the GPU matcher (gpu/dense_stereo.rs), of a
+/// rectified rig.
+pub(crate) struct LevelSetup {
+    pub level: usize,
+    pub w: usize,
+    pub h: usize,
+    /// Patch grid.
+    pub ws: usize,
+    pub hs: usize,
+    /// D's search range.
+    pub dmin: f32,
+    pub dmax: f32,
+    /// ln of D per unit inverse range (log-range = ln_s − ln D).
+    pub ln_s: f32,
+    /// Per patch, the right image's shift per unit of D (dx1/dD for the
+    /// patch's centre ray); 0 where that ray has no projection.
+    pub patch_n: Vec<f32>,
+    /// The same per pixel (the variational refinement's warp, the occlusion
+    /// test and the fills' check).
+    pub pixel_n: Vec<f32>,
+}
+
 /// A coarser level's depth after validation, for the coarse fallback.
 #[derive(Default)]
 struct LevelDepth {
@@ -1923,6 +1946,11 @@ impl DenseStereo {
         self.coarsest
     }
 
+    /// Width and height of the input images.
+    pub fn image_size(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+
     /// True when the rig is a rectified pinhole pair (no projection per sample).
     pub fn is_rectified(&self) -> bool {
         matches!(self.epi.kind, EpipolarKind::Rectified { .. })
@@ -1955,7 +1983,8 @@ impl DenseStereo {
         self.run(left, right, out);
     }
 
-    fn run(&mut self, left: &Image<u8>, right: &Image<u8>, out: &mut DenseDepth) {
+    /// Both eyes' pyramids, rectified first with `new_rectifying`.
+    fn build_pyramids(&mut self, left: &Image<u8>, right: &Image<u8>) {
         let n_levels = self.coarsest + 1;
         let [s0, s1] = &mut self.pyr_scratch;
         let (pyr0, pyr1) = (&mut self.pyr0, &mut self.pyr1);
@@ -1968,7 +1997,10 @@ impl DenseStereo {
             None => pyr.build_f32_reuse(img, n_levels, s),
         };
         join(|| build(0, left, pyr0, s0), || build(1, right, pyr1, s1));
+    }
 
+    fn run(&mut self, left: &Image<u8>, right: &Image<u8>, out: &mut DenseDepth) {
+        self.build_pyramids(left, right);
         let finest = self.config.finest_level;
         // Levels the coarse fallback takes depth from: finest+1..=fallback.
         let fallback = self.last_validated_level();
@@ -1993,6 +2025,40 @@ impl DenseStereo {
         self.coarse_fallback();
         self.reject_contradicted_fills();
         self.finish(out);
+    }
+
+    /// Per level, finest to coarsest, the geometry the GPU matcher needs.
+    /// Panics unless the rig is a rectified pinhole pair.
+    pub(crate) fn level_setups(&self) -> Vec<LevelSetup> {
+        let EpipolarKind::Rectified { sign } = self.epi.kind else {
+            panic!("the GPU matcher needs a rectified rig");
+        };
+        (self.config.finest_level..=self.coarsest)
+            .map(|level| {
+                let g = self.levels[level].as_ref().unwrap();
+                LevelSetup {
+                    level,
+                    w: g.w,
+                    h: g.h,
+                    ws: g.ws,
+                    hs: g.hs,
+                    dmin: (g.s / self.config.max_range) as f32,
+                    dmax: (g.s / self.config.min_range) as f32,
+                    ln_s: (g.s as f32).ln(),
+                    // As Epipolar::locate: no projection where !(z > 1e-6).
+                    patch_n: g
+                        .patch_rays
+                        .iter()
+                        .map(|r| if r[2] > 1e-6 { sign / r[2] } else { 0.0 })
+                        .collect(),
+                    pixel_n: g
+                        .rays
+                        .iter()
+                        .map(|r| if r[2] > 1e-6 { sign / r[2] } else { 0.0 })
+                        .collect(),
+                }
+            })
+            .collect()
     }
 
     /// The coarsest level whose patches are validated: the finest, and the
@@ -2709,6 +2775,142 @@ impl DenseStereo {
                 };
             }
         });
+    }
+}
+
+/// One level of `DenseStereo::trace`, for checking the GPU matcher stage by
+/// stage.
+#[cfg(test)]
+pub(crate) struct LevelTrace {
+    pub level: usize,
+    pub gx: Vec<f32>,
+    pub gy: Vec<f32>,
+    /// Per patch: Σ gx², Σ gx·gy, Σ gy², Σ gx, Σ gy.
+    pub sums: Vec<[f32; 5]>,
+    /// Patch D after the coarsest search or the upsampled start.
+    pub init: Vec<f32>,
+    /// Patches after propagation.
+    pub patches: Vec<PatchTrace>,
+    /// Per patch after densification: inverse variance (0: unused) and
+    /// validity.
+    pub precision: Vec<f32>,
+    pub valid_patch: Vec<bool>,
+    /// Dense D, validity and variance after densification.
+    pub dense_d: Vec<f32>,
+    pub dense_valid: Vec<bool>,
+    pub dense_var: Vec<f32>,
+    /// D and variance after the variational refinement (the levels it runs
+    /// at).
+    pub refined: Option<(Vec<f32>, Vec<f32>)>,
+    /// D and validity after `mask` (validated levels).
+    pub masked: Option<(Vec<f32>, Vec<bool>)>,
+}
+
+/// `DenseStereo::trace`'s result: every level's, then the finest level's
+/// sources after the coarse fallback, and the depth map.
+#[cfg(test)]
+pub(crate) struct FrameTrace {
+    pub levels: Vec<LevelTrace>,
+    pub filled: Vec<u8>,
+    pub depth: DenseDepth,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PatchTrace {
+    pub d: f32,
+    pub ssd: f32,
+    pub hess: f32,
+    pub shift: [f32; 2],
+    pub offset: f32,
+    pub ok: bool,
+    pub inside: bool,
+    pub moved: bool,
+    pub settled: bool,
+}
+
+#[cfg(test)]
+impl DenseStereo {
+    /// `compute`'s stages, recording each level's intermediate results.
+    pub(crate) fn trace(&mut self, left: &Image<u8>, right: &Image<u8>) -> FrameTrace {
+        self.build_pyramids(left, right);
+        let finest = self.config.finest_level;
+        let fallback = self.last_validated_level();
+        let mut out = Vec::new();
+        for level in (finest..=self.coarsest).rev() {
+            self.prepare_level(level);
+            if level == self.coarsest {
+                self.search_coarsest(level);
+            } else {
+                self.upsample_init(level);
+            }
+            let init = self.buf.patches.iter().map(|p| p.d).collect();
+            self.propagate(level);
+            let validate = level <= fallback;
+            self.densify(level, validate);
+            let b = &self.buf;
+            out.push(LevelTrace {
+                level,
+                gx: b.gx.clone(),
+                gy: b.gy.clone(),
+                sums: b
+                    .sums
+                    .iter()
+                    .map(|s| [s.xx, s.xy, s.yy, s.x, s.y])
+                    .collect(),
+                init,
+                patches: (b.patches.iter().zip(&b.moved).zip(&b.settled))
+                    .map(|((p, &moved), &settled)| PatchTrace {
+                        d: p.d,
+                        ssd: p.ssd,
+                        hess: p.hess,
+                        shift: p.shift,
+                        offset: p.offset,
+                        ok: p.ok,
+                        inside: p.inside,
+                        moved,
+                        settled,
+                    })
+                    .collect(),
+                precision: b.precision.clone(),
+                valid_patch: b.valid_patch.clone(),
+                dense_d: b.d.clone(),
+                dense_valid: b.valid.clone(),
+                dense_var: b.var.clone(),
+                refined: None,
+                masked: None,
+            });
+            let refines = self.config.variational_iterations > 0
+                && (level == finest || self.config.refine_coarse_levels);
+            self.refine_variational(level);
+            if refines {
+                out.last_mut().unwrap().refined = Some((self.buf.d.clone(), self.buf.var.clone()));
+            }
+            if validate {
+                self.mask(level);
+                out.last_mut().unwrap().masked = Some((self.buf.d.clone(), self.buf.valid.clone()));
+            }
+            if level > finest && level <= fallback {
+                self.keep_level(level);
+            }
+        }
+        self.coarse_fallback();
+        let filled = self.buf.source.clone();
+        self.reject_contradicted_fills();
+        let mut depth = DenseDepth {
+            width: 0,
+            height: 0,
+            level: 0,
+            log_range: Vec::new(),
+            variance: Vec::new(),
+            source_level: Vec::new(),
+        };
+        self.finish(&mut depth);
+        FrameTrace {
+            levels: out,
+            filled,
+            depth,
+        }
     }
 }
 

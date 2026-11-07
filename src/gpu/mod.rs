@@ -1,5 +1,6 @@
 pub mod checkerboard;
 pub mod clahe;
+pub mod dense_stereo;
 pub mod device;
 pub mod fast;
 pub mod frontend;

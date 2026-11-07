@@ -21,6 +21,8 @@
 //                    first; the depth is then on the rectified left grid
 //   --rectified DIR  with --rectify, also write the rectified images to
 //                    DIR/left and DIR/right (rounded to u8)
+//   --gpu            match on the GPU (gpu/dense_stereo.rs; a rectified pair,
+//                    or --rectify)
 //   --out DIR        write <stem>.logr (f32 log-range, little-endian, row-major),
 //                    <stem>.src (u8 source level per pixel, 255 = none) and
 //                    <stem>.png (left image | range, 0.3 m red .. 6 m blue, none black)
@@ -30,6 +32,8 @@
 
 use rudolf_v::camera::StereoRig;
 use rudolf_v::dense_stereo::{DenseDepth, DenseStereo, DenseStereoConfig};
+use rudolf_v::gpu::dense_stereo::GpuDenseStereo;
+use rudolf_v::gpu::device::GpuDevice;
 use rudolf_v::image::Image;
 use rudolf_v::rectify::StereoRectification;
 use std::path::{Path, PathBuf};
@@ -132,8 +136,29 @@ fn write_outputs(out: &Path, stem: &str, left: &Image<u8>, depth: &DenseDepth) {
         .expect("write png");
 }
 
+/// One pair's depth, on the GPU with `gpu`.
+fn compute(
+    stereo: &mut DenseStereo,
+    gpu: &mut Option<(GpuDevice, GpuDenseStereo)>,
+    left: &Image<u8>,
+    right: &Image<u8>,
+    depth: &mut DenseDepth,
+) {
+    match gpu {
+        Some((dev, matcher)) => matcher.compute_into(dev, left, right, depth),
+        None => stereo.compute_into(left, right, depth),
+    }
+}
+
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let use_gpu = match args.iter().position(|a| a == "--gpu") {
+        Some(i) => {
+            args.remove(i);
+            true
+        }
+        None => false,
+    };
     let mut take = |flag: &str| -> Option<String> {
         let i = args.iter().position(|a| a == flag)?;
         args.remove(i);
@@ -225,8 +250,13 @@ fn main() {
             std::fs::create_dir_all(dir.join(eye)).expect("--rectified");
         }
     }
+    let mut gpu = use_gpu.then(|| {
+        let dev = GpuDevice::new().expect("--gpu needs a Vulkan GPU");
+        let matcher = GpuDenseStereo::new(&dev, &stereo);
+        (dev, matcher)
+    });
     eprintln!(
-        "{} pairs, {}x{}, levels {}..={}, {}",
+        "{} pairs, {}x{}, levels {}..={}, {}, on {}",
         pairs.len(),
         pairs[0].1.width(),
         pairs[0].1.height(),
@@ -238,15 +268,27 @@ fn main() {
             "rectified"
         } else {
             "raw (epipolar curves)"
-        }
+        },
+        gpu.as_ref().map_or("the CPU".to_string(), |(dev, _)| dev
+            .adapter_info
+            .name
+            .clone())
     );
 
-    let mut depth = stereo.compute(&pairs[0].1, &pairs[0].2); // warm-up
+    let mut depth = DenseDepth {
+        width: 0,
+        height: 0,
+        level: 0,
+        log_range: Vec::new(),
+        variance: Vec::new(),
+        source_level: Vec::new(),
+    };
+    compute(&mut stereo, &mut gpu, &pairs[0].1, &pairs[0].2, &mut depth); // warm-up
     let mut ms = Vec::with_capacity(pairs.len());
     let mut coverage = 0.0f64;
     for (stem, left, right) in &pairs {
         let t = Instant::now();
-        stereo.compute_into(left, right, &mut depth);
+        compute(&mut stereo, &mut gpu, left, right, &mut depth);
         let dt = t.elapsed().as_secs_f64() * 1e3;
         ms.push(dt);
         coverage += depth.coverage() as f64;
