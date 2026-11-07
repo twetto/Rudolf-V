@@ -282,8 +282,9 @@ impl GpuDevice {
         // Auto-detect RPi when the caller passed Native but the adapter is V3D.
         // This makes GpuDevice::new() work correctly on RPi without requiring
         // every call site to know about DeviceProfile::RaspberryPi.
+        let on_v3d = raw_info.name.to_ascii_lowercase().contains("v3d");
         let profile = match profile {
-            DeviceProfile::Native if raw_info.name.to_ascii_lowercase().contains("v3d") => {
+            DeviceProfile::Native if on_v3d => {
                 eprintln!("[rudolf-v] V3D adapter detected — using RaspberryPi profile");
                 DeviceProfile::RaspberryPi
             }
@@ -291,7 +292,45 @@ impl GpuDevice {
         };
 
         // Build the requested limits from the (possibly auto-upgraded) profile.
-        let limits = limits_for_profile(profile);
+        let mut limits = limits_for_profile(profile);
+
+        // On real V3D, start from what the adapter actually reports and keep
+        // only our deliberate caps on top.
+        //
+        // `limits_for_profile` inherits the rest from `wgpu::Limits::default()`,
+        // and those defaults track the wgpu version rather than the hardware:
+        // the 22 -> 30 bump pushed max_color_attachments (8 vs 4 allowed) and
+        // max_inter_stage_shader_variables (16 vs 15) past VideoCore, and
+        // request_device rejects the whole request over one limit at a time, so
+        // GpuDevice::new() -- and with it every GpuFrontend -- failed outright
+        // on a Pi. Both offenders are graphics-pipeline limits that a
+        // compute-only library never uses, and adding them one per error as
+        // they surface just waits for the next wgpu release.
+        //
+        // The simulated RaspberryPi profile on other hardware is deliberately
+        // left alone: its job is to REJECT work that would not fit a Pi, which
+        // clamping to a desktop adapter's limits would defeat.
+        if on_v3d {
+            let have = adapter.limits();
+            let cap = limits;
+            limits = have.clone();
+            limits.max_compute_invocations_per_workgroup = have
+                .max_compute_invocations_per_workgroup
+                .min(cap.max_compute_invocations_per_workgroup);
+            limits.max_compute_workgroup_size_x =
+                have.max_compute_workgroup_size_x.min(cap.max_compute_workgroup_size_x);
+            limits.max_compute_workgroup_size_y =
+                have.max_compute_workgroup_size_y.min(cap.max_compute_workgroup_size_y);
+            limits.max_compute_workgroup_size_z =
+                have.max_compute_workgroup_size_z.min(cap.max_compute_workgroup_size_z);
+            limits.max_texture_dimension_2d =
+                have.max_texture_dimension_2d.min(cap.max_texture_dimension_2d);
+            limits.max_texture_dimension_1d =
+                have.max_texture_dimension_1d.min(cap.max_texture_dimension_1d);
+            limits.max_storage_buffer_binding_size = have
+                .max_storage_buffer_binding_size
+                .min(cap.max_storage_buffer_binding_size);
+        }
 
         // request_device returns (Device, Queue) directly; the tuple
         // type must be spelled out to help the type inferencer.
@@ -420,8 +459,19 @@ fn limits_for_profile(profile: DeviceProfile) -> wgpu::Limits {
             // RPi 4 has 4 GiB RAM shared with CPU; 128 MiB for GPU buffers
             // is safe for our pyramid + feature buffer workloads.
             max_storage_buffer_binding_size: 128 << 20,
-            // Inherit everything else from wgpu defaults (which are already
-            // conservative enough to be safe on RPi's Vulkan implementation).
+            // V3D allows 4; wgpu's default became 8, so inheriting it made
+            // request_device fail outright on a Pi:
+            //   LimitsExceeded(max_color_attachments: requested 8, allowed 4)
+            // Nothing here needs any: rudolf-v is compute-only (no render
+            // passes at all). Asking for a capability we never use was the
+            // only thing keeping GpuDevice::new() -- and so every GpuFrontend
+            // -- from initialising on VideoCore.
+            max_color_attachments: 4,
+            // Inherit everything else from wgpu defaults. NOTE: those defaults
+            // track the wgpu version, not the hardware -- the wgpu 22 -> 30
+            // bump raised max_color_attachments past what V3D allows and broke
+            // Pi init entirely. Any default V3D cannot meet will surface as
+            // LimitsExceeded naming one limit at a time, so add it above.
             ..wgpu::Limits::default()
         },
     }
