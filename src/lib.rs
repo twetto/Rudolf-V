@@ -25,5 +25,9 @@ pub mod rectify;
 pub mod rigid_ransac;
 pub mod shi_tomasi;
 pub mod stereo;
+#[cfg(unix)]
+pub mod stereo_net;
+#[cfg(unix)]
+pub mod tensorrt;
 
 pub use camera_geometry;

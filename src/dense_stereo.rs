@@ -368,7 +368,7 @@ impl Epipolar {
 }
 
 /// `Some(sign of t_x)` when the rig is a rectified pinhole pair.
-fn rectified_sign(rig: &StereoRig) -> Option<f32> {
+pub(crate) fn rectified_sign(rig: &StereoRig) -> Option<f32> {
     let pinhole = |c: &crate::camera::CameraIntrinsics| {
         matches!(c.model, DistortionModel::None | DistortionModel::RadTan)
             && c.distortion.iter().all(|&k| k == 0.0)
