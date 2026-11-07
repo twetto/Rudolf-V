@@ -426,6 +426,7 @@ mod tests {
                         pipeline.record_build_in_pass(&gpu, &mut pass, &pyr);
                     }
                     clahe.record_readback(&mut enc);
+                    let readback = pyr.record_readback(&gpu, &mut enc);
                     gpu.queue.submit(std::iter::once(enc.finish()));
                     clahe.arm_readback();
                     gpu.device
@@ -435,7 +436,7 @@ mod tests {
 
                     let mut want = Image::new(w, h);
                     histeq::equalize_clahe_into(&img, tile, clip, &mut want);
-                    let got = pyr.readback_level(&gpu, 0);
+                    let got = readback.read(&gpu).swap_remove(0);
 
                     let ws = want.stride();
                     let wp = want.as_slice();
