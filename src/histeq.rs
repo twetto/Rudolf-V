@@ -253,16 +253,6 @@ pub fn equalize_histogram_into(image: &Image<u8>, out: &mut Image<u8>) {
     }
 }
 
-/// Wrapper to send a raw pointer across threads.
-/// SAFETY: The caller must guarantee non-overlapping writes.
-#[cfg(feature = "parallel")]
-#[derive(Clone, Copy)]
-struct SendPtr(*mut u8);
-#[cfg(feature = "parallel")]
-unsafe impl Send for SendPtr {}
-#[cfg(feature = "parallel")]
-unsafe impl Sync for SendPtr {}
-
 /// Build a 256-entry lookup table from a histogram and total pixel count.
 fn build_lut(hist: &[u32; 256], total: usize) -> [u8; 256] {
     let mut cdf = [0u32; 256];

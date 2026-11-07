@@ -28,6 +28,9 @@ parallel = ["rayon"]
 [lints.clippy]
 # Kernels and SIMD routines take many slices and sizes by design.
 too_many_arguments = "allow"
+# as_chunks made the global-histeq histogram 34 % slower on the Pi 4
+# (median 0.79 -> 1.06 ms, Rust 1.99.1); hot loops keep chunks_exact.
+chunks_exact_to_as_chunks = "allow"
 
 [dev-dependencies]
 criterion = "0.5"

@@ -291,6 +291,7 @@ impl KltTracker {
         curr_pyramid: &Pyramid,
         features: &[Feature],
         results: &mut Vec<TrackedFeature>,
+        #[cfg_attr(feature = "parallel", allow(unused_variables))] // sequential path only
         scratch: &mut KltScratch,
     ) {
         let num_levels = self
@@ -329,7 +330,6 @@ impl KltTracker {
                 )
                 .collect();
             *results = par_results;
-            return;
         }
 
         // ── Sequential path ─────────────────────────────────────────────
@@ -1493,13 +1493,11 @@ unsafe fn extract_template_gradients(
             );
         }
     }
-    // A `return` statement, so the scalar tail below can be compiled out.
     #[cfg(target_arch = "aarch64")]
-    #[allow(clippy::needless_return)]
     {
-        return extract_template_gradients_neon(
+        extract_template_gradients_neon(
             r_m1, r_0, r_1, r_p2, bx, count, w00, w10, w01, w11, t_out, gx_out, gy_out,
-        );
+        )
     }
     #[cfg(not(target_arch = "aarch64"))]
     extract_template_gradients_scalar(

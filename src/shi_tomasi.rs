@@ -265,9 +265,7 @@ impl ShiTomasiScratch {
                 self.cell_winners.clear();
                 self.cell_winners.resize(n_cells, None);
             } else {
-                for winner in &mut self.cell_winners {
-                    *winner = None;
-                }
+                self.cell_winners.fill(None);
             }
 
             blur_tensor_cols_collect(
@@ -286,7 +284,7 @@ impl ShiTomasiScratch {
                 &mut self.cell_winners,
             );
 
-            return self.cell_winners.iter().filter_map(Clone::clone).collect();
+            self.cell_winners.iter().filter_map(Clone::clone).collect()
         }
 
         #[cfg(not(feature = "parallel"))]
@@ -295,9 +293,7 @@ impl ShiTomasiScratch {
                 self.cell_winners.clear();
                 self.cell_winners.resize(n_cells, None);
             } else {
-                for winner in &mut self.cell_winners {
-                    *winner = None;
-                }
+                self.cell_winners.fill(None);
             }
 
             blur_tensor_cols_collect(
@@ -626,7 +622,6 @@ fn blur_tensor_rows_5(
                     w, row, k0, k1, k2, k3, k4, ix2, iy2, ixiy, tmp_xx_row, tmp_yy_row, tmp_xy_row,
                 );
             });
-        return;
     }
 
     #[cfg(not(feature = "parallel"))]
@@ -835,7 +830,6 @@ fn blur_tensor_cols_collect_5(
                     );
                 }
             });
-        return;
     }
 
     #[cfg(not(feature = "parallel"))]
@@ -963,7 +957,7 @@ fn collect_row_5_cell_row(
                 continue;
             }
 
-            if winner.as_ref().map_or(true, |prev| score > prev.score) {
+            if winner.as_ref().is_none_or(|prev| score > prev.score) {
                 *winner = Some(Feature {
                     x: x as f32,
                     y: y as f32,

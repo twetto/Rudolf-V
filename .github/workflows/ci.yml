@@ -6,14 +6,19 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Pinned, so new clippy lints arrive with a deliberate bump, not a release.
+env:
+  RUST_VERSION: 1.99.1
+
 jobs:
   fmt:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt
       - name: Check formatting
         run: cargo fmt --all --check
@@ -23,13 +28,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_VERSION }}
           components: clippy
           targets: aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy with parallel
+        run: cargo clippy -p rudolf-v --all-targets --features parallel -- -D warnings
+      # The CPU library alone: nothing outside src/gpu may need wgpu.
+      - name: Clippy without the gpu feature
+        run: cargo clippy -p rudolf-v --all-targets --no-default-features -- -D warnings
       # The NEON paths only compile for aarch64. minifb (an example
       # dev-dependency) builds a little C, hence the cross compiler.
       - name: Clippy for aarch64
@@ -37,9 +48,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
           cargo clippy -p rudolf-v --target aarch64-unknown-linux-gnu --all-targets -- -D warnings
-      # The CPU library alone: nothing outside src/gpu may need wgpu.
-      - name: Check without the gpu feature
-        run: cargo check -p rudolf-v --no-default-features --all-targets
       # The GPU tests are #[ignore]d, and the gpu-test job runs them.
       - name: Test
         run: cargo test --workspace
@@ -51,7 +59,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
       - name: Install lavapipe
         run: |

@@ -176,7 +176,7 @@ impl FastDetector {
                     .then_with(|| a.x.total_cmp(&b.x))
                     .then_with(|| b.score.total_cmp(&a.score))
             });
-            return features;
+            features
         }
 
         #[cfg(not(feature = "parallel"))]
