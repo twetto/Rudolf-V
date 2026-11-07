@@ -13,9 +13,11 @@
 // `cdf_min` is the first non-zero CDF entry; the CDF is monotone, so that is
 // its minimum positive entry and an atomicMin finds it without a serial scan.
 //
-// ROUNDING: WGSL `round` is half-to-even, Rust's `f32::round` is half-away-
-// from-zero. Values here are non-negative, so `floor(x + 0.5)` matches the CPU;
-// plain `round` left ~0.2 % of pixels off by one.
+// ROUNDING: as histeq_lut.wgsl. The CPU divides two exact integers in f32,
+// correctly rounded; WGSL only guarantees 2.5 ULP for `/`, and the Orin's
+// approximate division flipped .5 cases, so the quotient comes from div_rn.
+// Then Rust's `f32::round` (half away from zero): WGSL `round` is half to
+// even, and `floor(x + 0.5)` rounds 0.49999997 up, since x + 0.5 rounds to 1.
 //
 // PACKING: each LUT entry fits in a byte, so the output packs four per u32
 // (entry 4k+j in byte j of word k, i.e. plain byte order on a little-endian
@@ -23,6 +25,39 @@
 // readback is the u8 LUT array as is.
 
 const BINS: u32 = 256u;
+
+// Correctly rounded (round-to-nearest-even) f32 of a / b for integers
+// 0 <= a <= b < 2^24, b > 0: what IEEE f32 division of f32(a) / f32(b) gives.
+// The same function as histeq_lut.wgsl's (see there).
+fn div_rn(a: u32, b: u32) -> f32 {
+    if a == 0u {
+        return 0.0;
+    }
+    if a >= b {
+        return 1.0;
+    }
+    var rem = a;
+    var e = 0i;
+    while rem < b {
+        rem = rem << 1u;
+        e = e - 1;
+    }
+    var q = 0u;
+    for (var i = 0u; i < 25u; i++) {
+        q = q << 1u;
+        if rem >= b {
+            rem -= b;
+            q |= 1u;
+        }
+        rem = rem << 1u;
+    }
+    let round_bit = q & 1u;
+    var mant = q >> 1u;
+    if round_bit == 1u && (rem != 0u || (mant & 1u) == 1u) {
+        mant += 1u;
+    }
+    return ldexp(f32(mant), e - 23);
+}
 
 struct ClaheParams {
     img_width:  u32,
@@ -124,11 +159,15 @@ fn clahe_luts(@builtin(workgroup_id) wg: vec3<u32>,
     workgroupBarrier();
 
     let cdf_min = atomicLoad(&cdf_min_a);
-    let denom   = f32(tile_pixels) - f32(cdf_min);
     var out_v: u32 = 0u;
-    if (denom > 0.0 && cdf_min != 0xffffffffu) {
-        let val = (f32(cdf_i) - f32(cdf_min)) / denom * 255.0;
-        out_v = u32(clamp(floor(val + 0.5), 0.0, 255.0));
+    // CPU: (cdf[i] - cdf_min) / (tile_pixels - cdf_min) * 255; both
+    // differences are exact. cdf_i < cdf_min only before the first non-zero
+    // bin, where the CPU value is negative and clamps to 0.
+    if (cdf_min != 0xffffffffu && tile_pixels > cdf_min && cdf_i >= cdf_min) {
+        let val = div_rn(cdf_i - cdf_min, tile_pixels - cdf_min) * 255.0;
+        // val - floor(val) is exact in f32 for |val| < 2^23.
+        let r = floor(val);
+        out_v = u32(clamp(select(r, r + 1.0, val - r >= 0.5), 0.0, 255.0));
     }
 
     // Pack four entries per word (every thread has read its cdf_i above).

@@ -79,8 +79,11 @@ fn value(x: i32, y: i32) -> f32 {
 
     let top = v00 + ax * (v10 - v00);
     let bot = v01 + ax * (v11 - v01);
-    // Round to the u8 the CPU would have produced, then widen as usual.
-    return clamp(floor(top * (1.0 - ay) + bot * ay + 0.5), 0.0, 255.0);
+    // Round to the u8 the CPU would have produced (half away from zero, as
+    // f32::round), then widen as usual.
+    let val = top * (1.0 - ay) + bot * ay;
+    let r = floor(val);
+    return clamp(select(r, r + 1.0, val - r >= 0.5), 0.0, 255.0);
 }
 
 @compute @workgroup_size({{WG_X}}, {{WG_Y}})

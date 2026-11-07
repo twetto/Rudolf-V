@@ -8,9 +8,9 @@
 //
 // Matches the remap loop of `histeq::equalize_clahe_into`: tile centres sit at
 // (t + 0.5) * tile_size, so the weight is clamp((p - centre0) / tile_size, 0, 1),
-// and the blended value is rounded half-away-from-zero (floor(x + 0.5)) to the
-// u8 the CPU would have produced, then widened to f32 exactly as the identity
-// LUT path does.
+// and the blended value is rounded half away from zero (as `f32::round`; not
+// floor(x + 0.5), which rounds 0.49999997 up) to the u8 the CPU would have
+// produced, then widened to f32 exactly as the identity LUT path does.
 //
 // {{WG_X}} / {{WG_Y}} are substituted by pyramid.rs (same as pyramid.wgsl).
 
@@ -72,7 +72,9 @@ fn convert_u8_clahe(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let top = v00 + ax * (v10 - v00);
     let bot = v01 + ax * (v11 - v01);
-    let out = clamp(floor(top * (1.0 - ay) + bot * ay + 0.5), 0.0, 255.0);
+    let val = top * (1.0 - ay) + bot * ay;
+    let r = floor(val);
+    let out = clamp(select(r, r + 1.0, val - r >= 0.5), 0.0, 255.0);
 
     textureStore(dst_tex, vec2<u32>(gid.x, gid.y), vec4<f32>(out, 0.0, 0.0, 1.0));
 }
