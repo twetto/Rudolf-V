@@ -4,7 +4,7 @@
 // outer square corners), anti-aliased by 4×4 supersampling, with optional
 // barrel distortion, so every test knows the true corner positions.
 
-use rudolf_v::checkerboard::{chess_response, CheckerboardConfig, CheckerboardDetector};
+use rudolf_v::checkerboard::{CheckerboardConfig, CheckerboardDetector, chess_response};
 use rudolf_v::image::Image;
 
 const COLS: usize = 9;

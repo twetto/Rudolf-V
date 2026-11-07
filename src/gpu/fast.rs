@@ -848,7 +848,9 @@ mod tests {
     #[test]
     #[ignore = "requires a real Vulkan GPU"]
     fn test_cpu_no_corners_flat() {
-        assert!(run_gpu_test("gpu::fast::tests::inner_cpu_no_corners_flat").contains("GPU_TEST_OK"));
+        assert!(
+            run_gpu_test("gpu::fast::tests::inner_cpu_no_corners_flat").contains("GPU_TEST_OK")
+        );
     }
     #[test]
     #[ignore = "requires a real Vulkan GPU"]
@@ -858,12 +860,16 @@ mod tests {
     #[test]
     #[ignore = "requires a real Vulkan GPU"]
     fn test_cpu_matches_cpu_ref() {
-        assert!(run_gpu_test("gpu::fast::tests::inner_cpu_matches_cpu_ref").contains("GPU_TEST_OK"));
+        assert!(
+            run_gpu_test("gpu::fast::tests::inner_cpu_matches_cpu_ref").contains("GPU_TEST_OK")
+        );
     }
     #[test]
     #[ignore = "requires a real Vulkan GPU"]
     fn test_gpu_no_corners_flat() {
-        assert!(run_gpu_test("gpu::fast::tests::inner_gpu_no_corners_flat").contains("GPU_TEST_OK"));
+        assert!(
+            run_gpu_test("gpu::fast::tests::inner_gpu_no_corners_flat").contains("GPU_TEST_OK")
+        );
     }
     #[test]
     #[ignore = "requires a real Vulkan GPU"]

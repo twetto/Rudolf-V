@@ -9,7 +9,7 @@
 // The EuRoC benchmark loads the first 50 frames and runs the full
 // frontend pipeline with the euroc_live configuration.
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
 use rudolf_v::camera::CameraIntrinsics;
 use rudolf_v::essential::{self, Correspondence, RansacConfig};

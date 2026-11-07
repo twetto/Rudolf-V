@@ -10,7 +10,7 @@
 // Fixed shapes, float32 tensors. Each tensor has a pinned host buffer: fill
 // the inputs' (`host_mut`), `run`, read the outputs' (`host`).
 
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::path::Path;
 
 unsafe extern "C" {

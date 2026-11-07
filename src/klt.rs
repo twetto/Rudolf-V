@@ -39,7 +39,7 @@
 // SIMD mirrors the texture-gather pattern.
 
 use crate::fast::Feature;
-use crate::image::{interpolate_bilinear, interpolate_bilinear_unchecked, Image};
+use crate::image::{Image, interpolate_bilinear, interpolate_bilinear_unchecked};
 use crate::pyramid::Pyramid;
 
 #[cfg(feature = "parallel")]
@@ -3254,7 +3254,7 @@ mod tests {
         let iw10: i32 = 12 * 24; // 288
         let iw01: i32 = 20 * 8; // 160
         let iw11: i32 = 12 * 8; // 96
-                                // Sum = 1024 ✓
+        // Sum = 1024 ✓
 
         for ix in 0..4 {
             let val_u8 = unsafe {

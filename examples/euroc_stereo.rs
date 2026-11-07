@@ -247,7 +247,9 @@ fn main() {
     let mut fb = vec![0u32; win_w * win_h];
     let mut cam1_display_buf = Image::new(w, h);
 
-    eprintln!("frame,features,matched,match_rate,mean_range,median_range,min_range,max_range,frontend_ms,stereo_ms");
+    eprintln!(
+        "frame,features,matched,match_rate,mean_range,median_range,min_range,max_range,frontend_ms,stereo_ms"
+    );
     println!(
         "Range colors: {:.1}m red/yellow, {:.1}m blue (unit-bearing range). Controls: Q/Esc=quit",
         VIS_NEAR_RANGE_M, VIS_FAR_RANGE_M

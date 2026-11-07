@@ -247,7 +247,9 @@ fn main() {
     println!("\nRunning {} frames...\n", num_frames);
 
     // Per-frame CSV header on stderr for piping to file.
-    eprintln!("frame,tracked,lost,rejected,new,total,histeq_ms,pyramid_ms,klt_ms,ransac_ms,detect_ms,total_ms");
+    eprintln!(
+        "frame,tracked,lost,rejected,new,total,histeq_ms,pyramid_ms,klt_ms,ransac_ms,detect_ms,total_ms"
+    );
 
     struct Accum {
         histeq: Vec<f64>,

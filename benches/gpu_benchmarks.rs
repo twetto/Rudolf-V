@@ -21,7 +21,7 @@
 // costs (wgpu compiles pipelines lazily on some drivers). We set warmup_time
 // explicitly to ensure stable measurements.
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::time::Duration;
 
 use rudolf_v::fast::FastDetector;

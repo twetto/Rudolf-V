@@ -6,7 +6,7 @@
 // that the public surface is usable.
 
 use rudolf_v::convert;
-use rudolf_v::image::{interpolate_bilinear, Image};
+use rudolf_v::image::{Image, interpolate_bilinear};
 
 // ===== Image construction & basic access =====
 

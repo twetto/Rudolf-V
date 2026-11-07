@@ -72,8 +72,8 @@ use crate::camera::CameraIntrinsics;
 use crate::essential::{self, BearingCorrespondence, RansacConfig};
 use crate::fast::Feature;
 use crate::frontend::{
-    compute_lbp_at_lut, compute_lbp_at_tile_lut, prune_low_reservoir_score, prune_overfull_tiles,
-    select_by_tile_deficit, FrameStats, LbpPolicy, TimingStats, TrackMeta,
+    FrameStats, LbpPolicy, TimingStats, TrackMeta, compute_lbp_at_lut, compute_lbp_at_tile_lut,
+    prune_low_reservoir_score, prune_overfull_tiles, select_by_tile_deficit,
 };
 use crate::gpu::clahe::{GpuClahe, TileLuts};
 use crate::gpu::device::GpuDevice;

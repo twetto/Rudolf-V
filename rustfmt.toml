@@ -1,2 +1,1 @@
-edition = "2024"
-skip_children = true
+style_edition = "2024"

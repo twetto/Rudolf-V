@@ -96,7 +96,7 @@ pub(crate) const AMBIGUITY_RATIO: f32 = 2.0;
 /// when their D differ by at most DISAGREE or this fraction of its D.
 pub(crate) const FALLBACK_AGREE: f32 = 0.1;
 /// `DenseDepth::source_level` where there is no depth.
-pub(crate) const NO_SOURCE: u8 = u8::MAX;
+pub const NO_SOURCE: u8 = u8::MAX;
 /// `DenseDepth::source_level` where only textureless patches the
 /// semi-global search placed cover the pixel (`SemiGlobal`).
 pub const INFERRED: u8 = u8::MAX - 1;
@@ -333,6 +333,7 @@ impl Epipolar {
     /// level, and the derivative of that position with respect to D:
     /// `[x1, y1, dx1/dD, dy1/dD]`. (x, y) is the ray's left pixel in the level.
     #[inline]
+    #[allow(clippy::neg_cmp_op_on_partial_ord)] // NaN fails the test too
     fn locate(&self, g: &LevelGeom, ray: [f32; 3], x: f32, y: f32, d: f32) -> Option<[f32; 4]> {
         match self.kind {
             EpipolarKind::Rectified { sign } => {
@@ -784,7 +785,7 @@ impl PatchRows<'_> {
     fn residuals<const COST: bool>(&self, res: &mut [f32]) -> [f32; 4] {
         #[cfg(target_arch = "x86_64")]
         {
-            if self.psz % 8 == 0
+            if self.psz.is_multiple_of(8)
                 && is_x86_feature_detected!("avx2")
                 && is_x86_feature_detected!("fma")
             {
@@ -1113,6 +1114,7 @@ impl LevelView<'_> {
     /// `e`), accepting only steps that lower the SSD. Moving more than a
     /// patch side from the start discards the result, as DIS does. Also
     /// whether it converged (stopped before the iteration limit).
+    #[allow(clippy::neg_cmp_op_on_partial_ord)] // NaN fails the test too
     fn refine(&self, k: usize, start: f32, mut e: Eval, iterations: usize) -> (PatchState, bool) {
         let first = self.state(start, &e);
         let mut d = start;
@@ -1482,11 +1484,10 @@ impl Densify<'_> {
             *c = (self.local_cost(x, y, k), patches[k].d);
         }
         let costs = &costs[..nc];
-        let (win_cost, win_d) =
-            costs
-                .iter()
-                .copied()
-                .fold((f32::INFINITY, lo), |b, c| if c.0 < b.0 { c } else { b });
+        let (win_cost, win_d) = costs
+            .iter()
+            .copied()
+            .fold((f32::INFINITY, lo), |b, c| if c.0 < b.0 { c } else { b });
         // The other surface's best; a winner that is not clearly better
         // leaves the pixel without depth.
         let rival = costs
@@ -2268,7 +2269,10 @@ impl DenseStereo {
                                 false,
                             ),
                         };
-                        (p, !((p.d - own).abs() < GN_MIN_STEP), converged)
+                        // NaN counts as moved.
+                        #[allow(clippy::neg_cmp_op_on_partial_ord)]
+                        let moved = !((p.d - own).abs() < GN_MIN_STEP);
+                        (p, moved, converged)
                     },
                 );
                 for (i, &(p, m, s)) in steps.iter().enumerate() {

@@ -209,7 +209,9 @@ fn main() {
     }
 
     // CSV header on stderr.
-    eprintln!("frame,tracked,lost,rejected,new,total,histeq_ms,pyramid_ms,klt_ms,ransac_ms,detect_ms,total_ms");
+    eprintln!(
+        "frame,tracked,lost,rejected,new,total,histeq_ms,pyramid_ms,klt_ms,ransac_ms,detect_ms,total_ms"
+    );
 
     // Benchmark loop.
     println!("\nRunning {num_frames} frames...\n");
