@@ -14,8 +14,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        # ubuntu-24.04-arm: the aarch64 wheel, for the Jetsons; built and
+        # tested natively, NEON paths included
+        os: [windows-latest, ubuntu-latest, ubuntu-24.04-arm]
         package: [camera-geometry, rudolf-v]
+        exclude:
+          # No aarch64 user of the camera-geometry wheel yet
+          - os: ubuntu-24.04-arm
+            package: camera-geometry
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

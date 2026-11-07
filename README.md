@@ -43,6 +43,10 @@ frontend = rudolf_v.Frontend(rudolf_v.FrontendConfig.from_yaml("config.yaml"), 7
 features, stats = frontend.process(grey)  # uint8 (480, 752) array
 ```
 
+CI builds the wheel for Linux (x86-64 and aarch64) and Windows. For a Jetson,
+`maturin build --release --zig --target aarch64-unknown-linux-gnu` in that
+directory cross-builds one.
+
 `tools/cross.sh` cross-compiles for a board, copies over ssh and runs tests or an
 example there.
 
