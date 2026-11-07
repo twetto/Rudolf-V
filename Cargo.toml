@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/camera-geometry", "crates/camera-geometry-python"]
+members = [".", "crates/camera-geometry", "crates/camera-geometry-python", "crates/rudolf-v-python"]
 resolver = "2"
 
 [package]
@@ -18,12 +18,15 @@ wgpu = { version = "30", optional = true }
 pollster = { version = "0.3", optional = true }
 bytemuck = { version = "1", features = ["derive"], optional = true }
 rayon = { version = "1", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
 
 [features]
 default = ["gpu"]
 # rudolf_v::gpu: the wgpu frontend, pyramid, CLAHE and dense stereo
 gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 parallel = ["rayon"]
+# rudolf_v::config: the settings as a YAML config file spells them
+serde = ["dep:serde"]
 
 [lints.clippy]
 # Kernels and SIMD routines take many slices and sizes by design.
@@ -39,6 +42,8 @@ approx = "0.5"
 image = "0.25"
 # Live visualization window (minimal framebuffer), for the examples
 minifb = "0.27"
+# Config-file tests
+serde_yaml = "0.9"
 
 [[example]]
 name = "bench_euroc_gpu"

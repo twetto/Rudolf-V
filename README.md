@@ -31,6 +31,17 @@ rudolf-v = { git = "https://github.com/twetto/Rudolf-V.git" }
 Features: `gpu` (default) builds the `gpu::` modules on wgpu; with
 `default-features = false` the CPU library needs neither wgpu nor a GPU. `parallel`
 spreads the CPU work (detection, KLT, stereo matching) over threads with rayon.
+`serde` adds `config`: the frontend's and stereo matcher's settings as the
+`RudolfV:` and `Stereo:` sections of a YAML config file.
+
+From Python, `crates/rudolf-v-python` (`pip install crates/rudolf-v-python`)
+has the frontend, the stereo matcher and the checkerboard finder:
+
+```python
+import rudolf_v
+frontend = rudolf_v.Frontend(rudolf_v.FrontendConfig.from_yaml("config.yaml"), 752, 480)
+features, stats = frontend.process(grey)  # uint8 (480, 752) array
+```
 
 `tools/cross.sh` cross-compiles for a board, copies over ssh and runs tests or an
 example there.

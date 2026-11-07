@@ -6,6 +6,8 @@
 
 pub mod camera;
 pub mod checkerboard;
+#[cfg(feature = "serde")]
+pub mod config;
 pub mod convert;
 pub mod convolution;
 pub mod dense_stereo;
