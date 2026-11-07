@@ -12,6 +12,7 @@ pub mod dense_stereo;
 pub mod essential;
 pub mod fast;
 pub mod frontend;
+#[cfg(feature = "gpu")]
 pub mod gpu;
 pub mod gradient;
 pub mod harris;

@@ -200,7 +200,7 @@ pub fn chess_response_into(image: &Image<u8>, out: &mut Image<f32>) {
     fill_response(image, out);
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "gpu"))]
 /// The response as the detector stores it, 5R in i16 (for checking a GPU's).
 pub(crate) fn chess_response_r5(image: &Image<u8>) -> Image<i16> {
     let mut out = Image::new(image.width(), image.height());
@@ -209,6 +209,7 @@ pub(crate) fn chess_response_r5(image: &Image<u8>) -> Image<i16> {
 }
 
 /// `image` at half size, each pixel the rounded mean of a 2×2 block.
+#[cfg(feature = "gpu")]
 pub(crate) fn half_size(image: &Image<u8>) -> Image<u8> {
     let mut out = Image::new(image.width() / 2, image.height() / 2);
     half_size_into(image, &mut out);
@@ -400,6 +401,7 @@ fn candidate_at<T: ResponseValue>(x: usize, y: usize, v: T, near: [T; 4]) -> Can
 
 /// A local maximum as a GPU finds it: position, 5R, and its left, right, upper
 /// and lower neighbours' 5R.
+#[cfg(feature = "gpu")]
 #[derive(Clone, Copy)]
 pub(crate) struct Maximum {
     pub x: u16,
@@ -410,6 +412,7 @@ pub(crate) struct Maximum {
 
 /// `candidates_in`'s result from its maxima, found in any order: strongest
 /// first, ties in row-major order (as its stable sort of a row-major scan).
+#[cfg(feature = "gpu")]
 pub(crate) fn candidates_from(
     maxima: &mut [Maximum],
     config: &CheckerboardConfig,
@@ -424,6 +427,7 @@ pub(crate) fn candidates_from(
 
 /// `candidates_in` on a response computed here: for a GPU's frame with more
 /// maxima than its buffer holds.
+#[cfg(feature = "gpu")]
 pub(crate) fn candidates_of(image: &Image<u8>, config: &CheckerboardConfig) -> Vec<Candidate> {
     let mut response = Image::<i16>::new(image.width(), image.height());
     fill_response(image, &mut response);
@@ -431,6 +435,7 @@ pub(crate) fn candidates_of(image: &Image<u8>, config: &CheckerboardConfig) -> V
 }
 
 /// The threshold `candidates_in` applies, in 5R.
+#[cfg(feature = "gpu")]
 pub(crate) fn grow_r5(config: &CheckerboardConfig) -> i16 {
     r5_at_least(config.grow_response)
 }
@@ -497,6 +502,7 @@ impl CheckerboardDetector {
 
     /// As `detect`, with the candidates found elsewhere (on a GPU): `full` in
     /// `image`, `half` in its half-size image, as `candidates_in` gives them.
+    #[cfg(feature = "gpu")]
     pub(crate) fn detect_with_candidates(
         &self,
         image: &Image<u8>,

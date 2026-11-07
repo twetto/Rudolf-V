@@ -9,30 +9,62 @@ edition = "2021"
 description = "RUst Device-Optimized Library for Frontend Vision"
 
 [dependencies]
-# Image I/O only -- NOT for algorithms
-image = "0.25"
-# Live visualization window (minimal framebuffer)
-minifb = "0.27"
 # Linear algebra (geometric verification, SVD)
 nalgebra = "0.33"
 camera-geometry = { path = "crates/camera-geometry" }
 # GPU compute (Vulkan/Metal/DX12/WebGPU backends)
-wgpu = "30"
+wgpu = { version = "30", optional = true }
 # Minimal async executor for blocking on wgpu futures in sync context
-pollster = "0.3"
-bytemuck = { version = "1", features = ["derive"] }
+pollster = { version = "0.3", optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }
 rayon = { version = "1", optional = true }
 
 [features]
+default = ["gpu"]
+# rudolf_v::gpu: the wgpu frontend, pyramid, CLAHE and dense stereo
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 parallel = ["rayon"]
 
 [dev-dependencies]
 criterion = "0.5"
 approx = "0.5"
+# Image I/O only -- NOT for algorithms (examples, benches and tests)
+image = "0.25"
+# Live visualization window (minimal framebuffer), for the examples
+minifb = "0.27"
+
+[[example]]
+name = "bench_euroc_gpu"
+required-features = ["gpu"]
+
+[[example]]
+name = "checkerboard_eval"
+required-features = ["gpu"]
+
+[[example]]
+name = "dense_stereo_eval"
+required-features = ["gpu"]
+
+[[example]]
+name = "gpu_euroc_live"
+required-features = ["gpu"]
+
+[[example]]
+name = "gpu_fast"
+required-features = ["gpu"]
+
+[[example]]
+name = "gpu_frontend"
+required-features = ["gpu"]
+
+[[example]]
+name = "gpu_pyramid"
+required-features = ["gpu"]
 
 [[bench]]
 name = "gpu_benchmarks"
 harness = false
+required-features = ["gpu"]
 
 [[bench]]
 name = "benchmarks"

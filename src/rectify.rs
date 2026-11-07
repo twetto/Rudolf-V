@@ -29,7 +29,8 @@ use rayon::prelude::*;
 /// and below it (wy). The GPU reads the same layout
 /// (pyramid_convert_rect.wgsl).
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "gpu", derive(bytemuck::Pod, bytemuck::Zeroable))]
 pub struct RemapTap {
     pub pos: u32,
     pub wx: f32,
