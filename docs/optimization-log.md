@@ -1,0 +1,336 @@
+# Optimization log
+
+The development phases of Rudolf-V, moved here from the README on 2026-11-07.
+Figures are as measured at the time; the README has the current ones.
+
+We are adopting a verification-first development strategy. The project is divided into three distinct phases:
+
+## Phase 1: Pure Rust CPU Reference (Complete)
+
+**Goal:** Implement the core VIO frontend algorithms in safe, single-threaded Rust.
+
+**Purpose:** Since debugging GPU shaders is difficult, this CPU implementation serves as the **Test Oracle** (Ground Truth). We did not write a single line of shader code until the math was verified here.
+
+* [x] `Image<T>` Dynamic Container
+* [x] Gaussian Pyramid Generation
+* [x] FAST Corner Detection
+* [x] Harris Corner Response
+* [x] KLT (Lucas-Kanade) Feature Tracker
+* [x] Occupancy Grid + Frontend Pipeline
+
+## Phase 2: `wgpu` Acceleration (Complete)
+
+**Goal:** Port the verified algorithms to WGSL compute shaders, targeting Vulkan
+on NVIDIA, AMDGPU, and Raspberry Pi 4 & 5.
+
+**Purpose:** Unlock real-time performance on embedded and cross-platform devices.
+
+**Architecture — Hybrid CPU/GPU Model:**
+
+GPU handles all heavy compute *within* a frame. CPU handles orchestration
+*between* frames. The boundary falls at the KLT output readback.
+
+```
+┌─────────────────────────────── GPU (per frame) ──────────────────────────────┐
+│  Image upload → Pyramid construction → FAST detection → KLT tracking         │
+└───────────────────────────────────────┬──────────────────────────────────────┘
+                                        │ readback: tracked (x, y) positions only
+                                        ▼
+┌─────────────────────────────── CPU (per frame) ──────────────────────────────┐
+│  RANSAC outlier rejection → Occupancy grid update → Replenishment decisions  │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+The readback is mandatory because RANSAC (essential matrix estimation) requires
+feature positions on the CPU every frame. This is a small buffer (~200 features
+× 8 bytes) so latency is negligible. Pyramid levels, gradient images, and
+detection candidates never need to touch the CPU.
+
+**Hardware tuning knobs:**
+
+Two enums on `GpuFrontendConfig` expose the underlying tradeoffs:
+
+| Setting | Options | Default |
+|---|---|---|
+| `SubmitStrategy` | `Separate`, `Fused`, `Pipelined`, `Auto` | `Auto` |
+| `NmsStrategy` | `Cpu`, `Gpu` | `Cpu` |
+
+`SubmitStrategy::Fused` records the whole frame into a single command
+encoder: one submit, one wait. `SubmitStrategy::Pipelined` puts FAST in a
+second submit so the CPU stages (LBP, RANSAC, pruning) overlap with it.
+`SubmitStrategy::Auto` (default) picks between the two per frame (see
+Phase 3h). `SubmitStrategy::Separate` is the original flow: each stage
+submitted and waited for on its own. All four give identical results.
+
+`NmsStrategy::Cpu` reads back the full score buffer (~1.4 MB for 752×480) and
+runs cell-max NMS on the CPU. `NmsStrategy::Gpu` adds a compute pass and reads
+back only per-cell winners (~17 KB), saving PCIe bandwidth on discrete hardware.
+
+Current benchmark results are in the README.
+
+**Milestones:**
+
+* [x] `GpuDevice` abstraction (device/queue/command encoder wrappers)
+* [x] Image upload + staging buffer infrastructure
+* [x] Pyramid construction kernel (validated pixel-for-pixel against `Pyramid::build`)
+* [x] FAST corner detection kernel
+* [x] KLT tracking kernel (inverse compositional — constant Hessian is GPU-friendly)
+* [x] `NmsStrategy::{Cpu, Gpu}` — selectable NMS for iGPU and discrete GPU
+* [x] `SubmitStrategy::{Separate, Fused, Pipelined, Auto}` — selectable submit strategy
+* [x] `GpuFrontend::process()` integration (API-compatible with CPU `Frontend`)
+* [ ] Harris corner response kernel
+
+## Phase 3: Optimization (Active)
+
+**Goal:** Close the gap to OpenCV performance through platform-specific optimization.
+
+**Purpose:** Make the CPU pipeline production-viable on embedded targets (RPi 4).
+
+**Phase 3a — GPU overhead investigation (complete):**
+
+Systematic comparison against vilib's CUDA implementation revealed that wgpu's
+GPU advantage at EuRoC resolution is blocked by fixed overhead, not kernel
+compute. Optimizations attempted and their outcomes:
+
+| Optimization | Target | Result |
+|---|---|---|
+| Occupancy grid skip in FAST shader | Reduce GPU FAST work | No effect — dispatch overhead dominates, not compute |
+| 5-tap kernel (match CPU) in pyramid shader | Reduce GPU pyramid work | No effect — same reason |
+| `MAPPABLE_PRIMARY_BUFFERS` (STORAGE\|MAP_READ) | Eliminate readback copy on iGPU | No effect — copy was already free on unified memory |
+| Comparison with vilib CUDA architecture | Identify fundamental gaps | Confirmed: mapped pinned memory, ~5μs launch, no bind groups |
+
+Conclusion (at the time): at 752×480, the CPU pipeline won on all targets
+tested. Phase 3c revisited this and removed most of the per-frame host
+overhead.
+
+**Phase 3c — GPU per-frame overhead removal:**
+
+`SubmitStrategy::Fused` (the default until Phase 3h) no longer allocates anything per
+frame, and does one submit and one wait per frame:
+
+* Two persistent pyramids used alternately (`GpuPyramidPipeline::allocate` +
+  `record_rebuild`). The frame is uploaded as u8 via `queue.write_texture`
+  and widened to f32 on the GPU. Before this, the CPU converted it and a
+  1.4 MB staging buffer was allocated every frame.
+* KLT bind groups are cached per pyramid pair.
+* FAST is recorded into the fused submit every frame. KLT or RANSAC losses
+  no longer trigger a second blocking round-trip, which also fixes missed
+  replenishment after RANSAC rejections.
+* Replenishment looks winners up in the occupancy grid directly instead of
+  filling a full-resolution mask image (~0.7ms/frame on Jetson).
+
+Output is bit-identical to the original `Separate` pipeline over all 2912
+frames of EuRoC V1_01_easy. `Separate` keeps the original flow (fresh
+pyramid per frame). The persistent pyramids must be built and first
+consumed in the same command buffer. On the Tegra Vulkan driver (wgpu 22),
+reading them from a later submit intermittently returned stale texels. See
+the SUBMISSION note in `gpu/frontend.rs`.
+
+On Jetson, the GPU clock governor stays at the lowest clocks for this bursty
+load (306–510 MHz of 1020 MHz). Benchmark with `sudo jetson_clocks` to
+measure at locked clocks.
+
+**Phase 3e — CPU offload: split API + reservoir parity:**
+
+`GpuFrontend` is now a drop-in for the CPU `Frontend`'s default reservoir
+policy. It has LBP verification (soft/hard), per-track `TrackMeta`
+(`track_meta()`), reservoir-score and over-full-tile pruning, and
+`drop_tracks`. These run on the CPU through the same helpers as `frontend.rs`,
+with the same defaults.
+
+`process()` is now `submit()` + `collect()`. Work done between the two
+overlaps with the GPU. `drop_tracks()` may be called in between, and also
+removes the IDs from the frame in flight. On Jetson Orin Nano (V1_01_easy):
+
+| Backend work between submit/collect | 0 ms | 1 ms | 2 ms | 3 ms | 4 ms |
+|---|---|---|---|---|---|
+| Frame time | 3.01 | 3.01 | 3.04 | 3.87 | 4.87 |
+
+Up to ~2 ms of backend work per frame is free (3.0 ms instead of ~5 ms back
+to back). The CPU frontend spends 8.5–9 ms of CPU time per frame across ~2.5
+cores. The GPU frontend's CPU work is ~1 ms. Calling `collect()` too early
+wastes a core, because the Tegra driver spins while waiting. `poll_ready()`
+checks without blocking.
+
+Not ported yet: the forward-backward gate (`klt_fb_threshold_px`), the
+pose-prior epipolar gate, and non-FAST detectors.
+
+**Phase 3g — beating OpenCV CUDA on Jetson:**
+
+Measured with a Rust benchmark (`opencv` crate, OpenCV 4.12 built with CUDA
+for sm_87) running the same pipeline: pyramidal LK (200 pts, 15×15, 3
+levels), FAST 20 9/16 with best-per-32-px-cell replenishment, and RANSAC on
+undistorted points. OpenCV's fastest RANSAC here is `findFundamentalMat`
+`FM_RANSAC` (7-point). Jetson Orin Nano, locked clocks, EuRoC V1_01_easy,
+ms/frame, alternating back-to-back runs:
+
+| | No histeq | Global histeq |
+|---|---|---|
+| OpenCV CUDA (7-point RANSAC) | 1.37–1.40 | 1.30–1.33 |
+| Rudolf-V GPU, `Fused` (default) | **1.11–1.13** | **1.20–1.26** |
+| Rudolf-V GPU, `Pipelined` (fixed GPU clock only) | 0.95–1.02 | 1.11–1.15 |
+
+What got it there (frontend output bit-identical throughout):
+
+* **wgpu 22 → 30**, with wgpu's injected shader loop bounding turned off
+  (`GpuDevice::create_compute_shader`). Loop bounding made FAST + NMS 1.8×
+  slower; bounds checks stay on.
+* **Fused FAST + NMS** (`fast_nms_fused.wgsl`). One workgroup per cell, with
+  a shared-memory reduction and the same tie-break as the old score buffer
+  + NMS pass: 0.38 → 0.25 ms GPU.
+* **Pyramid**:
+  * Constant binomial weights instead of a uniform-driven generic kernel.
+  * Level 0 and level 1 in one dispatch, with level 1 computed from the raw
+    u8 frame through the LUT (`pyramid_l0l1.wgsl`).
+  * 0.20 → 0.11 ms GPU.
+* **KLT** keeps its template and gradients in workgroup memory.
+* **One compute pass per frame** (histogram, LUT, pyramid, KLT, FAST). There
+  are no encoder-level clears; zeroing goes through the queue. CPU
+  recording + submit fell from 0.37 to 0.23 ms.
+* **RANSAC input**:
+  * Bearings unprojected in one frame are reused as the next frame's
+    previous bearings.
+  * The previous position is found through a hash lookup instead of a
+    linear scan.
+  * 0.23 → 0.18 ms.
+* **`SubmitStrategy::Pipelined`**. FAST goes in a second submit, so
+  LBP, RANSAC and pruning overlap with it on the GPU. Validated at unlocked
+  clocks in Phase 3h; used by `Auto` (default) when it pays off.
+
+**GPU waits.** wgpu waits with `vkWaitSemaphores`, and NVIDIA's Tegra driver
+busy-waits inside it, keeping a core at 100% for the whole wait.
+`GpuFrontendConfig::gpu_wait` (`GpuWait::Auto`, the default) therefore
+sleep-polls on Tegra: a zero-timeout wait, then 20 µs sleeps. Elsewhere it
+uses the driver's blocking wait. This only matters when `collect()` runs
+before the GPU is done; with ≥ the GPU time of work between `submit()` and
+`collect()`, there is no wait at all. Measured with nothing in between:
+
+| | Block: frame / CPU | Auto: frame / CPU |
+|---|---|---|
+| Fused, no histeq | 1.09 / 1.09 ms | 1.14 / 0.55 ms |
+| Fused, Global | 1.30 / 1.30 ms | 1.29 / 0.58 ms |
+
+Tried without gain: a shared-memory tile for FAST (the texture cache already
+serves the overlapping reads), and arithmetic circle offsets (slower than the
+table).
+
+The single compute pass and `Pipelined` were measured with locked clocks;
+Phase 3h validates them with the GPU governor active.
+
+**Phase 3h — unlocked clocks, `SubmitStrategy::Auto`:**
+
+Jetson Orin Nano, default GPU governor (no `jetson_clocks`), V1_01_easy:
+
+* **Determinism.** No per-frame differences from the reference output in
+  any run:
+  * 174 full `Pipelined` runs (both reference configurations), 100 of them
+    while a random GPU load made the clock governor switch ~5000 times.
+  * 91 `Fused` runs alongside.
+  * Positive control: a probe that builds a fresh pyramid and reads it only
+    in a later submit still reads stale data under the same conditions
+    (stale reads in 13 of 31 runs). The frontend never uses that pattern
+    (see SUBMISSION in `src/gpu/frontend.rs`).
+* **Synchronization validation.** Vulkan validation layers 1.3.250
+  (`VALIDATION_CHECK_ENABLE_SYNCHRONIZATION_VALIDATION_QUEUE_SUBMIT`, which
+  checks hazards across submits and is off by default) report no hazards for
+  `Fused`, `Pipelined`, or the probe. wgpu's barriers are correct; the stale
+  reads come from below the API. The layers shipped with Ubuntu 22.04
+  (1.3.204) do not detect cross-submit hazards at all.
+* **`SubmitStrategy::Auto` (new default).** `Pipelined` is fastest when
+  `collect()` follows `submit()` directly (unlocked: 2.0–2.4 vs 2.9–3.5
+  ms/frame). Its second submit costs ~0.1–0.15 ms of CPU, which is wasted
+  once the caller's work between `submit()` and `collect()` covers the GPU
+  time (3 ms of simulated backend work: 3.70 vs 3.88 ms for `Fused` vs
+  `Pipelined`). `Auto` checks at the start of `collect()` whether the
+  frame's last submit has already finished (a zero-timeout wait). If it
+  has, the next frame uses `Fused`, otherwise `Pipelined`. Frames submitted
+  as `Pipelined`, by simulated backend work:
+
+  | Backend work | 0 ms | 0.5 ms | 1 ms | 2 ms | 3 ms |
+  |---|---|---|---|---|---|
+  | `Pipelined` frames | 100% | 100% | 75% | 13% | 1% |
+
+  Output is bit-identical in every mode and overlap.
+* **KLT hardware sampling** (opt-in, Phase 3d) is repeat-deterministic with
+  `Fused`, `Pipelined` and `Auto`, with the same output in all three.
+
+**Phase 3f — histogram equalization:**
+
+CPU frontend, Global histeq. The histogram now uses 4 interleaved
+sub-histograms (0.41 → 0.30 ms). The LUT remap fused into pyramid level 0 is
+now a NEON `tbl` lookup (0.26 → 0.125 ms). The output is bit-identical (same
+determinism hash).
+
+GPU frontend, Global histeq. `GpuGlobalHistEq` builds the histogram and the
+LUT in the frame's submit. The pyramid's level-0 convert pass reads through
+the LUT, and only the 1 KB LUT is read back for CPU-side LBP. The LUT division
+is correctly rounded on the GPU, so the result is bit-identical to the CPU
+equalization: same frontend output over all 2912 frames. That costs ~4 µs of
+GPU time per frame.
+
+Jetson Orin Nano, locked clocks, EuRoC V1_01_easy, Global histeq:
+
+| | Frame time | CPU time |
+|---|---|---|
+| CPU frontend | 3.33–3.41 ms | 7.7 ms |
+| GPU frontend, histeq on CPU | 2.08–2.10 ms | 3.2 ms |
+| GPU frontend, histeq on GPU (default) | 1.85–1.90 ms | 1.9 ms |
+
+For comparison, Ryzen 7 3700X + RX Vega 56/64 (RADV, Mesa 26.2, unlocked
+clocks), same sequence, all 2912 frames, three runs each:
+
+| | Frame time (mean) |
+|---|---|
+| CPU frontend, `--features parallel` | 1.71–1.72 ms |
+| GPU frontend, histeq on GPU (default) | 0.59–0.60 ms |
+| GPU frontend, no histeq | 0.56–0.57 ms |
+| GPU frontend, CLAHE on GPU (`becf218`; 0.90–0.91 ms after the change below) | 1.18–1.22 ms |
+
+CLAHE runs on the GPU too (`becf218`): `clahe_lut.wgsl` builds one LUT per
+tile, and the level-0 pyramid pass blends the four around each pixel. The
+LUTs are read back, packed four entries per u32, for LBP verification on the
+CPU, which looks up each pixel's tile blend in per-axis tables built once per
+image size instead of recomputing it. On RX Vega 56/64 (RADV), V1_01_easy, tile
+32, clip 2, those two changes take the GPU frontend from 1.20 to 0.91 ms/frame
+(Global histeq: 0.66 ms in the same session).
+
+**Phase 3d — KLT hardware bilinear sampling (opt-in):**
+
+`KltSampling::Hardware` samples the pyramid through the texture unit instead
+of 4 `textureLoad`s. It needs `FLOAT32_FILTERABLE`, which `GpuDevice` now
+requests when the adapter has it. Results on Jetson Orin Nano:
+
+* KLT GPU time: 0.63 → 0.52 ms. Frontend: 2.57 → 2.49 ms.
+* Accuracy vs CPU IC-KLT: median 0.0015 px, p99 0.004 px. About 2× as many
+  ill-conditioned tracks run away (≈0.1% of tracks).
+* RANSAC rejects 0.6% more tracks over the whole sequence.
+
+It stays opt-in (`Manual` is the default) because the gain is small, and
+because it was badly nondeterministic outside `Fused` on Tegra (stale texture
+reads).
+
+This work also fixed a latent race in `klt_warp.wgsl`. Thread 0 wrote the
+Hessian inverse to a storage buffer and the other threads read it back after
+`workgroupBarrier()`. That barrier does not order storage memory, so it is
+now broadcast through workgroup memory.
+
+**Phase 3b — CPU SIMD optimization (active):**
+
+When this phase started, the RPi 4 took ~50 ms per frame, with this profile
+(it now takes 12.7 ms on one core; see the benchmark table):
+
+| Stage | At the start | Target | Approach |
+|---|---|---|---|
+| Pyramid construction | ~24ms | ~3–4ms | Separable NEON convolution |
+| KLT tracking | ~15ms | ~5ms | NEON Hessian accumulation |
+| FAST detection | ~8ms | ~3ms | NEON ring comparisons |
+
+* [x] KLT inverse-compositional restructuring (1.7× speedup)
+* [x] Row-pointer memory access, constant weight precomputation
+* [x] `KltScratch` allocation reuse
+* [ ] Separable NEON convolution for pyramid construction (highest priority)
+* [x] NEON KLT: template gradients and the inverse-compositional iteration
+  (`extract_template_gradients_neon`, `ic_iterate_patch_neon`)
+* [x] NEON ring comparisons for FAST (`detect_row_range_neon`,
+  `full_ring_pass_mask_neon`)
+* [ ] Platform-specific CPU/GPU dispatch strategy
