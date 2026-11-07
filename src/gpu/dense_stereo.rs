@@ -2188,11 +2188,8 @@ mod tests {
     #[test]
     #[ignore = "requires a real Vulkan GPU"]
     fn test_matches_cpu() {
-        let out = std::process::Command::new("cargo")
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
-                "test",
-                "--lib",
-                "--",
                 "gpu::dense_stereo::tests::inner_matches_cpu",
                 "--exact",
                 "--ignored",

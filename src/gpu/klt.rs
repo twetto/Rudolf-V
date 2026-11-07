@@ -964,16 +964,8 @@ mod tests {
     use crate::pyramid::Pyramid;
 
     fn run_gpu_test(test_name: &str) -> String {
-        let output = std::process::Command::new("cargo")
-            .args([
-                "test",
-                "--lib",
-                "--",
-                test_name,
-                "--exact",
-                "--ignored",
-                "--nocapture",
-            ])
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([test_name, "--exact", "--ignored", "--nocapture"])
             .output()
             .unwrap_or_else(|e| panic!("subprocess failed: {e}"));
         let out = String::from_utf8_lossy(&output.stdout).into_owned()

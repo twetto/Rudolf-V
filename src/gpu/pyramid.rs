@@ -1353,16 +1353,8 @@ mod tests {
 
     #[cfg(test)]
     fn run_gpu_test_in_subprocess(test_name: &str) -> String {
-        let output = std::process::Command::new("cargo")
-            .args([
-                "test",
-                "--lib",
-                "--",
-                test_name,
-                "--exact",
-                "--ignored",
-                "--nocapture",
-            ])
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([test_name, "--exact", "--ignored", "--nocapture"])
             .output()
             .unwrap_or_else(|e| panic!("subprocess failed for {test_name}: {e}"));
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
