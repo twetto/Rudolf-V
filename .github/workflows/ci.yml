@@ -34,10 +34,15 @@ jobs:
           components: clippy
           targets: aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
+      # The Python bindings turn on rudolf-v's parallel and serde features,
+      # and a workspace build would turn them on for everything; they get
+      # steps of their own.
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Clippy with parallel
-        run: cargo clippy -p rudolf-v --all-targets --features parallel -- -D warnings
+        run: cargo clippy --workspace --exclude rudolf-v-python --all-targets -- -D warnings
+      - name: Clippy with parallel and serde
+        run: cargo clippy -p rudolf-v --all-targets --features parallel,serde -- -D warnings
+      - name: Clippy for the Python bindings
+        run: cargo clippy -p rudolf-v-python --all-targets -- -D warnings
       # The CPU library alone: nothing outside src/gpu may need wgpu.
       - name: Clippy without the gpu feature
         run: cargo clippy -p rudolf-v --all-targets --no-default-features -- -D warnings
@@ -50,7 +55,11 @@ jobs:
           cargo clippy -p rudolf-v --target aarch64-unknown-linux-gnu --all-targets -- -D warnings
       # The GPU tests are #[ignore]d, and the gpu-test job runs them.
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude rudolf-v-python
+      - name: Test the config module and the Python bindings
+        run: |
+          cargo test -p rudolf-v --features serde --lib config::
+          cargo test -p rudolf-v-python
 
   # Every WGSL kernel against its CPU reference, on Mesa's software Vulkan
   # (lavapipe). GpuDevice falls back to it when there is no hardware adapter.

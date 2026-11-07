@@ -1,0 +1,19 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "rudolf-v"
+version = "0.1.0"
+description = "Python bindings for the Rudolf-V visual frontend, stereo matcher and checkerboard finder"
+requires-python = ">=3.10"
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "rudolf_v._rudolf_v"
+python-source = "python"
+strip = true

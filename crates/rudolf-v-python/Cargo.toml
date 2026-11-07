@@ -1,0 +1,21 @@
+[package]
+name = "rudolf-v-python"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "_rudolf_v"
+crate-type = ["cdylib"]
+
+[dependencies]
+rudolf-v = { path = "../..", features = ["parallel", "serde"] }
+numpy = "0.25"
+pyo3 = { version = "0.25", features = ["extension-module", "abi3-py310"] }
+rayon = "1"
+serde = "1"
+serde_yaml = "0.9"
+
+[lints.clippy]
+# Python constructors take every setting as a keyword argument.
+too_many_arguments = "allow"
