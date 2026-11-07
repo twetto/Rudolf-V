@@ -24,7 +24,7 @@ use crate::dense_stereo::{DenseDepth, SPECKLE_STEP};
 use crate::gpu::device::GpuDevice;
 use crate::gpu::pyramid::{GpuPyramid, GpuPyramidPipeline};
 use crate::image::Image;
-use crate::sgbm::{depth_from_disparity, Sgbm, SgbmConfig, DIRS};
+use crate::sgbm::{DIRS, Sgbm, SgbmConfig, depth_from_disparity};
 use wgpu::util::DeviceExt;
 
 /// sgbm.wgsl's `Params`.
@@ -920,11 +920,8 @@ mod tests {
     #[test]
     #[ignore = "requires a real Vulkan GPU"]
     fn test_matches_cpu() {
-        let out = std::process::Command::new("cargo")
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
-                "test",
-                "--lib",
-                "--",
                 "gpu::sgbm::tests::inner_matches_cpu",
                 "--exact",
                 "--ignored",

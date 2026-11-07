@@ -44,7 +44,7 @@
 // left-right check, and the GPU's sums are exact.
 
 use crate::camera::StereoRig;
-use crate::dense_stereo::{rectified_sign, remove_speckles, DenseDepth, SpeckleScratch, NO_SOURCE};
+use crate::dense_stereo::{DenseDepth, NO_SOURCE, SpeckleScratch, rectified_sign, remove_speckles};
 use crate::image::Image;
 use crate::pyramid::Pyramid;
 

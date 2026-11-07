@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Reported, not enforced yet: the existing warnings are being cleaned
+      # up file by file (issue #3), then this gets `-- -D warnings`.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+      # The GPU tests are #[ignore]d; they need a Vulkan adapter.
+      - name: Test
+        run: cargo test --workspace

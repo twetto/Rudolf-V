@@ -18,9 +18,9 @@
 // floating-point sums, not bit for bit.
 
 use crate::dense_stereo::{
-    DenseDepth, DenseStereo, LevelSetup, AMBIGUITY_RATIO, CANDIDATE_TRUNCATION, DISAGREE,
-    DISTINCT_RISE, DISTINCT_STEP, EPS2, FALLBACK_AGREE, FLAT_END_MARGIN, FLAT_GRADIENT,
-    GN_MIN_STEP, MAX_COVER, NOISE_FLOOR, NO_SOURCE, SAME_CANDIDATE, SPECKLE_STEP, ZETA2,
+    AMBIGUITY_RATIO, CANDIDATE_TRUNCATION, DISAGREE, DISTINCT_RISE, DISTINCT_STEP, DenseDepth,
+    DenseStereo, EPS2, FALLBACK_AGREE, FLAT_END_MARGIN, FLAT_GRADIENT, GN_MIN_STEP, LevelSetup,
+    MAX_COVER, NO_SOURCE, NOISE_FLOOR, SAME_CANDIDATE, SPECKLE_STEP, ZETA2,
 };
 use crate::gpu::device::GpuDevice;
 use crate::gpu::pyramid::{GpuPyramid, GpuPyramidPipeline};
@@ -2188,11 +2188,8 @@ mod tests {
     #[test]
     #[ignore = "requires a real Vulkan GPU"]
     fn test_matches_cpu() {
-        let out = std::process::Command::new("cargo")
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
-                "test",
-                "--lib",
-                "--",
                 "gpu::dense_stereo::tests::inner_matches_cpu",
                 "--exact",
                 "--ignored",

@@ -498,7 +498,7 @@ fn occluding_box() {
 
     // Near the outline, an estimate is one of the two surfaces or nothing:
     // no depth in between.
-    let all = stats(&depth, &gt, |x, y| seen(x, y));
+    let all = stats(&depth, &gt, seen);
     let mut between = 0usize;
     let proj = rig.cam0.projection();
     for y in 0..h {

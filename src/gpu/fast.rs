@@ -663,16 +663,8 @@ mod tests {
     use crate::image::Image;
 
     fn run_gpu_test(test_name: &str) -> String {
-        let output = std::process::Command::new("cargo")
-            .args([
-                "test",
-                "--lib",
-                "--",
-                test_name,
-                "--exact",
-                "--ignored",
-                "--nocapture",
-            ])
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([test_name, "--exact", "--ignored", "--nocapture"])
             .output()
             .unwrap_or_else(|e| panic!("subprocess failed for {test_name}: {e}"));
         let out = String::from_utf8_lossy(&output.stdout).into_owned()
@@ -848,7 +840,9 @@ mod tests {
     #[test]
     #[ignore = "requires a real Vulkan GPU"]
     fn test_cpu_no_corners_flat() {
-        assert!(run_gpu_test("gpu::fast::tests::inner_cpu_no_corners_flat").contains("GPU_TEST_OK"));
+        assert!(
+            run_gpu_test("gpu::fast::tests::inner_cpu_no_corners_flat").contains("GPU_TEST_OK")
+        );
     }
     #[test]
     #[ignore = "requires a real Vulkan GPU"]
@@ -858,12 +852,16 @@ mod tests {
     #[test]
     #[ignore = "requires a real Vulkan GPU"]
     fn test_cpu_matches_cpu_ref() {
-        assert!(run_gpu_test("gpu::fast::tests::inner_cpu_matches_cpu_ref").contains("GPU_TEST_OK"));
+        assert!(
+            run_gpu_test("gpu::fast::tests::inner_cpu_matches_cpu_ref").contains("GPU_TEST_OK")
+        );
     }
     #[test]
     #[ignore = "requires a real Vulkan GPU"]
     fn test_gpu_no_corners_flat() {
-        assert!(run_gpu_test("gpu::fast::tests::inner_gpu_no_corners_flat").contains("GPU_TEST_OK"));
+        assert!(
+            run_gpu_test("gpu::fast::tests::inner_gpu_no_corners_flat").contains("GPU_TEST_OK")
+        );
     }
     #[test]
     #[ignore = "requires a real Vulkan GPU"]

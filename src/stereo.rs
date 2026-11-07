@@ -122,11 +122,7 @@ fn depth_param_bounds(
 ) -> (f64, f64) {
     let near = inv_depth_to_depth_param(param, max_inv_depth, range_per_z);
     let far = inv_depth_to_depth_param(param, min_inv_depth, range_per_z);
-    if near < far {
-        (near, far)
-    } else {
-        (far, near)
-    }
+    if near < far { (near, far) } else { (far, near) }
 }
 
 #[inline(always)]

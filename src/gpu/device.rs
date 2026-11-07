@@ -590,18 +590,9 @@ mod tests {
     /// before returning, and we assert that token appears in the output.
     #[cfg(test)]
     fn run_gpu_test_in_subprocess(test_name: &str) -> String {
-        // Locate the test binary by re-running cargo. This is the only
-        // reliable way to get the current binary path from within a test.
-        let output = std::process::Command::new("cargo")
-            .args([
-                "test",
-                "--lib",
-                "--",
-                test_name,
-                "--exact",
-                "--ignored",
-                "--nocapture",
-            ])
+        // A fresh process of this test binary for each GPU test.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([test_name, "--exact", "--ignored", "--nocapture"])
             .output()
             .unwrap_or_else(|e| panic!("failed to spawn subprocess for {test_name}: {e}"));
 

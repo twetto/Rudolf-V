@@ -27,7 +27,7 @@
 // ESS's EULA allows commercial use on NVIDIA GPUs.
 
 use crate::camera::StereoRig;
-use crate::dense_stereo::{rectified_sign, DenseDepth, NO_SOURCE};
+use crate::dense_stereo::{DenseDepth, NO_SOURCE, rectified_sign};
 use crate::image::Image;
 use crate::tensorrt::TrtEngine;
 
@@ -442,9 +442,11 @@ mod tests {
     #[test]
     fn area_resize_keeps_constants_and_the_mean() {
         let flat = Image::from_vec(1280, 720, vec![200u8; 1280 * 720]);
-        assert!(resize(&flat, 480, 288)
-            .iter()
-            .all(|&v| (v - 200.0).abs() < 1e-3));
+        assert!(
+            resize(&flat, 480, 288)
+                .iter()
+                .all(|&v| (v - 200.0).abs() < 1e-3)
+        );
         let ramp = Image::from_vec(
             1280,
             4,

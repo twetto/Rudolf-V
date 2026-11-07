@@ -29,3 +29,12 @@ run_benchmark_euroc.sh
 run_gpu_*.sh
 run_example_*.sh
 temp*
+__pycache__/
+
+# Local profiling and benchmark output, and per-machine scripts
+/profile/
+/*.csv
+/profile*.sh
+/run_*.sh
+/filetree.txt
+/continue_codex.sh

@@ -49,7 +49,9 @@ use rudolf_v::gpu::sgbm::GpuSgbm;
 use rudolf_v::image::Image;
 use rudolf_v::rectify::StereoRectification;
 use rudolf_v::sgbm::{Sgbm, SgbmConfig};
+#[cfg(unix)]
 use rudolf_v::stereo_net::{StereoNet, StereoNetConfig};
+#[cfg(unix)]
 use rudolf_v::tensorrt::TrtEngine;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -158,6 +160,7 @@ enum Matcher {
     Gpu(GpuDevice, GpuDenseStereo),
     Sgbm(Sgbm),
     GpuSgbm(GpuDevice, GpuSgbm),
+    #[cfg(unix)]
     Net(StereoNet),
 }
 
@@ -169,6 +172,7 @@ impl Matcher {
             Matcher::Gpu(dev, _) => dev.adapter_info.name.clone(),
             Matcher::Sgbm(s) => format!("the CPU, {}", sgbm(s.config(), s.num_disparities())),
             Matcher::GpuSgbm(dev, _) => format!("{}, SGBM", dev.adapter_info.name),
+            #[cfg(unix)]
             Matcher::Net(net) => {
                 format!("TensorRT ({:?}, {:?} input)", net.kind(), net.input_size())
             }
@@ -188,11 +192,40 @@ impl Matcher {
             Matcher::Gpu(dev, m) => m.compute_into(dev, left, right, depth),
             Matcher::Sgbm(m) => m.compute_into(left, right, depth),
             Matcher::GpuSgbm(dev, m) => m.compute_into(dev, left, right, depth),
+            #[cfg(unix)]
             Matcher::Net(net) => net
                 .compute_into(left, right, depth)
                 .unwrap_or_else(|e| panic!("--trt: {e}")),
         }
     }
+}
+
+/// `--trt`: a stereo network's TensorRT engine, through librv_trt.so.
+#[cfg(unix)]
+fn network(
+    lib: &str,
+    engine: &Path,
+    plugin: Option<&Path>,
+    rig: &StereoRig,
+    level: usize,
+    conf: f32,
+) -> Matcher {
+    let plugins: Vec<&Path> = plugin.into_iter().collect();
+    let engine =
+        TrtEngine::load(Path::new(lib), engine, &plugins).unwrap_or_else(|e| panic!("--trt: {e}"));
+    let config = StereoNetConfig {
+        level,
+        min_confidence: conf,
+        ..Default::default()
+    };
+    let net = StereoNet::new(engine, None, rig, config).unwrap_or_else(|e| panic!("--trt: {e}"));
+    Matcher::Net(net)
+}
+
+/// The TensorRT caller loads its library with dlopen, so it is Unix only.
+#[cfg(not(unix))]
+fn network(_: &str, _: &Path, _: Option<&Path>, _: &StereoRig, _: usize, _: f32) -> Matcher {
+    panic!("--trt needs a Unix system");
 }
 
 fn main() {
@@ -320,17 +353,7 @@ fn main() {
             rectify.is_none(),
             "--trt needs a rectified pair, not --rectify"
         );
-        let plugins: Vec<&Path> = trt_plugin.iter().map(|p| p.as_path()).collect();
-        let engine = TrtEngine::load(Path::new(&trt_lib), engine, &plugins)
-            .unwrap_or_else(|e| panic!("--trt: {e}"));
-        let config = StereoNetConfig {
-            level,
-            min_confidence: conf,
-            ..Default::default()
-        };
-        let net =
-            StereoNet::new(engine, None, &rig, config).unwrap_or_else(|e| panic!("--trt: {e}"));
-        Matcher::Net(net)
+        network(&trt_lib, engine, trt_plugin.as_deref(), &rig, level, conf)
     } else if use_sgbm {
         assert!(
             rectify.is_none(),

@@ -892,22 +892,26 @@ mod tests {
             .unwrap(),
             CameraProjection::PinholeRational(_)
         ));
-        assert!(CameraProjection::from_kalibr_parts(
-            "pinhole",
-            Some("rational_polynomial"),
-            intrinsics,
-            &[0.1, 0.01, 0.001, 0.0001],
-            resolution,
-        )
-        .is_err());
-        assert!(CameraProjection::from_kalibr_parts(
-            "double-sphere",
-            None,
-            intrinsics,
-            &[0.5, 0.6],
-            resolution,
-        )
-        .is_err());
+        assert!(
+            CameraProjection::from_kalibr_parts(
+                "pinhole",
+                Some("rational_polynomial"),
+                intrinsics,
+                &[0.1, 0.01, 0.001, 0.0001],
+                resolution,
+            )
+            .is_err()
+        );
+        assert!(
+            CameraProjection::from_kalibr_parts(
+                "double-sphere",
+                None,
+                intrinsics,
+                &[0.5, 0.6],
+                resolution,
+            )
+            .is_err()
+        );
     }
 
     #[test]

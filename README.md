@@ -67,6 +67,11 @@ cargo run --example gpu_pyramid -- image.png 5 1.5      # 5 levels, sigma=1.5
 # Run benchmarks
 cargo bench
 
+# Cross-compile, copy over ssh and run on a board (see tools/cross.sh)
+tools/cross.sh pi4 test                                     # every test, on a Raspberry Pi 4
+tools/cross.sh orin test --lib -- --ignored tests::test_    # the GPU tests, on a Jetson Orin Nano
+tools/cross.sh pi4 run --example bench_euroc_cpu -- /path/to/MH_01_easy
+
 # To enable parallel CPU processing, add <--features parallel> to the above commands.
 ```
 
