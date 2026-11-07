@@ -34,6 +34,26 @@ jobs:
       # The CPU library alone: nothing outside src/gpu may need wgpu.
       - name: Check without the gpu feature
         run: cargo check -p rudolf-v --no-default-features --all-targets
-      # The GPU tests are #[ignore]d; they need a Vulkan adapter.
+      # The GPU tests are #[ignore]d, and the gpu-test job runs them.
       - name: Test
         run: cargo test --workspace
+
+  # Every WGSL kernel against its CPU reference, on Mesa's software Vulkan
+  # (lavapipe). GpuDevice falls back to it when there is no hardware adapter.
+  gpu-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install lavapipe
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers libvulkan1
+      # The test_ wrappers run each inner_ GPU test in a fresh process.
+      - name: GPU tests
+        run: cargo test --lib -- --ignored tests::test_
+      # GPU tests that are not #[ignore]d: without an adapter they skip.
+      - name: GPU tests that skip without an adapter
+        run: cargo test --lib "gpu::"
