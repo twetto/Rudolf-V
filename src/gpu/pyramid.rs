@@ -157,10 +157,46 @@ impl GpuPyramid {
     /// Read one pyramid level back to CPU memory.
     ///
     /// **Expensive and synchronous** — stalls the GPU. Use only in tests.
+    /// The copy is a submission of its own, so on the Tegra driver it may read
+    /// stale contents of a pyramid built in an earlier one (see
+    /// gpu/frontend.rs, SUBMISSION); [`record_readback`](Self::record_readback)
+    /// reads in the command buffer that builds the pyramid.
     ///
     /// Returns a flat `Vec<f32>` of length `width * height`, row-major,
     /// no padding (stride == width), matching `Image<f32>::as_slice()`.
     pub fn readback_level(&self, gpu: &GpuDevice, level: usize) -> Vec<f32> {
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("GpuPyramid::readback"),
+            });
+        let copy = self.record_level_copy(gpu, &mut encoder, level);
+        gpu.queue.submit(std::iter::once(encoder.finish()));
+        copy.read(gpu)
+    }
+
+    /// Record a copy of every level into `encoder`, to read with
+    /// [`PyramidReadback::read`] once `encoder` is submitted. Recorded in the
+    /// command buffer that builds the pyramid, it is the levels' first
+    /// consumer there, as the Tegra driver needs. For tests.
+    pub fn record_readback(
+        &self,
+        gpu: &GpuDevice,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> PyramidReadback {
+        PyramidReadback {
+            copies: (0..self.levels.len())
+                .map(|level| self.record_level_copy(gpu, encoder, level))
+                .collect(),
+        }
+    }
+
+    fn record_level_copy(
+        &self,
+        gpu: &GpuDevice,
+        encoder: &mut wgpu::CommandEncoder,
+        level: usize,
+    ) -> LevelCopy {
         let lvl = &self.levels[level];
 
         // R32Float: 4 bytes per pixel.
@@ -178,11 +214,6 @@ impl GpuPyramid {
             mapped_at_creation: false,
         });
 
-        let mut encoder = gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("GpuPyramid::readback"),
-            });
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &lvl.texture,
@@ -204,9 +235,40 @@ impl GpuPyramid {
                 depth_or_array_layers: 1,
             },
         );
-        gpu.queue.submit(std::iter::once(encoder.finish()));
+        LevelCopy {
+            buf: readback_buf,
+            width: lvl.width,
+            height: lvl.height,
+            aligned_bytes_per_row,
+        }
+    }
+}
 
-        let buf_slice = readback_buf.slice(..);
+/// Copies of a pyramid's levels, recorded by [`GpuPyramid::record_readback`].
+pub struct PyramidReadback {
+    copies: Vec<LevelCopy>,
+}
+
+impl PyramidReadback {
+    /// Each level as [`GpuPyramid::readback_level`] returns it, finest first.
+    /// Waits for the GPU; the encoder the copies were recorded into must have
+    /// been submitted.
+    pub fn read(self, gpu: &GpuDevice) -> Vec<Vec<f32>> {
+        self.copies.iter().map(|copy| copy.read(gpu)).collect()
+    }
+}
+
+/// One level's copy in a mappable buffer, rows padded to the copy alignment.
+struct LevelCopy {
+    buf: wgpu::Buffer,
+    width: u32,
+    height: u32,
+    aligned_bytes_per_row: u32,
+}
+
+impl LevelCopy {
+    fn read(&self, gpu: &GpuDevice) -> Vec<f32> {
+        let buf_slice = self.buf.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         buf_slice.map_async(wgpu::MapMode::Read, move |r| {
             tx.send(r).expect("readback channel closed");
@@ -219,24 +281,24 @@ impl GpuPyramid {
             .expect("readback map failed");
 
         let mapped = buf_slice.get_mapped_range().expect("buffer mapping failed");
-        let bytes_per_row_w = lvl.width as usize * 4;
+        let bytes_per_row_w = self.width as usize * 4;
 
         // Strip alignment padding and interpret bytes as f32.
-        let mut out = vec![0.0f32; (lvl.width * lvl.height) as usize];
-        for y in 0..lvl.height as usize {
-            let src_byte_start = y * aligned_bytes_per_row as usize;
-            let dst_start = y * lvl.width as usize;
+        let mut out = vec![0.0f32; (self.width * self.height) as usize];
+        for y in 0..self.height as usize {
+            let src_byte_start = y * self.aligned_bytes_per_row as usize;
+            let dst_start = y * self.width as usize;
             let src_bytes = &mapped[src_byte_start..src_byte_start + bytes_per_row_w];
             // SAFETY: src_bytes is aligned to 4 bytes because the GPU wrote
             // properly-aligned R32Float data; f32 and [u8; 4] have the same
             // size; and we're only reading (not mutating).
             let src_f32: &[f32] = unsafe {
-                std::slice::from_raw_parts(src_bytes.as_ptr() as *const f32, lvl.width as usize)
+                std::slice::from_raw_parts(src_bytes.as_ptr() as *const f32, self.width as usize)
             };
-            out[dst_start..dst_start + lvl.width as usize].copy_from_slice(src_f32);
+            out[dst_start..dst_start + self.width as usize].copy_from_slice(src_f32);
         }
         drop(mapped);
-        readback_buf.unmap();
+        self.buf.unmap();
         out
     }
 }
@@ -1102,6 +1164,25 @@ impl GpuPyramidPipeline {
         num_levels: usize,
         _sigma: f32,
     ) -> GpuPyramid {
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("GpuPyramid::build"),
+            });
+        let pyr = self.build_in(gpu, &mut encoder, src, num_levels);
+        gpu.queue.submit(std::iter::once(encoder.finish()));
+        pyr
+    }
+
+    /// As [`build`](Self::build), recorded into `encoder` for the caller to
+    /// submit, so that the same command buffer can read the pyramid.
+    pub fn build_in(
+        &self,
+        gpu: &GpuDevice,
+        encoder: &mut wgpu::CommandEncoder,
+        src: &Image<u8>,
+        num_levels: usize,
+    ) -> GpuPyramid {
         assert!(num_levels >= 1, "pyramid must have at least 1 level");
 
         // Hardcoded [1,4,6,4,1]/16, half_size=2, 25 textureLoads per pixel
@@ -1118,12 +1199,6 @@ impl GpuPyramidPipeline {
         levels.push(level0);
 
         // --- Levels 1..(num_levels-1): blur + downsample via compute ---
-        let mut encoder = gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("GpuPyramid::build"),
-            });
-
         for lvl_idx in 1..num_levels {
             let prev = &levels[lvl_idx - 1];
             let dst_w = (prev.width / 2).max(1);
@@ -1177,8 +1252,6 @@ impl GpuPyramidPipeline {
 
             levels.push(curr);
         }
-
-        gpu.queue.submit(std::iter::once(encoder.finish()));
 
         GpuPyramid {
             levels,
@@ -1322,6 +1395,22 @@ mod tests {
 
     // Inner tests ─────────────────────────────────────────────────────────────
 
+    /// `build()`'s levels, read back in the command buffer that builds them:
+    /// the Tegra driver can read stale contents of a pyramid first read in a
+    /// later submission (gpu/frontend.rs, SUBMISSION).
+    fn build_and_read(
+        gpu: &GpuDevice,
+        pipeline: &GpuPyramidPipeline,
+        src: &Image<u8>,
+        num_levels: usize,
+    ) -> Vec<Vec<f32>> {
+        let mut enc = gpu.device.create_command_encoder(&Default::default());
+        let pyr = pipeline.build_in(gpu, &mut enc, src, num_levels);
+        let readback = pyr.record_readback(gpu, &mut enc);
+        gpu.queue.submit(std::iter::once(enc.finish()));
+        readback.read(gpu)
+    }
+
     #[test]
     #[ignore = "GPU integration: run via outer subprocess wrapper"]
     fn inner_pipeline_creation() {
@@ -1340,9 +1429,9 @@ mod tests {
 
         let gpu = GpuDevice::new().expect("need Vulkan GPU");
         let pipeline = GpuPyramidPipeline::new(&gpu);
-        let pyr = pipeline.build(&gpu, &src, 1, 1.0);
+        let levels = build_and_read(&gpu, &pipeline, &src, 1);
 
-        let readback = pyr.readback_level(&gpu, 0);
+        let readback = &levels[0];
         assert_eq!(readback.len(), 100);
         for (i, (&expected, &got)) in pixels.iter().zip(readback.iter()).enumerate() {
             let diff = (expected as f32 - got).abs();
@@ -1353,7 +1442,6 @@ mod tests {
             );
         }
         println!("GPU_TEST_OK");
-        drop(pyr);
         drop(pipeline);
         drop(gpu);
     }
@@ -1391,10 +1479,9 @@ mod tests {
         let src = Image::<u8>::from_vec(64, 64, vec![128u8; 64 * 64]);
         let gpu = GpuDevice::new().expect("need Vulkan GPU");
         let pipeline = GpuPyramidPipeline::new(&gpu);
-        let pyr = pipeline.build(&gpu, &src, 4, 1.0);
+        let levels = build_and_read(&gpu, &pipeline, &src, 4);
 
-        for lvl in 0..4 {
-            let data = pyr.readback_level(&gpu, lvl);
+        for (lvl, data) in levels.iter().enumerate() {
             for (i, &v) in data.iter().enumerate() {
                 assert!(
                     (v - 128.0).abs() < 0.5,
@@ -1403,7 +1490,6 @@ mod tests {
             }
         }
         println!("GPU_TEST_OK");
-        drop(pyr);
         drop(pipeline);
         drop(gpu);
     }
@@ -1432,11 +1518,10 @@ mod tests {
 
         let gpu = GpuDevice::new().expect("need Vulkan GPU");
         let pipeline = GpuPyramidPipeline::new(&gpu);
-        let gpu_pyr = pipeline.build(&gpu, &src, 4, 1.0);
+        let gpu_levels = build_and_read(&gpu, &pipeline, &src, 4);
 
         let mut max_err = 0.0f32;
-        for lvl in 0..4 {
-            let gpu_data = gpu_pyr.readback_level(&gpu, lvl);
+        for (lvl, gpu_data) in gpu_levels.iter().enumerate() {
             let cpu_level = cpu_pyr.level(lvl);
             let cpu_data = cpu_level.as_slice();
 
@@ -1461,7 +1546,6 @@ mod tests {
         }
         eprintln!("[test] max GPU/CPU pyramid error: {max_err:.4}");
         println!("GPU_TEST_OK");
-        drop(gpu_pyr);
         drop(pipeline);
         drop(gpu);
     }
@@ -1485,16 +1569,20 @@ mod tests {
         let persistent = pipeline.allocate(&gpu, 150, 94, 4);
 
         for img in [&img_a, &img_b, &img_a] {
+            // Both pyramids are built and read back in one command buffer:
+            // the Tegra driver can read stale contents of a pyramid first
+            // read in a later submission (gpu/frontend.rs, SUBMISSION).
             let mut enc = gpu.device.create_command_encoder(&Default::default());
             pipeline.record_rebuild(&gpu, &mut enc, img, &persistent);
+            let reference = pipeline.build_in(&gpu, &mut enc, img, 4);
+            let got = persistent.record_readback(&gpu, &mut enc);
+            let want = reference.record_readback(&gpu, &mut enc);
             gpu.queue.submit(std::iter::once(enc.finish()));
-            let reference = pipeline.build(&gpu, img, 4, 1.0);
+            let (got, want) = (got.read(&gpu), want.read(&gpu));
             for lvl in 0..4 {
                 assert_eq!(persistent.levels[lvl].width, reference.levels[lvl].width);
                 assert_eq!(persistent.levels[lvl].height, reference.levels[lvl].height);
-                let got = persistent.readback_level(&gpu, lvl);
-                let want = reference.readback_level(&gpu, lvl);
-                assert_eq!(got, want, "level {lvl} differs from build()");
+                assert_eq!(got[lvl], want[lvl], "level {lvl} differs from build()");
             }
         }
         println!("GPU_TEST_OK");
@@ -1545,9 +1633,9 @@ mod tests {
             let pyr = pipeline.allocate_rectified(&gpu, w, h, 4, rect.map(eye));
             let mut enc = gpu.device.create_command_encoder(&Default::default());
             pipeline.record_rebuild(&gpu, &mut enc, &raw, &pyr);
+            let readback = pyr.record_readback(&gpu, &mut enc);
             gpu.queue.submit(std::iter::once(enc.finish()));
-            for lvl in 0..4 {
-                let got = pyr.readback_level(&gpu, lvl);
+            for (lvl, got) in readback.read(&gpu).iter().enumerate() {
                 let want = cpu.level(lvl).as_slice();
                 assert_eq!(got.len(), want.len(), "level {lvl} size");
                 let max = got
