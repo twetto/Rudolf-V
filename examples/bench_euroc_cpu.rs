@@ -49,7 +49,7 @@ fn list_euroc_images(data_dir: &std::path::Path) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(&cam0)
         .unwrap()
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().map_or(false, |e| e == "png"))
+        .filter(|p| p.extension().is_some_and(|e| e == "png"))
         .collect();
     files.sort();
     files
@@ -268,7 +268,8 @@ fn main() {
     println!();
 
     // Per-stage statistics.
-    let stages: [(&str, Box<dyn Fn(&FrameStats) -> f32>); 5] = [
+    type Stage = Box<dyn Fn(&FrameStats) -> f32>;
+    let stages: [(&str, Stage); 5] = [
         ("histeq", Box::new(|s: &FrameStats| s.timing.histeq_ms())),
         ("pyramid", Box::new(|s: &FrameStats| s.timing.pyramid_ms())),
         ("klt", Box::new(|s: &FrameStats| s.timing.klt_ms())),
@@ -289,7 +290,7 @@ fn main() {
     total_vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
     for (name, extract) in &stages {
-        let mut vals: Vec<f32> = all_stats.iter().map(|s| extract(s)).collect();
+        let mut vals: Vec<f32> = all_stats.iter().map(extract).collect();
         vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let mean: f32 = vals.iter().sum::<f32>() / vals.len() as f32;
         let min = vals[0];

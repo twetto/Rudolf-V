@@ -308,7 +308,7 @@ fn bench_euroc(c: &mut Criterion) {
         let file = fs::File::open(&csv_path).expect("failed to open data.csv");
         BufReader::new(file)
             .lines()
-            .filter_map(|l| l.ok())
+            .map_while(Result::ok)
             .filter(|l| !l.trim().starts_with('#') && !l.trim().is_empty())
             .filter_map(|l| l.split_once(',').map(|(_, f)| f.trim().to_string()))
             .collect()

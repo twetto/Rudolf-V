@@ -631,7 +631,7 @@ impl GpuPyramidPipeline {
                 .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     label: Some("GpuPyramid convert CLAHE BGL"),
                     entries: &[
-                        raw_tex_entry.clone(),
+                        raw_tex_entry,
                         store_entry(1),
                         tile_lut_entry(2),
                         params_entry(3),
@@ -668,7 +668,7 @@ impl GpuPyramidPipeline {
                 .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     label: Some("GpuPyramid l0l1 CLAHE BGL"),
                     entries: &[
-                        raw_tex_entry.clone(),
+                        raw_tex_entry,
                         store_entry(1),
                         store_entry(2),
                         tile_lut_entry(3),
@@ -1087,8 +1087,8 @@ impl GpuPyramidPipeline {
     /// # Arguments
     /// - `src`        — CPU source image (`Image<u8>`).
     /// - `num_levels` — number of pyramid levels (must be ≥ 1).
-    /// - `sigma`      — Gaussian blur sigma. Must match what the CPU pipeline
-    ///                  uses so the GPU and CPU pyramids agree pixel-for-pixel.
+    /// - `_sigma`     — ignored: the pyramid uses the fixed [1,4,6,4,1]/16
+    ///   kernel, as the CPU pipeline does.
     ///
     /// # How level 0 is uploaded
     /// The source pixels are converted from `u8` to `f32` on the CPU (raw
@@ -1100,7 +1100,7 @@ impl GpuPyramidPipeline {
         gpu: &GpuDevice,
         src: &Image<u8>,
         num_levels: usize,
-        sigma: f32,
+        _sigma: f32,
     ) -> GpuPyramid {
         assert!(num_levels >= 1, "pyramid must have at least 1 level");
 
@@ -1264,28 +1264,6 @@ fn upload_f32_level(gpu: &GpuDevice, dst: &GpuPyramidLevel, src: &Image<u8>) {
 // Kernel generation (reproduced from convolution.rs to avoid coupling)
 // ---------------------------------------------------------------------------
 
-/// Compute a normalised 1D Gaussian kernel matching `gaussian_kernel_1d` in
-/// convolution.rs. Returns a full-length kernel (length = 2*half_size + 1).
-///
-/// Formula: k[i] = exp(−i² / (2σ²)), normalised so Σk = 1.
-/// half_size = ceil(3σ).max(1) — the same formula used in PyramidScratch::new.
-fn gaussian_kernel_1d_for_gpu(sigma: f32) -> Vec<f32> {
-    let half_size = (3.0 * sigma).ceil().max(1.0) as usize;
-    let len = 2 * half_size + 1;
-    let mut k = vec![0.0f32; len];
-    let two_sigma_sq = 2.0 * sigma * sigma;
-    for i in 0..=half_size as isize {
-        let v = (-(i * i) as f32 / two_sigma_sq).exp();
-        k[half_size as usize - i as usize] = v;
-        k[half_size as usize + i as usize] = v;
-    }
-    let sum: f32 = k.iter().sum();
-    for v in &mut k {
-        *v /= sum;
-    }
-    k
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1305,11 +1283,9 @@ mod tests {
 
     #[test]
     fn test_pyramid_params_coefficients() {
-        // sigma=1.0: half_size=3, kernel has 7 taps.
-        // Right half (indices 0..=3) maps to coeffs[0][0..3] and coeffs[0][3].
-        let kernel = gaussian_kernel_1d_for_gpu(1.0);
-        assert_eq!(kernel.len(), 7);
-        let half_size = 3;
+        // The [1,4,6,4,1]/16 kernel `build` uses: half_size=2, 5 taps.
+        let kernel = [1.0 / 16.0, 4.0 / 16.0, 6.0 / 16.0, 4.0 / 16.0, 1.0 / 16.0];
+        let half_size = 2;
         let params = PyramidParams::new(320, 240, &kernel);
         assert_eq!(params.half_size, half_size as u32);
         // coeffs[0][0] should be the centre weight (largest).
@@ -1322,26 +1298,6 @@ mod tests {
             for &c in row {
                 assert!(c >= 0.0);
             }
-        }
-    }
-
-    #[test]
-    fn test_kernel_matches_cpu() {
-        // Verify our GPU kernel matches the CPU half_size formula.
-        let sigma = 1.5f32;
-        let expected_half_size = (3.0 * sigma).ceil().max(1.0) as usize;
-        let k = gaussian_kernel_1d_for_gpu(sigma);
-        assert_eq!(k.len(), 2 * expected_half_size + 1);
-        // Must normalise to 1.
-        let sum: f32 = k.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-6, "kernel sum = {sum}, expected 1.0");
-        // Must be symmetric.
-        let half = expected_half_size;
-        for i in 0..half {
-            assert!(
-                (k[i] - k[k.len() - 1 - i]).abs() < 1e-7,
-                "kernel not symmetric at index {i}"
-            );
         }
     }
 

@@ -868,6 +868,8 @@ impl Frontend {
                 let mut write = 0;
                 let curr_img = self.curr_pyramid.u8_level(0);
 
+                // Indexed: the body needs `self` mutably.
+                #[allow(clippy::needless_range_loop)]
                 for i in 0..self.track_results.len() {
                     if self.track_results[i].status == TrackStatus::Tracked {
                         if fb_reject[i] {
@@ -1309,6 +1311,181 @@ impl Frontend {
     }
 }
 
+// ---------------------------------------------------------------------------
+// LBP Helpers
+// ---------------------------------------------------------------------------
+
+const CIRCLE_OFFSETS: [(i32, i32); 16] = [
+    (0, -3),
+    (1, -3),
+    (2, -2),
+    (3, -1),
+    (3, 0),
+    (3, 1),
+    (2, 2),
+    (1, 3),
+    (0, 3),
+    (-1, 3),
+    (-2, 2),
+    (-3, 1),
+    (-3, 0),
+    (-3, -1),
+    (-2, -2),
+    (-1, -3),
+];
+
+/// Compute the rotation-invariant LBP at a fractional position using u8 image.
+///
+/// All circle offsets are integers, so every sample shares the same fractional
+/// part (fx, fy) as the center. Precompute bilinear weights once, then do 17
+/// unchecked u8 lookups with fixed-point interpolation.
+pub(crate) fn compute_lbp_at(img: &Image<u8>, x: f32, y: f32) -> Option<u16> {
+    compute_lbp_at_lut(img, None, x, y)
+}
+
+/// [`compute_lbp_at`] on `lut[img]` without materializing the remapped image:
+/// each sampled pixel goes through `lut` before interpolation, which is
+/// exactly what sampling the LUT-remapped image gives. Used by the GPU
+/// frontend, whose histogram equalization runs on the GPU (it reads back only
+/// the 256-entry LUT).
+pub(crate) fn compute_lbp_at_lut(
+    img: &Image<u8>,
+    lut: Option<&[u8; 256]>,
+    x: f32,
+    y: f32,
+) -> Option<u16> {
+    let w = img.width();
+    let h = img.height();
+    let stride = img.stride();
+    let data = img.as_slice();
+
+    if !x.is_finite() || !y.is_finite() {
+        return None;
+    }
+
+    let x0 = x as usize;
+    let y0 = y as usize;
+    if x0 < 3 || y0 < 3 || x0 + 4 >= w || y0 + 4 >= h {
+        return None;
+    }
+
+    let fx = x - x0 as f32;
+    let fy = y - y0 as f32;
+
+    // Fixed-point weights (8-bit fraction, total = 256).
+    let w00 = ((1.0 - fx) * (1.0 - fy) * 256.0) as u32;
+    let w10 = (fx * (1.0 - fy) * 256.0) as u32;
+    let w01 = ((1.0 - fx) * fy * 256.0) as u32;
+    let w11 = (fx * fy * 256.0) as u32;
+
+    let bilerp = |px: usize, py: usize| -> u32 {
+        let x1 = if px + 1 < w { px + 1 } else { px };
+        let y1 = if py + 1 < h { py + 1 } else { py };
+        let map = |v: u8| -> u32 {
+            match lut {
+                Some(l) => l[v as usize] as u32,
+                None => v as u32,
+            }
+        };
+        unsafe {
+            let p00 = map(*data.get_unchecked(py * stride + px));
+            let p10 = map(*data.get_unchecked(py * stride + x1));
+            let p01 = map(*data.get_unchecked(y1 * stride + px));
+            let p11 = map(*data.get_unchecked(y1 * stride + x1));
+            w00 * p00 + w10 * p10 + w01 * p01 + w11 * p11
+        }
+    };
+
+    let center = bilerp(x0, y0);
+    let mut lbp: u16 = 0;
+
+    for (i, &(dx, dy)) in CIRCLE_OFFSETS.iter().enumerate() {
+        let px = (x0 as i32 + dx) as usize;
+        let py = (y0 as i32 + dy) as usize;
+        if bilerp(px, py) >= center {
+            lbp |= 1 << i;
+        }
+    }
+
+    Some(compute_min_rotation(lbp))
+}
+
+/// `compute_lbp_at_lut` for CLAHE: the mapping varies across the image, so
+/// each sampled pixel goes through the bilinear blend of the four tile LUTs
+/// around *it* (`TileLuts::apply`), which is what the level-0 shaders do.
+///
+/// Same structure, bounds and fixed-point weights as `compute_lbp_at_lut`;
+/// only `map` differs, so the two stay in step.
+#[cfg(feature = "gpu")]
+pub(crate) fn compute_lbp_at_tile_lut(
+    img: &Image<u8>,
+    tiles: &crate::gpu::clahe::TileLuts,
+    x: f32,
+    y: f32,
+) -> Option<u16> {
+    let w = img.width();
+    let h = img.height();
+    let stride = img.stride();
+    let data = img.as_slice();
+
+    if !x.is_finite() || !y.is_finite() {
+        return None;
+    }
+
+    let x0 = x as usize;
+    let y0 = y as usize;
+    if x0 < 3 || y0 < 3 || x0 + 4 >= w || y0 + 4 >= h {
+        return None;
+    }
+
+    let fx = x - x0 as f32;
+    let fy = y - y0 as f32;
+
+    let w00 = ((1.0 - fx) * (1.0 - fy) * 256.0) as u32;
+    let w10 = (fx * (1.0 - fy) * 256.0) as u32;
+    let w01 = ((1.0 - fx) * fy * 256.0) as u32;
+    let w11 = (fx * fy * 256.0) as u32;
+
+    let bilerp = |px: usize, py: usize| -> u32 {
+        let x1 = if px + 1 < w { px + 1 } else { px };
+        let y1 = if py + 1 < h { py + 1 } else { py };
+        unsafe {
+            let p00 = tiles.apply(px, py, *data.get_unchecked(py * stride + px)) as u32;
+            let p10 = tiles.apply(x1, py, *data.get_unchecked(py * stride + x1)) as u32;
+            let p01 = tiles.apply(px, y1, *data.get_unchecked(y1 * stride + px)) as u32;
+            let p11 = tiles.apply(x1, y1, *data.get_unchecked(y1 * stride + x1)) as u32;
+            w00 * p00 + w10 * p10 + w01 * p01 + w11 * p11
+        }
+    };
+
+    let center = bilerp(x0, y0);
+    let mut lbp: u16 = 0;
+
+    for (i, &(dx, dy)) in CIRCLE_OFFSETS.iter().enumerate() {
+        let px = (x0 as i32 + dx) as usize;
+        let py = (y0 as i32 + dy) as usize;
+        if bilerp(px, py) >= center {
+            lbp |= 1 << i;
+        }
+    }
+
+    Some(compute_min_rotation(lbp))
+}
+
+/// Compute the rotation-invariant LBP by finding the minimum value
+/// among all 16 cyclic shifts.
+#[inline]
+fn compute_min_rotation(mut v: u16) -> u16 {
+    let mut min_v = v;
+    for _ in 0..15 {
+        v = v.rotate_right(1);
+        if v < min_v {
+            min_v = v;
+        }
+    }
+    min_v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1368,7 +1545,7 @@ mod tests {
         let mut frontend = Frontend::new(config, 160, 120);
 
         let (features, stats) = frontend.process(&img);
-        assert!(features.len() > 0, "first frame should detect features");
+        assert!(!features.is_empty(), "first frame should detect features");
         assert_eq!(stats.tracked, 0, "nothing to track on first frame");
         assert_eq!(stats.lost, 0);
         assert!(stats.new_detections > 0);
@@ -1410,7 +1587,7 @@ mod tests {
         // Some features should survive tracking.
         assert!(stats2.tracked > 0, "should track some features: {stats2:?}");
         // Total should stay near max_features (replenished).
-        assert!(f2.len() > 0);
+        assert!(!f2.is_empty());
     }
 
     #[test]
@@ -1828,7 +2005,7 @@ mod tests {
         let mut frontend = Frontend::new(config, 160, 120);
 
         let (features, stats) = frontend.process(&img);
-        assert!(features.len() > 0, "Harris should detect features");
+        assert!(!features.is_empty(), "Harris should detect features");
         assert!(stats.new_detections > 0);
     }
 
@@ -2010,179 +2187,4 @@ mod tests {
         let (_, stats) = frontend.process(&img2);
         assert!(stats.tracked > 0, "CLAHE frontend should track features");
     }
-}
-
-// ---------------------------------------------------------------------------
-// LBP Helpers
-// ---------------------------------------------------------------------------
-
-const CIRCLE_OFFSETS: [(i32, i32); 16] = [
-    (0, -3),
-    (1, -3),
-    (2, -2),
-    (3, -1),
-    (3, 0),
-    (3, 1),
-    (2, 2),
-    (1, 3),
-    (0, 3),
-    (-1, 3),
-    (-2, 2),
-    (-3, 1),
-    (-3, 0),
-    (-3, -1),
-    (-2, -2),
-    (-1, -3),
-];
-
-/// Compute the rotation-invariant LBP at a fractional position using u8 image.
-///
-/// All circle offsets are integers, so every sample shares the same fractional
-/// part (fx, fy) as the center. Precompute bilinear weights once, then do 17
-/// unchecked u8 lookups with fixed-point interpolation.
-pub(crate) fn compute_lbp_at(img: &Image<u8>, x: f32, y: f32) -> Option<u16> {
-    compute_lbp_at_lut(img, None, x, y)
-}
-
-/// [`compute_lbp_at`] on `lut[img]` without materializing the remapped image:
-/// each sampled pixel goes through `lut` before interpolation, which is
-/// exactly what sampling the LUT-remapped image gives. Used by the GPU
-/// frontend, whose histogram equalization runs on the GPU (it reads back only
-/// the 256-entry LUT).
-pub(crate) fn compute_lbp_at_lut(
-    img: &Image<u8>,
-    lut: Option<&[u8; 256]>,
-    x: f32,
-    y: f32,
-) -> Option<u16> {
-    let w = img.width();
-    let h = img.height();
-    let stride = img.stride();
-    let data = img.as_slice();
-
-    if !x.is_finite() || !y.is_finite() {
-        return None;
-    }
-
-    let x0 = x as usize;
-    let y0 = y as usize;
-    if x0 < 3 || y0 < 3 || x0 + 4 >= w || y0 + 4 >= h {
-        return None;
-    }
-
-    let fx = x - x0 as f32;
-    let fy = y - y0 as f32;
-
-    // Fixed-point weights (8-bit fraction, total = 256).
-    let w00 = ((1.0 - fx) * (1.0 - fy) * 256.0) as u32;
-    let w10 = (fx * (1.0 - fy) * 256.0) as u32;
-    let w01 = ((1.0 - fx) * fy * 256.0) as u32;
-    let w11 = (fx * fy * 256.0) as u32;
-
-    let bilerp = |px: usize, py: usize| -> u32 {
-        let x1 = if px + 1 < w { px + 1 } else { px };
-        let y1 = if py + 1 < h { py + 1 } else { py };
-        let map = |v: u8| -> u32 {
-            match lut {
-                Some(l) => l[v as usize] as u32,
-                None => v as u32,
-            }
-        };
-        unsafe {
-            let p00 = map(*data.get_unchecked(py * stride + px));
-            let p10 = map(*data.get_unchecked(py * stride + x1));
-            let p01 = map(*data.get_unchecked(y1 * stride + px));
-            let p11 = map(*data.get_unchecked(y1 * stride + x1));
-            w00 * p00 + w10 * p10 + w01 * p01 + w11 * p11
-        }
-    };
-
-    let center = bilerp(x0, y0);
-    let mut lbp: u16 = 0;
-
-    for (i, &(dx, dy)) in CIRCLE_OFFSETS.iter().enumerate() {
-        let px = (x0 as i32 + dx) as usize;
-        let py = (y0 as i32 + dy) as usize;
-        if bilerp(px, py) >= center {
-            lbp |= 1 << i;
-        }
-    }
-
-    Some(compute_min_rotation(lbp))
-}
-
-/// `compute_lbp_at_lut` for CLAHE: the mapping varies across the image, so
-/// each sampled pixel goes through the bilinear blend of the four tile LUTs
-/// around *it* (`TileLuts::apply`), which is what the level-0 shaders do.
-///
-/// Same structure, bounds and fixed-point weights as `compute_lbp_at_lut`;
-/// only `map` differs, so the two stay in step.
-#[cfg(feature = "gpu")]
-pub(crate) fn compute_lbp_at_tile_lut(
-    img: &Image<u8>,
-    tiles: &crate::gpu::clahe::TileLuts,
-    x: f32,
-    y: f32,
-) -> Option<u16> {
-    let w = img.width();
-    let h = img.height();
-    let stride = img.stride();
-    let data = img.as_slice();
-
-    if !x.is_finite() || !y.is_finite() {
-        return None;
-    }
-
-    let x0 = x as usize;
-    let y0 = y as usize;
-    if x0 < 3 || y0 < 3 || x0 + 4 >= w || y0 + 4 >= h {
-        return None;
-    }
-
-    let fx = x - x0 as f32;
-    let fy = y - y0 as f32;
-
-    let w00 = ((1.0 - fx) * (1.0 - fy) * 256.0) as u32;
-    let w10 = (fx * (1.0 - fy) * 256.0) as u32;
-    let w01 = ((1.0 - fx) * fy * 256.0) as u32;
-    let w11 = (fx * fy * 256.0) as u32;
-
-    let bilerp = |px: usize, py: usize| -> u32 {
-        let x1 = if px + 1 < w { px + 1 } else { px };
-        let y1 = if py + 1 < h { py + 1 } else { py };
-        unsafe {
-            let p00 = tiles.apply(px, py, *data.get_unchecked(py * stride + px)) as u32;
-            let p10 = tiles.apply(x1, py, *data.get_unchecked(py * stride + x1)) as u32;
-            let p01 = tiles.apply(px, y1, *data.get_unchecked(y1 * stride + px)) as u32;
-            let p11 = tiles.apply(x1, y1, *data.get_unchecked(y1 * stride + x1)) as u32;
-            w00 * p00 + w10 * p10 + w01 * p01 + w11 * p11
-        }
-    };
-
-    let center = bilerp(x0, y0);
-    let mut lbp: u16 = 0;
-
-    for (i, &(dx, dy)) in CIRCLE_OFFSETS.iter().enumerate() {
-        let px = (x0 as i32 + dx) as usize;
-        let py = (y0 as i32 + dy) as usize;
-        if bilerp(px, py) >= center {
-            lbp |= 1 << i;
-        }
-    }
-
-    Some(compute_min_rotation(lbp))
-}
-
-/// Compute the rotation-invariant LBP by finding the minimum value
-/// among all 16 cyclic shifts.
-#[inline]
-fn compute_min_rotation(mut v: u16) -> u16 {
-    let mut min_v = v;
-    for _ in 0..15 {
-        v = v.rotate_right(1);
-        if v < min_v {
-            min_v = v;
-        }
-    }
-    min_v
 }

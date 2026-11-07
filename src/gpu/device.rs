@@ -420,8 +420,8 @@ impl GpuDevice {
     /// if gid.x >= width || gid.y >= height { return; }
     /// ```
     pub fn dispatch_size(&self, img_w: u32, img_h: u32) -> (u32, u32) {
-        let dx = (img_w + self.workgroup_size.x - 1) / self.workgroup_size.x;
-        let dy = (img_h + self.workgroup_size.y - 1) / self.workgroup_size.y;
+        let dx = img_w.div_ceil(self.workgroup_size.x);
+        let dy = img_h.div_ceil(self.workgroup_size.y);
         (dx, dy)
     }
 }
@@ -775,8 +775,8 @@ mod tests {
         }
 
         fn dispatch_size(&self, img_w: u32, img_h: u32) -> (u32, u32) {
-            let dx = (img_w + self.workgroup_size.x - 1) / self.workgroup_size.x;
-            let dy = (img_h + self.workgroup_size.y - 1) / self.workgroup_size.y;
+            let dx = img_w.div_ceil(self.workgroup_size.x);
+            let dy = img_h.div_ceil(self.workgroup_size.y);
             (dx, dy)
         }
     }

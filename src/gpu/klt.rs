@@ -66,6 +66,7 @@ const WG_SIZE: u32 = 64;
 ///   - RPi 4 (VideoCore VI, subgroup=16): 4 subgroups → good latency hiding
 ///   - AMD RDNA3 (subgroup=64): single wavefront → barriers are free
 ///   - NVIDIA Turing (subgroup=32): 2 warps → good occupancy
+///
 /// Benchmarked on RPi 4, Radeon 780M, GTX 1660Ti.
 const WG_WARP: u32 = 64;
 
@@ -134,9 +135,6 @@ fn bilinear(tex: texture_2d<f32>, x: f32, y: f32) -> f32 {
 /// covers a ping-ponged pyramid pair; callers that build a fresh pyramid every
 /// frame keep at most this many old pyramids alive.
 const BG_CACHE_CAP: usize = 2;
-
-/// Sentinel displacement value indicating a lost feature.
-/// Must match LOST_SENTINEL in klt.wgsl.
 
 /// KLT dispatch strategy.
 ///
@@ -222,11 +220,10 @@ pub struct GpuKltTracker {
     // Pre-allocated GPU buffers — reused every frame to avoid VRAM allocation
     // overhead. Sized for max_features at construction.
     max_features: usize,
-    patch_size: usize,              // SIDE² = (2*window_size+1)²
-    feature_buf: wgpu::Buffer,      // STORAGE | COPY_DST  — feature positions
-    disp_buf: wgpu::Buffer,         // STORAGE | COPY_DST  — displacements (zeroed each frame)
-    results_buf: wgpu::Buffer,      // STORAGE | COPY_SRC  — track results
-    rb_buf: wgpu::Buffer,           // MAP_READ | COPY_DST — CPU readback
+    feature_buf: wgpu::Buffer, // STORAGE | COPY_DST  — feature positions
+    disp_buf: wgpu::Buffer,    // STORAGE | COPY_DST  — displacements (zeroed each frame)
+    results_buf: wgpu::Buffer, // STORAGE | COPY_SRC  — track results
+    rb_buf: wgpu::Buffer,      // MAP_READ | COPY_DST — CPU readback
     params_bufs: Vec<wgpu::Buffer>, // one UNIFORM | COPY_DST per level
     // Per-feature patch data in storage buffers (not private shader memory).
     // Each is max_features × PATCH floats. Avoids VideoCore VI private-memory
@@ -663,7 +660,6 @@ impl GpuKltTracker {
             epsilon,
             max_levels,
             max_features,
-            patch_size: patch,
             feature_buf,
             disp_buf,
             results_buf,
@@ -823,7 +819,7 @@ impl GpuKltTracker {
         // Scalar: ceil(n / WG_SIZE) workgroups, multiple features per WG.
         // Warp:   n workgroups, one feature per WG.
         self.workgroups_p = match self.dispatch {
-            KltDispatch::Scalar => (n_u32 + WG_SIZE - 1) / WG_SIZE,
+            KltDispatch::Scalar => n_u32.div_ceil(WG_SIZE),
             KltDispatch::Warp(_) => n_u32,
         };
 
@@ -1221,7 +1217,7 @@ mod tests {
         );
         let features = vec![feat(40.0, 44.0), feat(52.0, 50.0), feat(46.0, 55.0)];
 
-        let mut run = |sampling: KltSampling| {
+        let run = |sampling: KltSampling| {
             let mut t = GpuKltTracker::new_with_sampling(&gpu, 7, 30, 0.01, 3, 16, sampling);
             let mut enc = gpu.device.create_command_encoder(&Default::default());
             pipeline.record_rebuild(&gpu, &mut enc, &img1, &p1);

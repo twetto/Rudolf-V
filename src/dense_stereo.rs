@@ -796,7 +796,7 @@ impl PatchRows<'_> {
         }
         #[cfg(target_arch = "aarch64")]
         {
-            if self.psz % 4 == 0 {
+            if self.psz.is_multiple_of(4) {
                 // SAFETY: NEON is part of aarch64; rows are sliced first.
                 return unsafe { self.residuals_neon::<COST>(res) };
             }

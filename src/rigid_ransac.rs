@@ -241,7 +241,7 @@ fn random_sample_3(rng: &mut SimpleRng, n: usize) -> [usize; 3] {
     let mut count = 0;
     while count < 3 {
         let idx = rng.next_usize(n);
-        if !sample[..count].iter().any(|&s| s == idx) {
+        if !sample[..count].contains(&idx) {
             sample[count] = idx;
             count += 1;
         }
@@ -317,8 +317,8 @@ mod tests {
         let mut corrs = make_corrs(50, 7);
         // Replace 15 with random outliers.
         let mut rng = SimpleRng::new(99);
-        for i in 0..15 {
-            corrs[i].p2 = [
+        for c in corrs.iter_mut().take(15) {
+            c.p2 = [
                 (rng.next_u64() >> 33) as f64 / (1u64 << 31) as f64 * 10.0,
                 (rng.next_u64() >> 33) as f64 / (1u64 << 31) as f64 * 10.0,
                 (rng.next_u64() >> 33) as f64 / (1u64 << 31) as f64 * 10.0,

@@ -315,7 +315,7 @@ impl GpuImage {
 ///   align_to(640, 256) = 768   (rounds up to next multiple)
 #[inline]
 pub(crate) fn align_to(value: u32, alignment: u32) -> u32 {
-    (value + alignment - 1) / alignment * alignment
+    value.div_ceil(alignment) * alignment
 }
 
 // ---------------------------------------------------------------------------

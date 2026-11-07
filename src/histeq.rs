@@ -354,12 +354,12 @@ impl ClaheMap {
         let cols = if tile_size == 0 {
             0
         } else {
-            (w + tile_size - 1) / tile_size
+            w.div_ceil(tile_size)
         };
         let rows = if tile_size == 0 {
             0
         } else {
-            (h + tile_size - 1) / tile_size
+            h.div_ceil(tile_size)
         };
         if w == 0 || h == 0 || tile_size == 0 {
             return Self {
@@ -551,6 +551,7 @@ pub fn equalize_clahe_into(
 /// Always compiled: it is the non-aarch64 implementation AND the reference the
 /// NEON path is asserted bit-equal against, so it cannot rot unnoticed.
 #[inline]
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))] // only the tests call it there
 fn remap_row_scalar(
     src_row: &[u8],
     dst_row: &mut [u8],
@@ -821,8 +822,8 @@ mod tests {
 
         // --- clahe, tile 32 ---
         let tile = 32usize;
-        let cols = (W + tile - 1) / tile;
-        let rows = (H + tile - 1) / tile;
+        let cols = W.div_ceil(tile);
+        let rows = H.div_ceil(tile);
         let src = img.as_slice();
         let stride = img.stride();
         let t = Instant::now();
@@ -866,8 +867,8 @@ mod tests {
         fn scalar_clahe(img: &Image<u8>, tile: usize, clip: f32) -> Image<u8> {
             let w = img.width();
             let h = img.height();
-            let cols = (w + tile - 1) / tile;
-            let rows = (h + tile - 1) / tile;
+            let cols = w.div_ceil(tile);
+            let rows = h.div_ceil(tile);
             let src = img.as_slice();
             let stride = img.stride();
             let luts: Vec<[u8; 256]> = (0..rows * cols)
@@ -1016,8 +1017,8 @@ mod tests {
         let stride = img.stride();
 
         for &tile in &[32usize, 64, 256] {
-            let cols = (W + tile - 1) / tile;
-            let rows = (H + tile - 1) / tile;
+            let cols = W.div_ceil(tile);
+            let rows = H.div_ceil(tile);
             let reps = 200;
 
             // (a) LUT construction only

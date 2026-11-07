@@ -323,6 +323,7 @@ impl PinholeRational {
         let [k1, k2, _, _, k3, k4, k5, k6] = self.distortion;
         let n = 1.0 + r2 * (k1 + r2 * (k2 + r2 * k3));
         let d = 1.0 + r2 * (k4 + r2 * (k5 + r2 * k6));
+        #[allow(clippy::neg_cmp_op_on_partial_ord)] // NaN fails the test too
         if !(d > MIN_NORM) {
             return None;
         }

@@ -168,7 +168,7 @@ mod tests {
             for x in 0..img_size {
                 let cx = x / cell_size;
                 let cy = y / cell_size;
-                let val = if (cx + cy) % 2 == 0 { lo } else { hi };
+                let val = if (cx + cy).is_multiple_of(2) { lo } else { hi };
                 img.set(x, y, val);
             }
         }

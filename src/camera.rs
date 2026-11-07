@@ -81,13 +81,13 @@ impl CameraIntrinsics {
     }
 
     fn from_yaml_content(content: &str) -> Result<Self, String> {
-        let intrinsics = parse_bracket_values(&content, "intrinsics:")
+        let intrinsics = parse_bracket_values(content, "intrinsics:")
             .ok_or_else(|| "intrinsics: line not found".to_string())?;
         if intrinsics.len() != 4 {
             return Err(format!("Expected 4 intrinsics, got {}", intrinsics.len()));
         }
 
-        let resolution = parse_bracket_values(&content, "resolution:")
+        let resolution = parse_bracket_values(content, "resolution:")
             .ok_or_else(|| "resolution: line not found".to_string())?;
         if resolution.len() != 2 {
             return Err(format!(
@@ -96,10 +96,10 @@ impl CameraIntrinsics {
             ));
         }
 
-        let distortion = parse_bracket_values(&content, "distortion_coefficients:")
-            .or_else(|| parse_bracket_values(&content, "distortion_coeffs:"))
+        let distortion = parse_bracket_values(content, "distortion_coefficients:")
+            .or_else(|| parse_bracket_values(content, "distortion_coeffs:"))
             .unwrap_or_default();
-        let model = parse_projection_model(&content, &distortion)?;
+        let model = parse_projection_model(content, &distortion)?;
         let distortion = if model == DistortionModel::None {
             Vec::new()
         } else {
@@ -297,8 +297,8 @@ fn invert_se3(t: &[[f64; 4]; 4]) -> [[f64; 4]; 4] {
             out[i][j] = t[j][i]; // R^T
         }
     }
-    for i in 0..3 {
-        out[i][3] = -(out[i][0] * t[0][3] + out[i][1] * t[1][3] + out[i][2] * t[2][3]);
+    for row in out.iter_mut().take(3) {
+        row[3] = -(row[0] * t[0][3] + row[1] * t[1][3] + row[2] * t[2][3]);
     }
     out[3][3] = 1.0;
     out
@@ -567,14 +567,10 @@ mod tests {
         ];
         let inv = super::invert_se3(&t);
         let product = super::multiply_se3(&t, &inv);
-        for i in 0..4 {
-            for j in 0..4 {
+        for (i, row) in product.iter().enumerate() {
+            for (j, &v) in row.iter().enumerate() {
                 let expected = if i == j { 1.0 } else { 0.0 };
-                assert!(
-                    (product[i][j] - expected).abs() < 1e-10,
-                    "T*T^-1 [{i}][{j}] = {}",
-                    product[i][j]
-                );
+                assert!((v - expected).abs() < 1e-10, "T*T^-1 [{i}][{j}] = {v}");
             }
         }
     }

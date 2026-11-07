@@ -694,7 +694,6 @@ unsafe fn hblur_row_u8_avx2(src_row: *const u8, h_row: *mut u16, sw: usize) {
 /// writes f32 and u8 outputs.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-#[allow(clippy::too_many_arguments)]
 unsafe fn vblur_row_avx2(
     h_buf: &[u16],
     r0: usize,

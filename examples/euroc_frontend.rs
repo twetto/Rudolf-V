@@ -164,8 +164,8 @@ fn main() {
 
     let mut last_img: Option<Image<u8>> = None;
 
-    for i in 0..num_frames {
-        let img = load_grayscale(&data_dir.join(&image_files[i]));
+    for (i, file) in image_files.iter().enumerate().take(num_frames) {
+        let img = load_grayscale(&data_dir.join(file));
 
         let (features, stats) = frontend.process(&img);
 

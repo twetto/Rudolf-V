@@ -31,8 +31,9 @@ fn homography(q: [[f64; 2]; 4]) -> [[f64; 3]; 3] {
         for r in 0..8 {
             if r != col {
                 let f = a[r][col] / a[col][col];
-                for cc in col..9 {
-                    a[r][cc] -= f * a[col][cc];
+                let pivot = a[col];
+                for (x, p) in a[r][col..].iter_mut().zip(&pivot[col..]) {
+                    *x -= f * p;
                 }
             }
         }

@@ -753,7 +753,7 @@ fn random_sample_8(rng: &mut SimpleRng, n: usize) -> [usize; 8] {
     while count < 8 {
         let idx = rng.next_usize(n);
         // Check for duplicates (8 is small, linear scan is fine).
-        let dup = sample[..count].iter().any(|&s| s == idx);
+        let dup = sample[..count].contains(&idx);
         if !dup {
             sample[count] = idx;
             count += 1;

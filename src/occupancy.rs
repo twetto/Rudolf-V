@@ -38,8 +38,8 @@ pub struct OccupancyGrid {
 impl OccupancyGrid {
     /// Create a new occupancy grid for an image of the given dimensions.
     pub fn new(img_w: usize, img_h: usize, cell_size: usize) -> Self {
-        let cols = (img_w + cell_size - 1) / cell_size;
-        let rows = (img_h + cell_size - 1) / cell_size;
+        let cols = img_w.div_ceil(cell_size);
+        let rows = img_h.div_ceil(cell_size);
         OccupancyGrid {
             grid: vec![false; cols * rows],
             cols,

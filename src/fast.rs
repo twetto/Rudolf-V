@@ -290,7 +290,7 @@ fn detect_row(
             cell_x = (gc + 1) << cell_shift;
             continue;
         }
-        let run_end = (((gc + 1) << cell_shift) as usize).min(x_max);
+        let run_end = ((gc + 1) << cell_shift).min(x_max);
         detect_row_range(
             slice,
             row_base,
@@ -426,25 +426,21 @@ unsafe fn fast_full_test(
     // Contiguous-arc check + scoring.
     let mut best_score = -1.0f32;
 
-    if bright_has {
-        if has_contiguous_arc(bright_mask, arc_length) {
-            let score = bitmask_best_arc_score(center, &circle_vals, thresh, bright_mask);
-            best_score = best_score.max(score);
-        }
+    if bright_has && has_contiguous_arc(bright_mask, arc_length) {
+        let score = bitmask_best_arc_score(center, &circle_vals, thresh, bright_mask);
+        best_score = best_score.max(score);
     }
 
-    if dark_has {
-        if has_contiguous_arc(dark_mask, arc_length) {
-            let score = bitmask_best_arc_score(center, &circle_vals, thresh, dark_mask);
-            best_score = best_score.max(score);
-        }
+    if dark_has && has_contiguous_arc(dark_mask, arc_length) {
+        let score = bitmask_best_arc_score(center, &circle_vals, thresh, dark_mask);
+        best_score = best_score.max(score);
     }
 
     if best_score >= 0.0 {
         // Compute RI-LBP descriptor (native radius 3).
         let mut lbp: u16 = 0;
-        for i in 0..16 {
-            if circle_vals[i] >= center {
+        for (i, &v) in circle_vals.iter().enumerate() {
+            if v >= center {
                 lbp |= 1 << i;
             }
         }
@@ -998,8 +994,7 @@ mod tests {
         let mut img = Image::from_vec(20, 20, vec![100u8; 400]);
         let cx = 10usize;
         let cy = 10usize;
-        for i in 0..10 {
-            let (dx, dy) = CIRCLE_OFFSETS[i];
+        for &(dx, dy) in &CIRCLE_OFFSETS[..10] {
             img.set(
                 (cx as isize + dx) as usize,
                 (cy as isize + dy) as usize,
@@ -1074,8 +1069,8 @@ mod tests {
         let img = make_fast_corner_image(40, 50, 200);
         let det = FastDetector::new(30, 9);
 
-        let cols = (40 + 15) / 16;
-        let rows = (40 + 15) / 16;
+        let cols = 40_usize.div_ceil(16);
+        let rows = 40_usize.div_ceil(16);
         let grid = vec![false; cols * rows];
 
         let full = det.detect(&img);
@@ -1093,8 +1088,8 @@ mod tests {
         let img = make_fast_corner_image(40, 50, 200);
         let det = FastDetector::new(30, 9);
 
-        let cols = (40 + 15) / 16;
-        let rows = (40 + 15) / 16;
+        let cols = 40_usize.div_ceil(16);
+        let rows = 40_usize.div_ceil(16);
         let grid = vec![true; cols * rows];
 
         let skip = det.detect_unoccupied(&img, &grid, cols, 16);
@@ -1109,7 +1104,7 @@ mod tests {
         let cols = 3;
         let rows = 3;
         let mut grid = vec![false; cols * rows];
-        grid[1 * cols + 1] = true; // center cell
+        grid[cols + 1] = true; // center cell
 
         let full = det.detect(&img);
         let skip = det.detect_unoccupied(&img, &grid, cols, 16);

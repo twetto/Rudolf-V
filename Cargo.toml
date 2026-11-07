@@ -25,6 +25,10 @@ default = ["gpu"]
 gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 parallel = ["rayon"]
 
+[lints.clippy]
+# Kernels and SIMD routines take many slices and sizes by design.
+too_many_arguments = "allow"
+
 [dev-dependencies]
 criterion = "0.5"
 approx = "0.5"

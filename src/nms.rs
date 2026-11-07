@@ -47,8 +47,8 @@ impl OccupancyNms {
         }
 
         // Grid dimensions: ceil(img_dim / cell_size).
-        let grid_cols = (img_w + self.cell_size - 1) / self.cell_size;
-        let grid_rows = (img_h + self.cell_size - 1) / self.cell_size;
+        let grid_cols = img_w.div_ceil(self.cell_size);
+        let grid_rows = img_h.div_ceil(self.cell_size);
 
         // Each cell stores the index of the best feature seen so far (or None).
         // This is idiomatic Rust: Option<usize> is the same size as usize on
