@@ -1874,6 +1874,7 @@ impl RedBlack {
 
 /// One level's geometry for the GPU matcher (gpu/dense_stereo.rs), of a
 /// rectified rig.
+#[cfg(feature = "gpu")]
 pub(crate) struct LevelSetup {
     pub level: usize,
     pub w: usize,
@@ -2082,6 +2083,7 @@ impl DenseStereo {
 
     /// Per level, finest to coarsest, the geometry the GPU matcher needs.
     /// Panics unless the rig is a rectified pinhole pair.
+    #[cfg(feature = "gpu")]
     pub(crate) fn level_setups(&self) -> Vec<LevelSetup> {
         let EpipolarKind::Rectified { sign } = self.epi.kind else {
             panic!("the GPU matcher needs a rectified rig");
@@ -3082,7 +3084,7 @@ impl DenseStereo {
 
 /// One level of `DenseStereo::trace`, for checking the GPU matcher stage by
 /// stage.
-#[cfg(test)]
+#[cfg(all(test, feature = "gpu"))]
 pub(crate) struct LevelTrace {
     pub level: usize,
     pub gx: Vec<f32>,
@@ -3110,14 +3112,14 @@ pub(crate) struct LevelTrace {
 
 /// `DenseStereo::trace`'s result: every level's, then the finest level's
 /// sources after the coarse fallback, and the depth map.
-#[cfg(test)]
+#[cfg(all(test, feature = "gpu"))]
 pub(crate) struct FrameTrace {
     pub levels: Vec<LevelTrace>,
     pub filled: Vec<u8>,
     pub depth: DenseDepth,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "gpu"))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PatchTrace {
     pub d: f32,
@@ -3131,7 +3133,7 @@ pub(crate) struct PatchTrace {
     pub settled: bool,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "gpu"))]
 impl DenseStereo {
     /// `compute`'s stages, recording each level's intermediate results.
     pub(crate) fn trace(&mut self, left: &Image<u8>, right: &Image<u8>) -> FrameTrace {

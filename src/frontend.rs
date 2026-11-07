@@ -2105,6 +2105,7 @@ pub(crate) fn compute_lbp_at_lut(
 ///
 /// Same structure, bounds and fixed-point weights as `compute_lbp_at_lut`;
 /// only `map` differs, so the two stay in step.
+#[cfg(feature = "gpu")]
 pub(crate) fn compute_lbp_at_tile_lut(
     img: &Image<u8>,
     tiles: &crate::gpu::clahe::TileLuts,

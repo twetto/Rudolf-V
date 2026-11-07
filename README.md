@@ -54,7 +54,7 @@ cargo run --example euroc_frontend --release -- /path/to/MH_01_easy 100
 #     vis_output/euroc_tracks.svg   -- feature tracks overlaid on last frame
 #     vis_output/euroc_stats.csv    -- per-frame statistics
 
-# Live visualization window (requires minifb)
+# Live visualization window (minifb)
 cargo run --example euroc_live --release -- /path/to/MH_01_easy
 cargo run --example gpu_euroc_live --release -- /path/to/MH_01_easy # GPU version
 # Controls: Space=pause, S=step, Q/Esc=quit, +/-=speed, T=trails, F=flow
@@ -73,6 +73,8 @@ tools/cross.sh orin test --lib -- --ignored tests::test_    # the GPU tests, on 
 tools/cross.sh pi4 run --example bench_euroc_cpu -- /path/to/MH_01_easy
 
 # To enable parallel CPU processing, add <--features parallel> to the above commands.
+# The `gpu` feature (on by default) builds the gpu:: modules on wgpu; for the CPU
+# library alone, depend on rudolf-v with default-features = false.
 ```
 
 ## Module Overview
@@ -93,7 +95,7 @@ tools/cross.sh pi4 run --example bench_euroc_cpu -- /path/to/MH_01_easy
 | `camera` | Pinhole camera model, EuRoC YAML parser, undistortion | -- |
 | `essential` | 8-point essential matrix + RANSAC outlier rejection (uses nalgebra) | -- |
 | `frontend` | Complete detect-track-replenish pipeline with geometric verification | `vilib_ros.cpp` |
-| `gpu::device` | `GpuDevice` abstraction (device/queue/adapter selection) | -- |
+| `gpu::device` | `GpuDevice` abstraction (all `gpu::` modules need the `gpu` feature, on by default) (device/queue/adapter selection) | -- |
 | `gpu::pyramid` | WGSL Gaussian pyramid kernel | `pyramid_gpu.cu` |
 | `gpu::fast` | WGSL FAST kernel with selectable NMS strategy | `fast_gpu_cuda_tools.cu` |
 | `gpu::klt` | WGSL inverse-compositional KLT kernel | `feature_tracker_cuda_tools.cu` |
