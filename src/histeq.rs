@@ -351,8 +351,16 @@ impl ClaheMap {
     pub fn build(image: &Image<u8>, tile_size: usize, clip_limit: f32) -> Self {
         let w = image.width();
         let h = image.height();
-        let cols = if tile_size == 0 { 0 } else { (w + tile_size - 1) / tile_size };
-        let rows = if tile_size == 0 { 0 } else { (h + tile_size - 1) / tile_size };
+        let cols = if tile_size == 0 {
+            0
+        } else {
+            (w + tile_size - 1) / tile_size
+        };
+        let rows = if tile_size == 0 {
+            0
+        } else {
+            (h + tile_size - 1) / tile_size
+        };
         if w == 0 || h == 0 || tile_size == 0 {
             return Self {
                 tile_luts: Vec::new(),
@@ -374,14 +382,32 @@ impl ClaheMap {
         let tile_luts: Vec<[u8; 256]> = (0..rows * cols)
             .into_par_iter()
             .map(|idx| {
-                clahe_tile_lut(src, src_stride, w, h, tile_size, idx % cols, idx / cols, clip_limit)
+                clahe_tile_lut(
+                    src,
+                    src_stride,
+                    w,
+                    h,
+                    tile_size,
+                    idx % cols,
+                    idx / cols,
+                    clip_limit,
+                )
             })
             .collect();
 
         #[cfg(not(feature = "parallel"))]
         let tile_luts: Vec<[u8; 256]> = (0..rows * cols)
             .map(|idx| {
-                clahe_tile_lut(src, src_stride, w, h, tile_size, idx % cols, idx / cols, clip_limit)
+                clahe_tile_lut(
+                    src,
+                    src_stride,
+                    w,
+                    h,
+                    tile_size,
+                    idx % cols,
+                    idx / cols,
+                    clip_limit,
+                )
             })
             .collect();
 
@@ -396,7 +422,17 @@ impl ClaheMap {
             col_ax.push(ax);
         }
 
-        Self { tile_luts, col_tx0, col_tx1, col_ax, rows, cols, tile_size, width: w, height: h }
+        Self {
+            tile_luts,
+            col_tx0,
+            col_tx1,
+            col_ax,
+            rows,
+            cols,
+            tile_size,
+            width: w,
+            height: h,
+        }
     }
 
     pub fn width(&self) -> usize {
@@ -430,15 +466,31 @@ impl ClaheMap {
         #[cfg(target_arch = "aarch64")]
         unsafe {
             remap_row_neon(
-                src_row, dst_row, w, lut_row0, lut_row1,
-                &self.col_tx0, &self.col_tx1, &self.col_ax, ay, w_top,
+                src_row,
+                dst_row,
+                w,
+                lut_row0,
+                lut_row1,
+                &self.col_tx0,
+                &self.col_tx1,
+                &self.col_ax,
+                ay,
+                w_top,
             );
         }
 
         #[cfg(not(target_arch = "aarch64"))]
         remap_row_scalar(
-            src_row, dst_row, w, lut_row0, lut_row1,
-            &self.col_tx0, &self.col_tx1, &self.col_ax, ay, w_top,
+            src_row,
+            dst_row,
+            w,
+            lut_row0,
+            lut_row1,
+            &self.col_tx0,
+            &self.col_tx1,
+            &self.col_ax,
+            ay,
+            w_top,
         );
     }
 }
@@ -490,11 +542,7 @@ pub fn equalize_clahe_into(
     #[cfg(not(feature = "parallel"))]
     for y in 0..h {
         let (_, rest) = dst.split_at_mut(y * dst_stride);
-        map.remap_row(
-            &src[y * src_stride..y * src_stride + w],
-            &mut rest[..w],
-            y,
-        );
+        map.remap_row(&src[y * src_stride..y * src_stride + w], &mut rest[..w], y);
     }
 }
 
@@ -766,7 +814,9 @@ mod tests {
         let g_full = t.elapsed().as_secs_f64() / reps as f64 * 1e3;
         println!(
             "global      hist+lut={:.3} ms  remap={:.3} ms  full={:.3} ms   (1 lookup/px, no interp)",
-            g_lut, g_full - g_lut, g_full
+            g_lut,
+            g_full - g_lut,
+            g_full
         );
 
         // --- clahe, tile 32 ---
@@ -790,7 +840,10 @@ mod tests {
         let c_full = t.elapsed().as_secs_f64() / reps as f64 * 1e3;
         println!(
             "clahe t=32  hist+lut={:.3} ms  remap={:.3} ms  full={:.3} ms   ({} tiles, 4 lookups/px + 3 lerps, NEON)",
-            c_lut, c_full - c_lut, c_full, rows * cols
+            c_lut,
+            c_full - c_lut,
+            c_full,
+            rows * cols
         );
         println!(
             "ratio       hist+lut={:.1}x        remap={:.1}x        full={:.1}x   sink={}",
@@ -875,7 +928,13 @@ mod tests {
             seed ^= seed << 5;
             (seed >> 24) as u8
         };
-        for &(w, h) in &[(317usize, 100usize), (319, 61), (320, 200), (321, 37), (7, 5)] {
+        for &(w, h) in &[
+            (317usize, 100usize),
+            (319, 61),
+            (320, 200),
+            (321, 37),
+            (7, 5),
+        ] {
             let n = w * h;
             cases.push((
                 format!("random {w}x{h}"),
@@ -890,8 +949,14 @@ mod tests {
                 Image::from_vec(w, h, (0..n).map(|i| (i % 256) as u8).collect()),
             ));
             // extremes: all-0 / all-255 drive the clamp branches
-            cases.push((format!("zeros {w}x{h}"), Image::from_vec(w, h, vec![0u8; n])));
-            cases.push((format!("sat {w}x{h}"), Image::from_vec(w, h, vec![255u8; n])));
+            cases.push((
+                format!("zeros {w}x{h}"),
+                Image::from_vec(w, h, vec![0u8; n]),
+            ));
+            cases.push((
+                format!("sat {w}x{h}"),
+                Image::from_vec(w, h, vec![255u8; n]),
+            ));
         }
         // a real frame, if the bike cache is present on this machine
         if let Ok(all) = std::env::var_os("RUDOLF_BENCH_FRAMES")
@@ -976,8 +1041,15 @@ mod tests {
 
             println!(
                 "tile={:3} ({}x{}={:3} tiles)  lut={:.3} ms  full={:.3} ms  remap={:.3} ms  ({:.0}% remap)  sink={}",
-                tile, cols, rows, cols * rows, t_lut, t_full, t_full - t_lut,
-                100.0 * (t_full - t_lut) / t_full, sink & 0xff
+                tile,
+                cols,
+                rows,
+                cols * rows,
+                t_lut,
+                t_full,
+                t_full - t_lut,
+                100.0 * (t_full - t_lut) / t_full,
+                sink & 0xff
             );
         }
     }

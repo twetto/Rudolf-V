@@ -317,16 +317,21 @@ impl GpuDevice {
             limits.max_compute_invocations_per_workgroup = have
                 .max_compute_invocations_per_workgroup
                 .min(cap.max_compute_invocations_per_workgroup);
-            limits.max_compute_workgroup_size_x =
-                have.max_compute_workgroup_size_x.min(cap.max_compute_workgroup_size_x);
-            limits.max_compute_workgroup_size_y =
-                have.max_compute_workgroup_size_y.min(cap.max_compute_workgroup_size_y);
-            limits.max_compute_workgroup_size_z =
-                have.max_compute_workgroup_size_z.min(cap.max_compute_workgroup_size_z);
-            limits.max_texture_dimension_2d =
-                have.max_texture_dimension_2d.min(cap.max_texture_dimension_2d);
-            limits.max_texture_dimension_1d =
-                have.max_texture_dimension_1d.min(cap.max_texture_dimension_1d);
+            limits.max_compute_workgroup_size_x = have
+                .max_compute_workgroup_size_x
+                .min(cap.max_compute_workgroup_size_x);
+            limits.max_compute_workgroup_size_y = have
+                .max_compute_workgroup_size_y
+                .min(cap.max_compute_workgroup_size_y);
+            limits.max_compute_workgroup_size_z = have
+                .max_compute_workgroup_size_z
+                .min(cap.max_compute_workgroup_size_z);
+            limits.max_texture_dimension_2d = have
+                .max_texture_dimension_2d
+                .min(cap.max_texture_dimension_2d);
+            limits.max_texture_dimension_1d = have
+                .max_texture_dimension_1d
+                .min(cap.max_texture_dimension_1d);
             limits.max_storage_buffer_binding_size = have
                 .max_storage_buffer_binding_size
                 .min(cap.max_storage_buffer_binding_size);

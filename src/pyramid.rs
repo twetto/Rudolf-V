@@ -1705,7 +1705,14 @@ mod fused_clahe_tests {
 
         println!("histeq+pyramid, 320x200, tile=32, {levels} levels:");
         println!("  two-pass CLAHE : {two:.3} ms");
-        println!("  fused CLAHE    : {fused:.3} ms   ({:.3} ms saved, {:.2}x)", two - fused, two / fused);
-        println!("  global (ref)   : {glob:.3} ms   (fused CLAHE is {:.2}x global)", fused / glob);
+        println!(
+            "  fused CLAHE    : {fused:.3} ms   ({:.3} ms saved, {:.2}x)",
+            two - fused,
+            two / fused
+        );
+        println!(
+            "  global (ref)   : {glob:.3} ms   (fused CLAHE is {:.2}x global)",
+            fused / glob
+        );
     }
 }
