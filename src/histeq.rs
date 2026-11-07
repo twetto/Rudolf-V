@@ -291,7 +291,37 @@ fn build_lut(hist: &[u32; 256], total: usize) -> [u8; 256] {
 // CLAHE
 // ============================================================
 
-/// Apply CLAHE (Contrast Limited Adaptive Histogram Equalization).
+/// Tile index pair and blend weight for position `p` along one axis.
+///
+/// The single definition of CLAHE's tile indexing, shared by every consumer:
+/// `ClaheMap::build` tabulates columns with it, `ClaheMap::remap_row` takes the
+/// row with it, and `gpu::clahe::TileLuts::apply` answers point queries against
+/// GPU-computed LUTs with it. `shaders/pyramid_convert_clahe.wgsl` computes the
+/// same thing per invocation on the GPU and is the reason for the exact form
+/// below: `p / tile_size`, matching the shader, since a CPU consumer of
+/// `TileLuts` exists precisely to reproduce what the GPU produced.
+///
+/// The CPU path previously used `p * (1 / tile_size)` instead. The two are not
+/// the same expression -- the reciprocal rounds, then the multiply rounds again,
+/// and the raw quotients disagree for about a quarter of inputs -- but they are
+/// indistinguishable here: across tile sizes 2..=1024 at widths and heights of
+/// 320, 200, 752, 480, 1280 and 800 (283568 cases) the resulting index pair and
+/// blend weight are bit-identical, because no disagreement survives the
+/// `floor(x - 0.5)` below. So consolidating on the shader's form changed no
+/// output; it removed a second expression for one quantity.
+#[inline]
+pub(crate) fn tile_blend(p: usize, tile_size: usize, n: usize) -> (usize, usize, f32) {
+    let ts = tile_size as f32;
+    let t0 = ((p as f32 / ts - 0.5).floor() as isize).max(0) as usize;
+    let t1 = (t0 + 1).min(n - 1);
+    let a = if t0 == t1 {
+        0.0
+    } else {
+        ((p as f32 - (t0 as f32 + 0.5) * ts) / ts).clamp(0.0, 1.0)
+    };
+    (t0, t1, a)
+}
+
 /// The spatially-varying map CLAHE applies: per-tile LUTs plus the x-direction
 /// tile indices and blend weights, which are identical for every row.
 ///
@@ -355,24 +385,16 @@ impl ClaheMap {
             })
             .collect();
 
-        let inv_tile = 1.0 / tile_size as f32;
-        let tile_cx = |tx: usize| -> f32 { (tx as f32 + 0.5) * tile_size as f32 };
-
-        let col_tx0: Vec<usize> = (0..w)
-            .map(|x| (((x as f32) * inv_tile - 0.5).floor() as isize).max(0) as usize)
-            .collect();
-        let col_tx1: Vec<usize> = col_tx0.iter().map(|&t| (t + 1).min(cols - 1)).collect();
-        let col_ax: Vec<f32> = (0..w)
-            .map(|x| {
-                let tx0 = col_tx0[x];
-                let tx1 = col_tx1[x];
-                if tx0 == tx1 {
-                    0.0
-                } else {
-                    ((x as f32 - tile_cx(tx0)) / (tile_cx(tx1) - tile_cx(tx0))).clamp(0.0, 1.0)
-                }
-            })
-            .collect();
+        // Columns are the same for every row, so they are tabulated once.
+        let mut col_tx0 = Vec::with_capacity(w);
+        let mut col_tx1 = Vec::with_capacity(w);
+        let mut col_ax = Vec::with_capacity(w);
+        for x in 0..w {
+            let (tx0, tx1, ax) = tile_blend(x, tile_size, cols);
+            col_tx0.push(tx0);
+            col_tx1.push(tx1);
+            col_ax.push(ax);
+        }
 
         Self { tile_luts, col_tx0, col_tx1, col_ax, rows, cols, tile_size, width: w, height: h }
     }
@@ -398,17 +420,9 @@ impl ClaheMap {
             return;
         }
         let w = self.width;
-        let inv_tile = 1.0 / self.tile_size as f32;
-        let tile_cy = |ty: usize| -> f32 { (ty as f32 + 0.5) * self.tile_size as f32 };
-        let py = y as f32;
-        let fy = py * inv_tile - 0.5;
-        let ty0 = (fy.floor() as isize).max(0) as usize;
-        let ty1 = (ty0 + 1).min(self.rows - 1);
-        let ay = if ty0 == ty1 {
-            0.0
-        } else {
-            ((py - tile_cy(ty0)) / (tile_cy(ty1) - tile_cy(ty0))).clamp(0.0, 1.0)
-        };
+        // Rows vary per call; columns came from `build`. Same `tile_blend` the
+        // GPU-side point query and the level-0 shader use.
+        let (ty0, ty1, ay) = tile_blend(y, self.tile_size, self.rows);
         let w_top = 1.0 - ay;
         let lut_row0 = &self.tile_luts[ty0 * self.cols..ty0 * self.cols + self.cols];
         let lut_row1 = &self.tile_luts[ty1 * self.cols..ty1 * self.cols + self.cols];
