@@ -94,6 +94,51 @@ def test_sgbm_errors():
         depth.compute(left.astype(np.float32), right)
 
 
+def test_sgbm_settings():
+    left, right = plane_pair()
+    default = sgbm().compute(left, right)
+    spelled_out = sgbm(block_size=5, p1=200, p2=800, pre_filter_cap=63, uniqueness=10,
+                       disp12_max_diff=1, speckle_size=400, disparity_sigma=0.5)
+    assert np.array_equal(spelled_out.compute(left, right), default, equal_nan=True)
+
+    # A patch with nothing to match (each eye its own random blocks): stricter
+    # checks keep less of what is matched there, looser ones more.
+    rng = np.random.default_rng(5)
+    unmatched = [img.copy() for img in (left, right)]
+    for img in unmatched:
+        img[96:264, 192:448] = np.kron(rng.integers(30, 230, (21, 32)), np.ones((8, 8)))
+    def kept(**kw):
+        return np.isfinite(sgbm(**kw).compute(*unmatched)[12:33, 24:56]).sum()
+    n = kept()
+    assert kept(uniqueness=30) < n and kept(speckle_size=3200) < n
+    assert kept(uniqueness=30, speckle_size=3200) < min(kept(uniqueness=30), kept(speckle_size=3200))
+    assert kept(disp12_max_diff=None) > n and kept(speckle_size=0) > n
+
+    # The variance is (sigma / disparity)².
+    wide = sgbm(disparity_sigma=1.0)
+    assert np.array_equal(wide.compute(left, right), default, equal_nan=True)
+    have = np.isfinite(default)
+    np.testing.assert_allclose(wide.variance()[have], 4 * spelled_out.variance()[have], rtol=1e-6)
+
+    with pytest.raises(ValueError, match="odd"):
+        sgbm(block_size=4)
+    with pytest.raises(ValueError, match="4 or 8"):
+        sgbm(paths=6)
+    with pytest.raises(ValueError, match="disparity_sigma"):
+        sgbm(disparity_sigma=0.0)
+
+
+def test_gpu_sgbm_settings(on_gpu):
+    left, right = plane_pair()
+    kw = dict(block_size=3, p2=500, uniqueness=20, speckle_size=1600)
+    z = sgbm(gpu=True, **kw).compute(left, right)
+    cpu = sgbm(**kw).compute(left, right)
+    same = (np.isnan(z) & np.isnan(cpu)) | np.isclose(z, cpu, rtol=1e-5)
+    assert same.mean() > 0.99
+    with pytest.raises(ValueError, match="16-bit"):  # 11x11 blocks overflow the GPU's path sums
+        sgbm(gpu=True, block_size=11)
+
+
 # The factory file of the lab Orin's ZED 2i (S/N 36835247), HD only, and the
 # SDK's rectified camera for it.
 ZED_CONF = """[LEFT_CAM_HD]

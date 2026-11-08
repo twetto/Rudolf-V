@@ -160,10 +160,31 @@ impl PyStereoDepth {
     /// on the GPU (`gpu=True`; RuntimeError without a Vulkan GPU) or the CPU.
     /// The rectified camera: fx, fy, cx, cy in pixels of the `width`×`height`
     /// images, `baseline` in metres.
+    ///
+    /// The matcher's settings, as rudolf_v::sgbm::SgbmConfig (and OpenCV's
+    /// StereoSGBM):
+    /// - `block_size`: side of the block pixel costs are summed over (odd).
+    /// - `p1`, `p2`: penalties for the disparity changing by one, and by
+    ///   more, between neighbours; None: 8 and 32 × block_size².
+    /// - `pre_filter_cap`: the prefiltered x-derivative is clamped to ±this.
+    /// - `uniqueness`: margin (percent) by which the best disparity must beat
+    ///   every other more than one away.
+    /// - `disp12_max_diff`: left-right check tolerance (pixels of the
+    ///   level); None skips the check.
+    /// - `speckle_size`: regions of consistent disparity smaller than this
+    ///   many full-resolution pixels are dropped; 0 keeps them.
+    /// - `disparity_sigma`: disparity standard deviation (pixels of the
+    ///   level) behind `variance()`.
+    /// Stricter `uniqueness` and a larger `speckle_size` drop more wrong
+    /// matches on glass and repeated patterns, and more right ones with
+    /// them. On the GPU, costs are 16-bit: settings whose path sums could
+    /// overflow them (large blocks or P2) raise ValueError.
     #[staticmethod]
     #[pyo3(signature = (
         fx, fy, cx, cy, baseline, width, height,
         level=3, min_range=0.25, max_range=30.0, gpu=true, paths=8,
+        block_size=5, p1=None, p2=None, pre_filter_cap=63, uniqueness=10,
+        disp12_max_diff=Some(1), speckle_size=400, disparity_sigma=0.5,
     ))]
     fn sgbm(
         fx: f64,
@@ -178,21 +199,40 @@ impl PyStereoDepth {
         max_range: f64,
         gpu: bool,
         paths: usize,
+        block_size: usize,
+        p1: Option<u32>,
+        p2: Option<u32>,
+        pre_filter_cap: u32,
+        uniqueness: u32,
+        disp12_max_diff: Option<u32>,
+        speckle_size: usize,
+        disparity_sigma: f32,
     ) -> PyResult<Self> {
         let rig = rectified_rig(fx, fy, cx, cy, baseline, width, height)?;
+        if !disparity_sigma.is_finite() || disparity_sigma <= 0.0 {
+            return Err(value_error("disparity_sigma must be positive"));
+        }
+        let area = (block_size * block_size) as u32;
         let config = SgbmConfig {
             level,
             min_range,
             max_range,
+            block_size,
+            p1: p1.unwrap_or(8 * area),
+            p2: p2.unwrap_or(32 * area),
+            pre_filter_cap,
+            uniqueness,
+            disp12_max_diff,
+            speckle_size,
             paths,
-            ..SgbmConfig::default()
+            disparity_sigma,
         };
         let cpu = checked(|| Sgbm::new(&rig, config))?;
         let matcher = if gpu {
             let device = GpuDevice::new().map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("gpu=True: no Vulkan GPU ({e})"))
             })?;
-            let m = GpuSgbm::new(&device, &cpu);
+            let m = checked(|| GpuSgbm::new(&device, &cpu))?;
             Matcher::GpuSgbm(Box::new((device, m)))
         } else {
             Matcher::Sgbm(Box::new(cpu))
