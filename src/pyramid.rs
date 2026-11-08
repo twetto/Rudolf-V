@@ -116,6 +116,18 @@ impl PyramidScratch {
 }
 
 impl Pyramid {
+    /// A pyramid with no levels yet, to build into (`build_reuse`,
+    /// `build_f32_reuse`, ...): a placeholder that does not depend on the
+    /// fields, so code holding one keeps building when they change.
+    pub fn empty() -> Self {
+        Pyramid {
+            levels: Vec::new(),
+            u8_levels: Vec::new(),
+            padded_levels: Vec::new(),
+            pad_border: 0,
+        }
+    }
+
     /// Build a Gaussian pyramid from an input image (allocating).
     ///
     /// Uses the f32 path. For per-frame use, prefer `build_reuse`.
@@ -1457,12 +1469,7 @@ mod tests {
     fn test_build_reuse_constant() {
         // Constant image: build_reuse should preserve value at all levels.
         let img = Image::from_vec(64, 64, vec![128u8; 64 * 64]);
-        let mut pyr = Pyramid {
-            levels: Vec::new(),
-            u8_levels: Vec::new(),
-            padded_levels: Vec::new(),
-            pad_border: 0,
-        };
+        let mut pyr = Pyramid::empty();
         let mut scratch = PyramidScratch::new(64, 64, 1.0);
         pyr.build_reuse(&img, 4, &mut scratch);
 
@@ -1479,12 +1486,7 @@ mod tests {
     #[test]
     fn test_build_reuse_dimensions() {
         let img: Image<u8> = Image::new(640, 480);
-        let mut pyr = Pyramid {
-            levels: Vec::new(),
-            u8_levels: Vec::new(),
-            padded_levels: Vec::new(),
-            pad_border: 0,
-        };
+        let mut pyr = Pyramid::empty();
         let mut scratch = PyramidScratch::new(640, 480, 1.0);
         pyr.build_reuse(&img, 5, &mut scratch);
 
@@ -1508,12 +1510,7 @@ mod tests {
 
         let pyr_f32 = Pyramid::build(&img, 4, 1.0);
 
-        let mut pyr_int = Pyramid {
-            levels: Vec::new(),
-            u8_levels: Vec::new(),
-            padded_levels: Vec::new(),
-            pad_border: 0,
-        };
+        let mut pyr_int = Pyramid::empty();
         let mut scratch = PyramidScratch::new(640, 480, 1.0);
         pyr_int.build_reuse(&img, 4, &mut scratch);
 
@@ -1545,12 +1542,7 @@ mod tests {
         }
         let img = Image::from_vec(128, 128, data);
 
-        let mut pyr = Pyramid {
-            levels: Vec::new(),
-            u8_levels: Vec::new(),
-            padded_levels: Vec::new(),
-            pad_border: 0,
-        };
+        let mut pyr = Pyramid::empty();
         let mut scratch = PyramidScratch::new(128, 128, 1.0);
         pyr.build_reuse(&img, 5, &mut scratch);
 
@@ -1604,24 +1596,14 @@ mod fused_clahe_tests {
 
                     // fused
                     let map = ClaheMap::build(&img, tile, clip);
-                    let mut fused = Pyramid {
-                        levels: Vec::new(),
-                        u8_levels: Vec::new(),
-                        padded_levels: Vec::new(),
-                        pad_border: 0,
-                    };
+                    let mut fused = Pyramid::empty();
                     let mut sc = PyramidScratch::new(w, h, 1.0);
                     fused.build_reuse_preproc(&img, levels, &mut sc, PyrPreproc::Clahe(&map));
 
                     // two-pass
                     let mut eq = Image::new(w, h);
                     histeq::equalize_clahe_into(&img, tile, clip, &mut eq);
-                    let mut two = Pyramid {
-                        levels: Vec::new(),
-                        u8_levels: Vec::new(),
-                        padded_levels: Vec::new(),
-                        pad_border: 0,
-                    };
+                    let mut two = Pyramid::empty();
                     let mut sc2 = PyramidScratch::new(w, h, 1.0);
                     two.build_reuse_preproc(&eq, levels, &mut sc2, PyrPreproc::None);
 
@@ -1665,12 +1647,7 @@ mod fused_clahe_tests {
         let tile = 32usize;
         let clip = 4.0f32;
 
-        let mut pyr = Pyramid {
-            levels: Vec::new(),
-            u8_levels: Vec::new(),
-            padded_levels: Vec::new(),
-            pad_border: 0,
-        };
+        let mut pyr = Pyramid::empty();
         let mut sc = PyramidScratch::new(W, H, 1.0);
         let mut eq = Image::new(W, H);
 

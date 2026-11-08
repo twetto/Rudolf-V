@@ -28,6 +28,14 @@ camera-geometry --------------------------+--> Rudolf-V
         +-------------------------------------> ECHO-LI
 ```
 
+The arrows are ownership of the camera contract, not repositories: the crate
+lives in this workspace (`crates/camera-geometry`, wheel in
+`crates/camera-geometry-python`), and Rudolf-V re-exports it as
+`rudolf_v::camera_geometry`. Consumers pin a Rudolf-V revision and get the
+camera-geometry that matches it; a repository of its own would be a second pin
+to keep in step, for no consumer that needs it apart (decided in
+[#3](https://github.com/twetto/Rudolf-V/issues/3)).
+
 Normal users must not need Rust. CI builds binary wheels, installs each wheel
 in a clean Python environment, and runs an import plus TUM-VI projection
 round-trip test. Rust is required only for maintainers changing the binding or
