@@ -7,9 +7,10 @@ geometric verification, on the CPU and, through [wgpu](https://wgpu.rs), on the 
 It started as a port of the UZH RPG [vilib](https://github.com/uzh-rpg/vilib), which is
 CUDA only; Rudolf-V runs wherever wgpu does (Vulkan, Metal, DX12).
 
-> **Status:** the CPU and GPU frontends are complete and validated against each other.
-> Current work is features as they are needed and cleanup toward a standalone library
-> ([#3](https://github.com/twetto/Rudolf-V/issues/3)).
+> **Status:** the CPU and GPU frontends are complete and validated against each other;
+> dense depth (SGBM, a DIS-style matcher, TensorRT stereo networks) and the Python wheel
+> followed. New work comes as features are needed. There are no crates.io releases: depend
+> on a git revision. The crate docs (`cargo doc --open`) list the supported API.
 
 ## Quick Start
 
