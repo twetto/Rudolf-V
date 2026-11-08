@@ -14,7 +14,11 @@
 //     (disparity) and `output_conf` (confidence, 0..1). The image is
 //     stretched to the input size, as Isaac ROS does.
 // Both take the grey image in all three channels, resized by area averaging
-// (OpenCV's INTER_AREA), and give disparity in their input's pixels.
+// (OpenCV's INTER_AREA), and give disparity in their input's pixels. The
+// resizing and scaling run on the GPU where the TensorRT library can
+// (TrtEngine::gpu_input), with the CPU's arithmetic: the same inputs, bit for
+// bit, and only the images' bytes to copy. With an older library they run on
+// the CPU.
 //
 // The pair must be rectified (a pinhole rig, cameras side by side, the right
 // one at +x): disparity d then puts the left pixel's point at range
@@ -29,7 +33,7 @@
 use crate::camera::StereoRig;
 use crate::dense_stereo::{DenseDepth, NO_SOURCE, rectified_sign};
 use crate::image::Image;
-use crate::tensorrt::TrtEngine;
+use crate::tensorrt::{GpuResize, TrtEngine};
 
 /// Which network an engine holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +52,14 @@ impl StereoNetKind {
             Some(Self::Las2)
         } else {
             None
+        }
+    }
+
+    /// v·scale + offset per resized pixel: the network's input range.
+    fn scaling(self) -> (f32, f32) {
+        match self {
+            Self::Las2 => (1.0, 0.0),
+            Self::LightEss => (1.0 / 127.5, -1.0),
         }
     }
 
@@ -217,6 +229,8 @@ pub struct StereoNet {
     log_scale: Vec<f32>,
     /// ln(disparity_sigma) in network pixels, for the variance.
     log_sigma: f32,
+    /// The inputs are made on the GPU from the images.
+    gpu_inputs: bool,
     /// fill's scratch: area_resize's row sums and output, and one channel.
     acc: Vec<f32>,
     small: Vec<f32>,
@@ -227,7 +241,7 @@ impl StereoNet {
     /// The network in `engine` (`kind`, or told from its tensor names) for a
     /// rectified rig.
     pub fn new(
-        engine: TrtEngine,
+        mut engine: TrtEngine,
         kind: Option<StereoNetKind>,
         rig: &StereoRig,
         config: StereoNetConfig,
@@ -279,6 +293,21 @@ impl StereoNet {
                 log_scale.push((fb * norm / per_net_pixel).ln() as f32);
             }
         }
+        let (cols, rows) = (area_weights(w0, layout.cw), area_weights(h0, layout.ch));
+        let (scale, offset) = kind.scaling();
+        let resize = GpuResize {
+            width: w0,
+            height: h0,
+            cols: &cols,
+            rows: &rows,
+            top: layout.top,
+            scale,
+            offset,
+        };
+        let mut gpu_inputs = true;
+        for &t in &io[..2] {
+            gpu_inputs &= engine.gpu_input(t, &resize)?;
+        }
         Ok(Self {
             engine,
             kind,
@@ -287,8 +316,9 @@ impl StereoNet {
             layout,
             io,
             conf,
-            cols: area_weights(w0, layout.cw),
-            rows: area_weights(h0, layout.ch),
+            cols,
+            rows,
+            gpu_inputs,
             pixel,
             log_scale,
             acc: Vec::new(),
@@ -306,19 +336,13 @@ impl StereoNet {
         (self.layout.nw, self.layout.nh)
     }
 
-    /// One eye into input tensor `t`.
-    /// One eye into input tensor `t`: the plane is built in ordinary memory
-    /// and only written to the tensor's pinned buffer, three times (one per
-    /// channel), never read back from it.
-    fn fill(&mut self, img: &Image<u8>, t: usize) {
+    /// One eye's input plane on the CPU, into `plane`.
+    fn cpu_plane(&mut self, img: &Image<u8>) {
         area_resize(img, &self.cols, &self.rows, &mut self.acc, &mut self.small);
         let Layout {
             nw, nh, ch, top, ..
         } = self.layout;
-        let (scale, offset) = match self.kind {
-            StereoNetKind::Las2 => (1.0, 0.0),
-            StereoNetKind::LightEss => (1.0 / 127.5, -1.0),
-        };
+        let (scale, offset) = self.kind.scaling();
         self.plane.resize(nw * nh, 0.0);
         for (r, row) in self.plane.chunks_mut(nw).enumerate() {
             let src = r.saturating_sub(top).min(ch - 1);
@@ -326,10 +350,29 @@ impl StereoNet {
                 *o = v * scale + offset;
             }
         }
+    }
+
+    /// One eye into input tensor `t`: on the GPU, only the image into its
+    /// pinned buffer; else the plane built on the CPU, written to the
+    /// tensor's pinned buffer three times (one per channel), never read back
+    /// from it.
+    fn fill(&mut self, img: &Image<u8>, t: usize) {
+        if let Some(buf) = self.engine.image_mut(t) {
+            for (y, dst) in buf.chunks_exact_mut(img.width()).enumerate() {
+                dst.copy_from_slice(img.row(y));
+            }
+            return;
+        }
+        self.cpu_plane(img);
         let plane = &self.plane;
         for channel in self.engine.host_mut(t).chunks_mut(plane.len()) {
             channel.copy_from_slice(plane);
         }
+    }
+
+    /// Whether the inputs are made on the GPU (TrtEngine::gpu_input).
+    pub fn preprocesses_on_gpu(&self) -> bool {
+        self.gpu_inputs
     }
 
     /// The depth of a rectified pair into `out`.
@@ -443,6 +486,78 @@ mod tests {
                     .sum::<f32>()
                     / 16.0;
                 assert!((out[oy * 4 + ox] - mean).abs() < 1e-3);
+            }
+        }
+    }
+
+    /// The engine named by RUDOLF_V_TRT_ENGINE, through the library named by
+    /// RUDOLF_V_TRT_LIB (plugin libraries: RUDOLF_V_TRT_PLUGINS,
+    /// colon-separated); None without them, and the test is skipped.
+    fn engine_from_env() -> Option<TrtEngine> {
+        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        let (Some(engine), Some(lib)) = (var("RUDOLF_V_TRT_ENGINE"), var("RUDOLF_V_TRT_LIB"))
+        else {
+            eprintln!("skipped: no TensorRT engine (RUDOLF_V_TRT_ENGINE, RUDOLF_V_TRT_LIB)");
+            return None;
+        };
+        let plugins = var("RUDOLF_V_TRT_PLUGINS").unwrap_or_default();
+        let plugins: Vec<&std::path::Path> = plugins
+            .split(':')
+            .filter(|p| !p.is_empty())
+            .map(std::path::Path::new)
+            .collect();
+        Some(TrtEngine::load(lib.as_ref(), engine.as_ref(), &plugins).unwrap())
+    }
+
+    /// A 1280×720 texture in rows of `stride` bytes.
+    fn texture(stride: usize, seed: u32) -> Image<u8> {
+        let data = (0..stride * 720)
+            .map(|i| ((i as u32 ^ seed).wrapping_mul(2_654_435_761) >> 24) as u8)
+            .collect();
+        Image::from_vec_with_stride(1280, 720, stride, data)
+    }
+
+    #[test]
+    fn gpu_inputs_are_the_cpus() {
+        let Some(engine) = engine_from_env() else {
+            return;
+        };
+        let cam = crate::camera::CameraIntrinsics::new(951.4, 951.4, 658.9, 356.7, 1280, 720);
+        let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let rig = StereoRig::new(cam.clone(), cam, identity, [-0.12, 0.0, 0.0]);
+        let mut net = StereoNet::new(engine, None, &rig, StereoNetConfig::default()).unwrap();
+        assert!(net.preprocesses_on_gpu());
+        let mut out = DenseDepth {
+            width: 0,
+            height: 0,
+            level: 0,
+            log_range: Vec::new(),
+            variance: Vec::new(),
+            source_level: Vec::new(),
+        };
+        // Rows wider than the image (the copy must take only the pixels);
+        // the first run is eager, the later ones replay its CUDA graph.
+        let a = [texture(1296, 1), texture(1296, 2)];
+        let b = [texture(1280, 3), texture(1280, 4)];
+        let mut first = Vec::new();
+        for (run, pair) in [&a, &b, &a].into_iter().enumerate() {
+            net.compute_into(&pair[0], &pair[1], &mut out).unwrap();
+            for (eye, img) in pair.iter().enumerate() {
+                let t = net.io[eye];
+                net.engine.input_to_host(t).unwrap();
+                net.cpu_plane(img);
+                for channel in net.engine.host(t).chunks(net.plane.len()) {
+                    let same = channel
+                        .iter()
+                        .zip(&net.plane)
+                        .all(|(g, c)| g.to_bits() == c.to_bits());
+                    assert!(same, "run {run}, eye {eye}: the GPU's input differs");
+                }
+            }
+            match run {
+                0 => first = net.disparity().to_vec(),
+                2 => assert!(net.disparity() == first, "the replay differs"),
+                _ => {}
             }
         }
     }
