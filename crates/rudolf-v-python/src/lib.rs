@@ -2,6 +2,7 @@ use pyo3::prelude::*;
 use serde::de::DeserializeOwned;
 
 mod checkerboard;
+mod dense;
 mod frontend;
 mod stereo;
 
@@ -11,6 +12,8 @@ fn _rudolf_v(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<frontend::PyFrontend>()?;
     m.add_class::<stereo::PyStereo>()?;
     m.add_class::<checkerboard::PyCheckerboardDetector>()?;
+    m.add_class::<dense::PyStereoDepth>()?;
+    m.add_class::<dense::PyStereoRectification>()?;
     Ok(())
 }
 
