@@ -77,6 +77,9 @@ use crate::frontend::{
 };
 use crate::gpu::clahe::{GpuClahe, TileLuts};
 use crate::gpu::device::GpuDevice;
+/// How `collect()` waits for the GPU (moved to `gpu::device`, kept here for
+/// existing users).
+pub use crate::gpu::device::GpuWait;
 use crate::gpu::fast::{GpuFastDetector, NmsStrategy};
 use crate::gpu::histeq::GpuGlobalHistEq;
 use crate::gpu::klt::{GpuKltTracker, KltSampling};
@@ -127,70 +130,6 @@ pub enum SubmitStrategy {
     /// at the start of `collect()`); switching never changes results. Default.
     #[default]
     Auto,
-}
-
-/// How `collect()` waits for GPU work that has not finished yet.
-///
-/// Only matters when `collect()` is called before the GPU is done (e.g.
-/// `process()`, or a caller with little work between `submit()` and
-/// `collect()`); otherwise there is nothing to wait for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum GpuWait {
-    /// `SleepPoll { interval_us: 20 }` on NVIDIA Tegra (Jetson) adapters,
-    /// `Block` elsewhere.
-    #[default]
-    Auto,
-    /// The driver's blocking wait (`vkWaitSemaphores` via wgpu). On Jetson
-    /// Orin Nano the NVIDIA driver busy-waits inside it, keeping a CPU core
-    /// at 100% for the whole wait.
-    Block,
-    /// Check for completion without blocking (zero-timeout wait) and sleep
-    /// `interval_us` between checks, leaving the core to other threads.
-    /// Jetson Orin Nano, Global histeq, nothing between submit and collect:
-    /// CPU time 1.26 → 0.56 ms/frame for +0.04–0.06 ms frame time
-    /// (20–50 µs intervals).
-    SleepPoll { interval_us: u32 },
-}
-
-impl GpuWait {
-    /// The concrete strategy for this device (`Auto` resolved).
-    fn resolve(self, gpu: &GpuDevice) -> GpuWait {
-        match self {
-            GpuWait::Auto if gpu.adapter_info.name.contains("Tegra") => {
-                GpuWait::SleepPoll { interval_us: 20 }
-            }
-            GpuWait::Auto => GpuWait::Block,
-            other => other,
-        }
-    }
-
-    /// Wait until `submission` (or, if `None`, all submitted work) has
-    /// completed and its map callbacks have run.
-    fn wait(self, gpu: &GpuDevice, submission: Option<&wgpu::SubmissionIndex>) {
-        match self {
-            GpuWait::SleepPoll { interval_us } => {
-                let interval = std::time::Duration::from_micros(interval_us as u64);
-                loop {
-                    match gpu.device.poll(wgpu::PollType::Wait {
-                        submission_index: submission.cloned(),
-                        timeout: Some(std::time::Duration::ZERO),
-                    }) {
-                        Ok(_) => return,
-                        Err(wgpu::PollError::Timeout) => std::thread::sleep(interval),
-                        Err(e) => panic!("GPU poll failed: {e}"),
-                    }
-                }
-            }
-            GpuWait::Block | GpuWait::Auto => {
-                gpu.device
-                    .poll(wgpu::PollType::Wait {
-                        submission_index: submission.cloned(),
-                        timeout: None,
-                    })
-                    .expect("GPU poll failed");
-            }
-        }
-    }
 }
 
 /// Configuration for the GPU visual frontend.

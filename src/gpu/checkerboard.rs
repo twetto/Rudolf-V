@@ -338,9 +338,7 @@ impl GpuCheckerboardDetector {
         self.record_into(gpu, &mut encoder, image);
         gpu.queue.submit(std::iter::once(encoder.finish()));
         self.arm_readback();
-        gpu.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("GPU poll failed");
+        gpu.wait(None);
     }
 
     /// Stage `image` (`queue.write_texture`, landing before the next submitted
