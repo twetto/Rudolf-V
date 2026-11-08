@@ -388,6 +388,14 @@ impl StereoNet {
     pub fn disparity(&self) -> &[f32] {
         self.engine.host(self.io[2])
     }
+
+    /// The last pair's confidence (0..1) at each depth map pixel, from the
+    /// network pixel its depth came from; None for a network without one
+    /// (LAS2).
+    pub fn confidence(&self) -> Option<Vec<f32>> {
+        let conf = self.engine.host(self.conf?);
+        Some(self.pixel.iter().map(|&p| conf[p]).collect())
+    }
 }
 
 #[cfg(test)]

@@ -242,6 +242,90 @@ impl StereoRig {
         Ok(StereoRig::new(cam0, cam1, r_10, t))
     }
 
+    /// Parse a stereo rig from a ZED camera's factory calibration
+    /// (`/usr/local/zed/settings/SN<serial>.conf`, the ZED SDK's INI file),
+    /// for raw (unrectified) images at `resolution`: "2K", "FHD", "HD" or
+    /// "VGA".
+    ///
+    /// `model` picks the distortion: `Rational` reads `[LEFT_DISTO]` and
+    /// `[RIGHT_DISTO]` (k1..k6, p1, p2: the model the SDK's own export calls
+    /// rational_polynomial); `RadTan` reads the resolution's k1, k2, p1, p2,
+    /// k3, as a rational model with no denominator.
+    ///
+    /// The extrinsic follows zed-open-capture: R = Rodrigues(RX, CV, RZ)
+    /// maps left-camera points into the right camera, and the right camera
+    /// sits at t = (-Baseline, TY, TZ), in millimetres in the file.
+    pub fn from_zed_conf(
+        path: &Path,
+        resolution: &str,
+        model: DistortionModel,
+    ) -> Result<Self, String> {
+        let content = fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+        let size = match resolution {
+            "2K" => [2208, 1242],
+            "FHD" => [1920, 1080],
+            "HD" => [1280, 720],
+            "VGA" => [672, 376],
+            _ => {
+                return Err(format!(
+                    "unsupported ZED resolution '{resolution}'; expected 2K, FHD, HD or VGA"
+                ));
+            }
+        };
+        let get = |section: &str, key: &str| {
+            ini_value(&content, section, key)
+                .ok_or_else(|| format!("[{section}] {key}: not found in {}", path.display()))
+        };
+        let camera = |eye: &str| -> Result<CameraIntrinsics, String> {
+            let cam = format!("{eye}_CAM_{resolution}");
+            let mut c = CameraIntrinsics::new(
+                get(&cam, "fx")?,
+                get(&cam, "fy")?,
+                get(&cam, "cx")?,
+                get(&cam, "cy")?,
+                size[0],
+                size[1],
+            );
+            let disto = format!("{eye}_DISTO");
+            let (keys, section): (&[&str], &str) = match model {
+                DistortionModel::Rational => (
+                    &["k1", "k2", "p1", "p2", "k3", "k4", "k5", "k6"],
+                    disto.as_str(),
+                ),
+                DistortionModel::RadTan => (&["k1", "k2", "p1", "p2", "k3"], cam.as_str()),
+                _ => {
+                    return Err(format!(
+                        "ZED calibrations are rational or radtan, not {model:?}"
+                    ));
+                }
+            };
+            c.distortion = keys
+                .iter()
+                .map(|k| get(section, k))
+                .collect::<Result<_, _>>()?;
+            c.distortion.resize(8, 0.0);
+            c.model = DistortionModel::Rational;
+            Ok(c)
+        };
+        let rotation = rodrigues([
+            get("STEREO", &format!("RX_{resolution}"))?,
+            get("STEREO", &format!("CV_{resolution}"))?,
+            get("STEREO", &format!("RZ_{resolution}"))?,
+        ]);
+        let t = [
+            -get("STEREO", "Baseline")? * 1e-3,
+            get("STEREO", "TY")? * 1e-3,
+            get("STEREO", "TZ")? * 1e-3,
+        ];
+        Ok(StereoRig::new(
+            camera("LEFT")?,
+            camera("RIGHT")?,
+            rotation,
+            t,
+        ))
+    }
+
     /// Transform a 3D point from cam0 frame to cam1 frame.
     #[inline]
     pub fn transform_point(&self, p: [f64; 3]) -> [f64; 3] {
@@ -270,6 +354,37 @@ impl StereoRig {
         let t = &self.t_10;
         (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt()
     }
+}
+
+/// `key=value` in `[section]` of an INI file, as a number.
+fn ini_value(content: &str, section: &str, key: &str) -> Option<f64> {
+    let header = format!("[{section}]");
+    let mut lines = content.lines().map(str::trim);
+    lines.find(|l| *l == header)?;
+    lines
+        .take_while(|l| !l.starts_with('['))
+        .filter_map(|l| l.split_once('='))
+        .find(|(k, _)| k.trim() == key)
+        .and_then(|(_, v)| v.trim().parse().ok())
+}
+
+/// The rotation matrix of rotation vector `r` (axis times angle, radians).
+fn rodrigues(r: [f64; 3]) -> [[f64; 3]; 3] {
+    let theta = (r[0] * r[0] + r[1] * r[1] + r[2] * r[2]).sqrt();
+    if theta < 1e-15 {
+        return [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    }
+    let k = [r[0] / theta, r[1] / theta, r[2] / theta];
+    let (s, c) = theta.sin_cos();
+    let skew = [[0.0, -k[2], k[1]], [k[2], 0.0, -k[0]], [-k[1], k[0], 0.0]];
+    let mut out = [[0.0; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            let identity = if i == j { c } else { 0.0 };
+            out[i][j] = identity + (1.0 - c) * k[i] * k[j] + s * skew[i][j];
+        }
+    }
+    out
 }
 
 /// Parse the T_BS 4×4 matrix from a EuRoC sensor.yaml file.
@@ -352,15 +467,18 @@ fn parse_matrix4_after_key(content: &str, key: &str) -> Option<[[f64; 4]; 4]> {
 
 fn yaml_section<'a>(content: &'a str, name: &str) -> Option<&'a str> {
     let marker = format!("{name}:");
-    let start_line = content.lines().position(|line| line.trim_end() == marker)?;
-    let start_byte = content
-        .lines()
-        .take(start_line + 1)
-        .map(|line| line.len() + 1)
-        .sum::<usize>();
-    let tail = &content[start_byte..];
-    let end = tail.find("\ncam").unwrap_or(tail.len());
-    Some(&tail[..end])
+    // Line by line with their endings, "\n" or "\r\n", to find the section's
+    // first byte.
+    let mut start_byte = 0;
+    for line in content.split_inclusive('\n') {
+        start_byte += line.len();
+        if line.trim_end() == marker {
+            let tail = &content[start_byte..];
+            let end = tail.find("\ncam").unwrap_or(tail.len());
+            return Some(&tail[..end]);
+        }
+    }
+    None
 }
 
 fn parse_projection_model(content: &str, distortion: &[f64]) -> Result<DistortionModel, String> {
@@ -670,9 +788,12 @@ cam1:
             line!()
         ));
         std::fs::write(&path, camchain).unwrap();
-
         let rig = StereoRig::from_kalibr_camchain(&path).unwrap();
+        // The same file with Windows line endings.
+        std::fs::write(&path, camchain.replace('\n', "\r\n")).unwrap();
+        let crlf = StereoRig::from_kalibr_camchain(&path).unwrap();
         let _ = std::fs::remove_file(&path);
+        assert_eq!(format!("{crlf:?}"), format!("{rig:?}"));
 
         assert_eq!(rig.cam0.model, DistortionModel::Equidistant);
         assert_eq!(rig.cam1.model, DistortionModel::Equidistant);
@@ -733,5 +854,124 @@ cam1:
         assert!((pixel.x() - 786.464309215).abs() < 1e-6);
         assert!((pixel.y() - 266.827864422).abs() < 1e-6);
         assert!((rig.baseline_meters() - 0.11988).abs() < 1e-4);
+    }
+
+    /// The factory file of the lab Orin's ZED 2i (S/N 36835247).
+    const ZED_CONF: &str = "[LEFT_CAM_HD]
+fx=958.245
+fy=958.715
+cx=651.625
+cy=353.5555
+k1=-0.0720847
+k2=-0.00535637
+p1=0.00042353
+p2=2.62033e-05
+k3=-0.0735599
+
+[RIGHT_CAM_HD]
+fx=956.08
+fy=956.605
+cx=653.05
+cy=359.875
+k1=-0.0701151
+k2=-0.0175723
+p1=0.000313971
+p2=4.32652e-05
+k3=-0.0535535
+
+[LEFT_DISTO]
+k1=-4.26217
+k2=46.5049
+k3=-23.2569
+k4=-4.16774
+k5=46.0752
+k6=-19.7633
+p1=0.00042056
+p2=9.13147e-06
+
+[RIGHT_DISTO]
+k1=-5.1226
+k2=47.702
+k3=-22.8344
+k4=-5.03039
+k5=47.2158
+k6=-19.2661
+p1=0.00032012
+p2=2.33182e-05
+
+[STEREO]
+Baseline=120.042
+TY=-0.252054
+TZ=0.432304
+CV_HD=0.00391325
+RX_HD=0.00305798
+RZ_HD=0.00347634
+
+[MISC]
+Sensor_ID=0
+";
+
+    #[test]
+    fn test_zed_conf_matches_the_sdk() {
+        let path = std::env::temp_dir().join(format!(
+            "rudolf_v_test_zed_{}_{}.conf",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, ZED_CONF).unwrap();
+        let rig = StereoRig::from_zed_conf(&path, "HD", DistortionModel::Rational).unwrap();
+        let radtan = StereoRig::from_zed_conf(&path, "HD", DistortionModel::RadTan).unwrap();
+        let missing = StereoRig::from_zed_conf(&path, "FHD", DistortionModel::Rational);
+        let _ = std::fs::remove_file(&path);
+
+        // The ZED SDK 5.5's raw calibration of the same camera, as
+        // tools/dense_stereo/zed_record.py exported it (float32 there).
+        let sdk_r = [
+            [0.999986291, -0.003470335, 0.003918541],
+            [0.003482302, 0.999989271, -0.003051159],
+            [-0.003907911, 0.003064763, 0.999987662],
+        ];
+        let sdk_t = [-0.120042004, -0.000252054, 0.000432304];
+        for (i, (row, sdk_row)) in rig.r_10.iter().zip(sdk_r).enumerate() {
+            for (j, (a, b)) in row.iter().zip(sdk_row).enumerate() {
+                assert!((a - b).abs() < 1e-7, "R[{i}][{j}]");
+            }
+        }
+        for (i, (a, b)) in rig.t_10.iter().zip(sdk_t).enumerate() {
+            assert!((a - b).abs() < 1e-8, "t[{i}]");
+        }
+        let sdk_left = [
+            -4.26216983795166,
+            46.50490188598633,
+            0.00042056001257151365,
+            9.131469596468378e-06,
+            -23.256900787353516,
+            -4.1677398681640625,
+            46.075199127197266,
+            -19.7632999420166,
+        ];
+        assert_eq!(rig.cam0.model, DistortionModel::Rational);
+        for (a, b) in rig.cam0.distortion.iter().zip(sdk_left) {
+            assert!((a - b).abs() < 1e-5 * b.abs().max(1e-3), "{a} vs {b}");
+        }
+        assert_eq!(rig.cam1.resolution, [1280, 720]);
+        assert!((rig.cam1.fx - 956.0800170898438).abs() < 1e-4);
+        assert!((rig.baseline_meters() - 0.120043054).abs() < 1e-7);
+
+        assert_eq!(
+            radtan.cam0.distortion,
+            [
+                -0.0720847,
+                -0.00535637,
+                0.00042353,
+                2.62033e-05,
+                -0.0735599,
+                0.0,
+                0.0,
+                0.0
+            ]
+        );
+        let e = missing.unwrap_err();
+        assert!(e.contains("_FHD") && e.contains("not found"), "{e}");
     }
 }

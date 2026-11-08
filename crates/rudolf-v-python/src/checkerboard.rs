@@ -231,7 +231,7 @@ impl PyCheckerboardDetector {
 
 /// A numpy (height, width) u8 array as a Rudolf-V image; a strided view (a
 /// crop, say) is copied row by row.
-fn to_image(image: &PyReadonlyArray2<'_, u8>) -> RudolfImage<u8> {
+pub(crate) fn to_image(image: &PyReadonlyArray2<'_, u8>) -> RudolfImage<u8> {
     let shape = image.shape();
     let data = match image.as_slice() {
         Ok(s) => s.to_vec(),

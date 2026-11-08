@@ -35,12 +35,18 @@ spreads the CPU work (detection, KLT, stereo matching) over threads with rayon.
 `RudolfV:` and `Stereo:` sections of a YAML config file.
 
 From Python, `crates/rudolf-v-python` (`pip install crates/rudolf-v-python`)
-has the frontend, the stereo matcher and the checkerboard finder:
+has the frontend, the sparse stereo matcher, the checkerboard finder, and dense
+depth from SGBM or a TensorRT stereo network on a pair rectified (on the CPU or
+the GPU) from a ZED's factory calibration:
 
 ```python
 import rudolf_v
 frontend = rudolf_v.Frontend(rudolf_v.FrontendConfig.from_yaml("config.yaml"), 752, 480)
 features, stats = frontend.process(grey)  # uint8 (480, 752) array
+
+rect = rudolf_v.StereoRectification.from_zed_conf("SN36835247.conf", fx, cx, cy)
+depth = rudolf_v.StereoDepth.sgbm(rect.fx, rect.fy, rect.cx, rect.cy, rect.baseline, 1280, 720)
+z = depth.compute(*rect.rectify(left, right))  # Z in metres, (90, 160), NaN for none
 ```
 
 CI builds the wheel for Linux (x86-64 and aarch64) and Windows. For a Jetson,
