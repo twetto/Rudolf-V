@@ -631,9 +631,7 @@ impl GpuSgbm {
         self.record_into(gpu, &mut enc);
         gpu.queue.submit(std::iter::once(enc.finish()));
         self.arm_readback();
-        gpu.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("poll");
+        gpu.wait(None);
         self.collect_into(out);
     }
 }

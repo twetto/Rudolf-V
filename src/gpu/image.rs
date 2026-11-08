@@ -277,9 +277,7 @@ impl GpuImage {
         });
 
         // Poll until the GPU copy is done and the map callback fires.
-        gpu.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("GPU poll failed");
+        gpu.wait(None);
         receiver
             .recv()
             .expect("readback map callback never fired")

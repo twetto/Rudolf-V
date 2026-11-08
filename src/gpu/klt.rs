@@ -941,9 +941,7 @@ impl GpuKltTracker {
         self.record_into(&mut encoder);
         gpu.queue.submit(std::iter::once(encoder.finish()));
         self.arm_readback();
-        gpu.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("GPU poll failed");
+        gpu.wait(None);
         self.collect_results(features)
     }
 }

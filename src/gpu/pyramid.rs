@@ -273,9 +273,7 @@ impl LevelCopy {
         buf_slice.map_async(wgpu::MapMode::Read, move |r| {
             tx.send(r).expect("readback channel closed");
         });
-        gpu.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("GPU poll failed");
+        gpu.wait(None);
         rx.recv()
             .expect("readback callback never fired")
             .expect("readback map failed");
