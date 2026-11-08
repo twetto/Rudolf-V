@@ -467,15 +467,18 @@ fn parse_matrix4_after_key(content: &str, key: &str) -> Option<[[f64; 4]; 4]> {
 
 fn yaml_section<'a>(content: &'a str, name: &str) -> Option<&'a str> {
     let marker = format!("{name}:");
-    let start_line = content.lines().position(|line| line.trim_end() == marker)?;
-    let start_byte = content
-        .lines()
-        .take(start_line + 1)
-        .map(|line| line.len() + 1)
-        .sum::<usize>();
-    let tail = &content[start_byte..];
-    let end = tail.find("\ncam").unwrap_or(tail.len());
-    Some(&tail[..end])
+    // Line by line with their endings, "\n" or "\r\n", to find the section's
+    // first byte.
+    let mut start_byte = 0;
+    for line in content.split_inclusive('\n') {
+        start_byte += line.len();
+        if line.trim_end() == marker {
+            let tail = &content[start_byte..];
+            let end = tail.find("\ncam").unwrap_or(tail.len());
+            return Some(&tail[..end]);
+        }
+    }
+    None
 }
 
 fn parse_projection_model(content: &str, distortion: &[f64]) -> Result<DistortionModel, String> {
@@ -785,9 +788,12 @@ cam1:
             line!()
         ));
         std::fs::write(&path, camchain).unwrap();
-
         let rig = StereoRig::from_kalibr_camchain(&path).unwrap();
+        // The same file with Windows line endings.
+        std::fs::write(&path, camchain.replace('\n', "\r\n")).unwrap();
+        let crlf = StereoRig::from_kalibr_camchain(&path).unwrap();
         let _ = std::fs::remove_file(&path);
+        assert_eq!(format!("{crlf:?}"), format!("{rig:?}"));
 
         assert_eq!(rig.cam0.model, DistortionModel::Equidistant);
         assert_eq!(rig.cam1.model, DistortionModel::Equidistant);
