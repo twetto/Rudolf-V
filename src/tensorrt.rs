@@ -8,7 +8,11 @@
 // only runs on the GPU and TensorRT version it was built for.
 //
 // Fixed shapes, float32 tensors. Each tensor has a pinned host buffer: fill
-// the inputs' (`host_mut`), `run`, read the outputs' (`host`).
+// the inputs' (`host_mut`), `run`, read the outputs' (`host`). An input can
+// instead be made on the GPU from a u8 image (`gpu_input`, then write each
+// image into `image_mut`): a separable resampling and scaling, so only the
+// image's bytes cross over. A library built before that has no GPU inputs
+// (`gpu_input` says so), and the caller fills `host_mut` as before.
 
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::path::Path;
@@ -45,6 +49,43 @@ type TensorFn = unsafe extern "C" fn(
 ) -> c_int;
 type RunFn = unsafe extern "C" fn(*mut RvTrt, *mut c_char, usize) -> c_int;
 type FreeFn = unsafe extern "C" fn(*mut RvTrt);
+type GpuInputFn = unsafe extern "C" fn(
+    *mut RvTrt,
+    c_int,
+    c_int,
+    c_int,
+    *const c_int,
+    *const f32,
+    c_int,
+    *const c_int,
+    c_int,
+    *const f32,
+    c_int,
+    c_int,
+    f32,
+    f32,
+    *mut *mut u8,
+    *mut c_char,
+    usize,
+) -> c_int;
+type InputToHostFn = unsafe extern "C" fn(*mut RvTrt, c_int, *mut c_char, usize) -> c_int;
+
+/// An input tensor (1×3×H×W) made on the GPU from a `width`×`height` u8
+/// image: tensor column x averages image columns `cols[x].0 ..` with weights
+/// `cols[x].1`, and resized row y image rows `rows[y].0 ..` with weights
+/// `rows[y].1` (the columns' weighted sum of the rows' weighted sums, in that
+/// order, without fused multiply-adds: as a CPU loop doing the rows first);
+/// the resized rows start at tensor row `top`, those above and below repeat
+/// the first and last; then v·scale + offset, into all three channels.
+pub struct GpuResize<'a> {
+    pub width: usize,
+    pub height: usize,
+    pub cols: &'a [(usize, Vec<f32>)],
+    pub rows: &'a [(usize, Vec<f32>)],
+    pub top: usize,
+    pub scale: f32,
+    pub offset: f32,
+}
 
 /// One input or output of the engine.
 #[derive(Debug, Clone)]
@@ -62,7 +103,11 @@ pub struct TrtEngine {
     handle: *mut RvTrt,
     run: RunFn,
     free: FreeFn,
+    gpu_input: Option<GpuInputFn>,
+    input_to_host: Option<InputToHostFn>,
     tensors: Vec<TensorInfo>,
+    /// Per tensor: the pinned image buffer of an input made on the GPU.
+    images: Vec<Option<(*mut u8, usize)>>,
 }
 
 // The handle owns its CUDA stream and buffers; nothing in it is tied to the
@@ -131,6 +176,17 @@ impl TrtEngine {
                 return Err(e);
             }
         };
+        // SAFETY: as above; absent from a library built before them.
+        let (gpu_input, input_to_host) = unsafe {
+            (
+                sym("rv_trt_gpu_input")
+                    .ok()
+                    .map(|p| std::mem::transmute::<*mut c_void, GpuInputFn>(p)),
+                sym("rv_trt_input_to_host")
+                    .ok()
+                    .map(|p| std::mem::transmute::<*mut c_void, InputToHostFn>(p)),
+            )
+        };
         let engine_c = c_path(engine)?;
         let plugins_c = plugins
             .iter()
@@ -186,6 +242,9 @@ impl TrtEngine {
             handle,
             run,
             free,
+            gpu_input,
+            input_to_host,
+            images: vec![None; tensors.len()],
             tensors,
         })
     }
@@ -214,7 +273,78 @@ impl TrtEngine {
         unsafe { std::slice::from_raw_parts(t.host, t.len) }
     }
 
-    /// Copies the inputs over, runs the engine, copies the outputs back.
+    /// Make input `i` on the GPU from u8 images (`r`), written into
+    /// `image_mut(i)` before each `run`; its `host_mut` is then unused.
+    /// Ok(false): the library predates GPU inputs.
+    pub fn gpu_input(&mut self, i: usize, r: &GpuResize) -> Result<bool, String> {
+        let Some(f) = self.gpu_input else {
+            return Ok(false);
+        };
+        let spans = |s: &[(usize, Vec<f32>)]| {
+            let (mut spans, mut weights) = (Vec::new(), Vec::new());
+            for (first, w) in s {
+                spans.extend([*first as c_int, w.len() as c_int, weights.len() as c_int]);
+                weights.extend_from_slice(w);
+            }
+            (spans, weights)
+        };
+        let ((cs, cw), (rs, rw)) = (spans(r.cols), spans(r.rows));
+        let mut image = std::ptr::null_mut();
+        let mut err = [0 as c_char; 512];
+        // SAFETY: a live handle; the arrays outlive the call, which copies
+        // them, and their lengths are passed.
+        let status = unsafe {
+            f(
+                self.handle,
+                i as c_int,
+                r.width as c_int,
+                r.height as c_int,
+                cs.as_ptr(),
+                cw.as_ptr(),
+                cw.len() as c_int,
+                rs.as_ptr(),
+                r.rows.len() as c_int,
+                rw.as_ptr(),
+                rw.len() as c_int,
+                r.top as c_int,
+                r.scale,
+                r.offset,
+                &mut image,
+                err.as_mut_ptr(),
+                err.len(),
+            )
+        };
+        if status != 0 {
+            return Err(message(&err));
+        }
+        self.images[i] = Some((image, r.width * r.height));
+        Ok(true)
+    }
+
+    /// The pinned image buffer of input `i` if it is made on the GPU
+    /// (`gpu_input`): row-major, the image's width a row.
+    pub fn image_mut(&mut self, i: usize) -> Option<&mut [u8]> {
+        // SAFETY: rv_trt.cpp allocated `len` bytes, freed only in Drop (or
+        // by another gpu_input, which replaces this entry).
+        self.images[i].map(|(p, len)| unsafe { std::slice::from_raw_parts_mut(p, len) })
+    }
+
+    /// Input `i` as the device last had it, into its host buffer (to check
+    /// one made on the GPU).
+    pub fn input_to_host(&mut self, i: usize) -> Result<(), String> {
+        let f = self
+            .input_to_host
+            .ok_or("the library predates rv_trt_input_to_host")?;
+        let mut err = [0 as c_char; 512];
+        // SAFETY: a live handle and an error buffer of the size passed.
+        match unsafe { f(self.handle, i as c_int, err.as_mut_ptr(), err.len()) } {
+            0 => Ok(()),
+            _ => Err(message(&err)),
+        }
+    }
+
+    /// Copies the inputs over (or makes them on the GPU), runs the engine,
+    /// copies the outputs back.
     pub fn run(&mut self) -> Result<(), String> {
         let mut err = [0 as c_char; 512];
         // SAFETY: a live handle and an error buffer of the size passed.

@@ -125,8 +125,12 @@ on the GPU:
 |---|---|---|
 | `GpuDenseStereo` | 160×90 (pyramid level 3) | 4.7 ms |
 | `GpuSgbm` | 160×90 (pyramid level 3) | 4.6 ms |
-| LAS2-S (`StereoNet`, TensorRT) | 320×192 input | 15.0 ms |
-| Light ESS (`StereoNet`, TensorRT) | 480×288 input | 20.3 ms |
+| LAS2-S (`StereoNet`, TensorRT) | 320×192 input | 11.4 ms |
+| Light ESS (`StereoNet`, TensorRT) | 480×288 input | 10.5 ms |
+
+Pairs back to back. At one pair every 33 ms, the GPU's clock governor lowers
+its clock between pairs, and the networks take 20.3 ms (LAS2-S) and 18.9 ms
+(Light ESS) a pair, still with 1.2 ms of CPU time.
 
 ## Scientific Basis
 
